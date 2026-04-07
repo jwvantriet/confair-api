@@ -17,15 +17,36 @@ import carerixRoutes     from './routes/carerix.js';
 
 const app = express();
 
+const corsOptions = {
+  origin: config.cors.origins,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+};
+
 app.use(helmet());
-app.use(cors({ origin: config.cors.origins, credentials: true }));
+app.use(cors(corsOptions));
+
+// Explicitly handle ALL preflight OPTIONS requests before any other middleware
+app.options('*', cors(corsOptions));
+
 app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
 
-const globalLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 300 });
-const authLimiter   = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many login attempts' } });
-app.use(globalLimiter);
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 200, standardHeaders: true, legacyHeaders: false,
+});
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many login attempts. Please try again later.' },
+  skip: (req) => req.method === 'OPTIONS', // never rate-limit preflight
+});
 
-app.get('/health', (_, res) => res.json({ status: 'ok', env: config.nodeEnv, ts: new Date().toISOString() }));
+app.use(limiter);
+
+app.get('/health', (_req, res) =>
+  res.json({ status: 'ok', env: config.nodeEnv, ts: new Date().toISOString() })
+);
 
 app.use('/auth',        authLimiter, authRoutes);
 app.use('/payroll',     payrollRoutes);
@@ -35,8 +56,10 @@ app.use('/runs',        runsRoutes);
 app.use('/invoices',    invoicesRoutes);
 app.use('/import',      importRoutes);
 app.use('/carerix',     carerixRoutes);
-
 app.use(errorHandler);
 
-app.listen(config.port, () => logger.info(`Confair API on :${config.port} [${config.nodeEnv}]`));
+app.listen(config.port, () =>
+  logger.info(`Confair API · port ${config.port} · ${config.nodeEnv}`)
+);
+
 export default app;
