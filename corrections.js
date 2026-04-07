@@ -1,0 +1,167 @@
+/**
+ * Corrections routes
+ *
+ * GET  /corrections                    — List corrections visible to current user
+ * POST /corrections                    — Placement creates a correction request
+ * POST /corrections/:id/approve        — Company/Agency approves (auto-adds to run)
+ * POST /corrections/:id/decline        — Company/Agency declines (reason mandatory)
+ */
+
+import { Router } from 'express';
+import { requireAuth, requireCompanyOrAbove } from '../middleware/auth.js';
+import { adminSupabase } from '../services/supabase.js';
+import { ApiError } from '../middleware/errorHandler.js';
+import { writeAuditLog } from '../utils/audit.js';
+
+const router = Router();
+router.use(requireAuth);
+
+router.get('/', async (req, res, next) => {
+  try {
+    const { status } = req.query;
+    let query = req.supabase
+      .from('correction_requests')
+      .select(`
+        *, declaration_types(code,label), placements(full_name),
+        companies(name), payroll_periods(period_ref)
+      `)
+      .order('created_at', { ascending: false });
+    if (status) query = query.eq('status', status);
+    const { data, error } = await query;
+    if (error) throw new ApiError(error.message);
+    res.json(data);
+  } catch (err) { next(err); }
+});
+
+router.post('/', async (req, res, next) => {
+  try {
+    if (req.user.role !== 'placement') throw new ApiError('Only Placement users can create corrections', 403);
+    const { declaration_entry_id, payroll_period_id, declaration_type_id, correction_date, requested_amount, note } = req.body;
+    if (!payroll_period_id || !declaration_type_id || !correction_date || requested_amount === undefined) {
+      throw new ApiError('payroll_period_id, declaration_type_id, correction_date and requested_amount are required');
+    }
+
+    // Get placement_id and company_id from user's placement record
+    const { data: placement } = await adminSupabase
+      .from('placements')
+      .select('id, company_id')
+      .eq('user_profile_id', req.user.id)
+      .single();
+    if (!placement) throw new ApiError('No placement record found for this user', 404);
+
+    // Get original amount if linked to an entry
+    let originalAmount = null;
+    if (declaration_entry_id) {
+      const { data: entry } = await adminSupabase
+        .from('declaration_entries')
+        .select('imported_amount')
+        .eq('id', declaration_entry_id)
+        .single();
+      originalAmount = entry?.imported_amount ?? null;
+    }
+
+    const { data, error } = await adminSupabase
+      .from('correction_requests')
+      .insert({
+        declaration_entry_id,
+        payroll_period_id,
+        placement_id:       placement.id,
+        company_id:         placement.company_id,
+        declaration_type_id,
+        correction_date,
+        original_amount:    originalAmount,
+        requested_amount,
+        note,
+        created_by:         req.user.id,
+      })
+      .select()
+      .single();
+    if (error) throw new ApiError(error.message);
+
+    await writeAuditLog({ eventType: 'correction_created', actorUserId: req.user.id, actorRole: req.user.role, entityType: 'correction_request', entityId: data.id });
+    res.status(201).json(data);
+  } catch (err) { next(err); }
+});
+
+router.post('/:id/approve', requireCompanyOrAbove, async (req, res, next) => {
+  try {
+    const { data: corr, error } = await adminSupabase
+      .from('correction_requests')
+      .select('*, payroll_periods(id)')
+      .eq('id', req.params.id)
+      .single();
+    if (error || !corr) throw new ApiError('Correction not found', 404);
+    if (corr.status !== 'requested') throw new ApiError('Correction is not in requested status');
+
+    // Find or create the active run for this period
+    let { data: run } = await adminSupabase
+      .from('payroll_runs')
+      .select('id')
+      .eq('payroll_period_id', corr.payroll_period_id)
+      .not('status', 'eq', 'finalized')
+      .maybeSingle();
+
+    if (!run) {
+      const { data: newRun } = await adminSupabase
+        .from('payroll_runs')
+        .insert({ payroll_period_id: corr.payroll_period_id, status: 'in_progress' })
+        .select()
+        .single();
+      run = newRun;
+    }
+
+    // Add to run
+    await adminSupabase.from('payroll_run_entries').insert({
+      payroll_run_id:       run.id,
+      correction_request_id: corr.id,
+      amount:               corr.requested_amount,
+    });
+
+    // Update correction
+    await adminSupabase.from('correction_requests').update({
+      status:          'approved',
+      reviewed_by:     req.user.id,
+      reviewed_at:     new Date().toISOString(),
+      included_in_run: true,
+      payroll_run_id:  run.id,
+    }).eq('id', corr.id);
+
+    await adminSupabase.from('approval_actions').insert({
+      entity_type: 'correction_request', entity_id: corr.id,
+      stage: 'company_initial', action: 'approved',
+      actor_user_id: req.user.id, actor_role: req.user.role,
+    });
+
+    await writeAuditLog({ eventType: 'correction_approved', actorUserId: req.user.id, actorRole: req.user.role, entityType: 'correction_request', entityId: corr.id });
+    res.json({ message: 'Correction approved and added to run', runId: run.id });
+  } catch (err) { next(err); }
+});
+
+router.post('/:id/decline', requireCompanyOrAbove, async (req, res, next) => {
+  try {
+    const { declineReason } = req.body;
+    if (!declineReason?.trim()) throw new ApiError('declineReason is mandatory', 400);
+
+    const { data: corr, error } = await adminSupabase
+      .from('correction_requests').select('id, status').eq('id', req.params.id).single();
+    if (error || !corr) throw new ApiError('Correction not found', 404);
+    if (corr.status !== 'requested') throw new ApiError('Correction is not in requested status');
+
+    await adminSupabase.from('correction_requests').update({
+      status: 'declined', decline_reason: declineReason,
+      reviewed_by: req.user.id, reviewed_at: new Date().toISOString(),
+    }).eq('id', corr.id);
+
+    await adminSupabase.from('approval_actions').insert({
+      entity_type: 'correction_request', entity_id: corr.id,
+      stage: 'company_initial', action: 'declined',
+      actor_user_id: req.user.id, actor_role: req.user.role,
+      decline_reason: declineReason,
+    });
+
+    await writeAuditLog({ eventType: 'correction_declined', actorUserId: req.user.id, actorRole: req.user.role, entityType: 'correction_request', entityId: corr.id, payload: { declineReason } });
+    res.json({ message: 'Correction declined' });
+  } catch (err) { next(err); }
+});
+
+export default router;
