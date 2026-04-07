@@ -20,26 +20,24 @@ const app = express();
 const corsOptions = {
   origin: config.cors.origins,
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
 };
 
-app.use(helmet());
+app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(cors(corsOptions));
-
-// Explicitly handle ALL preflight OPTIONS requests before any other middleware
-app.options('*', cors(corsOptions));
+app.options('*', cors(corsOptions));  // handle all preflight requests
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, max: 200, standardHeaders: true, legacyHeaders: false,
+  windowMs: 15*60*1000, max: 200, standardHeaders: true, legacyHeaders: false,
 });
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false,
+  windowMs: 15*60*1000, max: 20, standardHeaders: true, legacyHeaders: false,
+  skip: (req) => req.method === 'OPTIONS',
   message: { error: 'Too many login attempts. Please try again later.' },
-  skip: (req) => req.method === 'OPTIONS', // never rate-limit preflight
 });
 
 app.use(limiter);
