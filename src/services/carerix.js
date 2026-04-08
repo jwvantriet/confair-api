@@ -34,20 +34,16 @@ async function getServiceToken() {
   if (_serviceToken && now < _serviceTokenExp) return _serviceToken;
 
   try {
-    // Use Basic Auth header for client credentials — more reliable than body params
-    // when client secret contains special characters like < > & etc.
-    const basicAuth = Buffer.from(
-      `${encodeURIComponent(config.carerix.clientId)}:${encodeURIComponent(config.carerix.clientSecret)}`
-    ).toString('base64');
-
     const res = await axios.post(config.carerix.tokenUrl,
       new URLSearchParams({
-        grant_type: 'client_credentials',
-        scope:      'openid urn:cx/cx5Wrapper:data:manage urn:cx/core/data/candidates:manage urn:cx/cx5Acl:data:manage',
+        grant_type:    'client_credentials',
+        client_id:     config.carerix.clientId,
+        client_secret: config.carerix.clientSecret,
+        scope:         'urn:cx/cx5Wrapper:data:manage',
       }), {
         headers: {
-          'Content-Type':  'application/x-www-form-urlencoded',
-          'Authorization': `Basic ${basicAuth}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent':   'confair-platform/1.0',
         },
         timeout: 10_000,
       }
@@ -106,19 +102,17 @@ export function getCarerixAuthUrl(state, redirectUri) {
  */
 export async function exchangeCodeForTokens(code, redirectUri) {
   try {
-    const basicAuth = Buffer.from(
-      `${encodeURIComponent(config.carerix.clientId)}:${encodeURIComponent(config.carerix.clientSecret)}`
-    ).toString('base64');
-
     const res = await axios.post(config.carerix.tokenUrl,
       new URLSearchParams({
-        grant_type:   'authorization_code',
+        grant_type:    'authorization_code',
+        client_id:     config.carerix.clientId,
+        client_secret: config.carerix.clientSecret,
         code,
-        redirect_uri: redirectUri,
+        redirect_uri:  redirectUri,
       }), {
         headers: {
-          'Content-Type':  'application/x-www-form-urlencoded',
-          'Authorization': `Basic ${basicAuth}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent':   'confair-platform/1.0',
         },
         timeout: 10_000,
       }
