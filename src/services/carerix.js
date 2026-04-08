@@ -165,7 +165,7 @@ export async function getCarerixUserInfo(accessToken) {
 function mapCarerixRole(userInfo) {
   // Carerix may return role info in different fields depending on version
   const role = userInfo.role || userInfo.user_type || userInfo.preferred_username || '';
-  const roleMap: Record<string, string> = {
+  const roleMap = {
     Candidate:   'placement',
     Employee:    'placement',
     candidate:   'placement',
