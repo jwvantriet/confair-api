@@ -34,11 +34,28 @@ export function userSupabase(accessToken) {
  *   3. If no   → create auth.users entry + user_profiles row, issue session
  */
 export async function provisionCarerixSession(identity) {
-  const { data: existing } = await adminSupabase
-    .from('user_profiles')
-    .select('id')
-    .eq('carerix_user_id', identity.carerixUserId)
-    .maybeSingle();
+  let existing = null;
+
+  // Look up by carerix_user_id first (most specific)
+  if (identity.carerixUserId) {
+    const { data } = await adminSupabase
+      .from('user_profiles')
+      .select('id')
+      .eq('carerix_user_id', identity.carerixUserId)
+      .maybeSingle();
+    existing = data;
+  }
+
+  // Fallback: look up by email (handles case where carerixUserId was empty on first login)
+  if (!existing && identity.email) {
+    const { data } = await adminSupabase
+      .from('user_profiles')
+      .select('id')
+      .eq('email', identity.email)
+      .eq('auth_source', 'carerix')
+      .maybeSingle();
+    existing = data;
+  }
 
   let supabaseUserId;
 
@@ -58,8 +75,18 @@ export async function provisionCarerixSession(identity) {
       email_confirm: true,
       user_metadata: { full_name: identity.fullName, carerix_user_id: identity.carerixUserId, platform_role: identity.platformRole },
     });
-    if (error) throw new Error(`Failed to create Supabase user: ${error.message}`);
-    supabaseUserId = newUser.user.id;
+
+    if (error?.message?.includes('already been registered')) {
+      // User exists in auth but not in user_profiles — find and link them
+      const { data: authUsers } = await adminSupabase.auth.admin.listUsers();
+      const authUser = authUsers?.users?.find(u => u.email === identity.email);
+      if (!authUser) throw new Error(`User exists but could not be found: ${error.message}`);
+      supabaseUserId = authUser.id;
+    } else if (error) {
+      throw new Error(`Failed to create Supabase user: ${error.message}`);
+    } else {
+      supabaseUserId = newUser.user.id;
+    }
 
     await adminSupabase.from('user_profiles').insert({
       id:                     supabaseUserId,
