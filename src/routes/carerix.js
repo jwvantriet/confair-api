@@ -38,10 +38,10 @@ router.get('/test-login', async (req, res) => {
     results.loginError = { status: e.response?.status, data: e.response?.data, message: e.message };
   }
 
-  // Step 2: Look up CRUser by userName
+  // Step 2: Look up CREmployee/CRContact by toUser._id variations
   try {
-    const r = await axios.get(`${restBase}CRUser`, {
-      params: { qualifier: `userName = '${u}'`, show: '_id,userName,toEmployee._id,toEmployee.employeeID,toContact._id,toContact.toCompany._id,toContact.toCompany.name', limit: 2 },
+    const r = await axios.get(`${restBase}CREmployee`, {
+      params: { qualifier: `toUser._id = 25793`, limit: 2 },
       headers: { 'Authorization': `Basic ${restAuth}`, 'Accept': 'application/json', 'User-Agent': 'confair-platform/1.0' },
       timeout: 10_000,
     });
@@ -62,6 +62,40 @@ router.get('/test-login', async (req, res) => {
     results.crContactError = { status: e.response?.status, message: e.message };
   }
 
+  res.json(results);
+});
+
+
+// ── GET /carerix/test-user — test specific user entity lookups
+router.get('/test-user', async (req, res) => {
+  const axios  = (await import('axios')).default;
+  const config = (await import('../config.js')).config;
+  const restBase = config.carerix.restUrl;
+  const restAuth = Buffer.from(`${config.carerix.restUsername}:${config.carerix.restPassword}`).toString('base64');
+  const headers  = { 'Authorization': `Basic ${restAuth}`, 'User-Agent': 'confair-platform/1.0' };
+  const results  = {};
+
+  // Try finding employee with various qualifiers
+  const queries = [
+    { entity: 'CREmployee', qualifier: "toUser._id = 25793" },
+    { entity: 'CREmployee', qualifier: "toUser.id = 25793" },
+    { entity: 'CRContact',  qualifier: "toUser._id = 25793" },
+    { entity: 'CRContact',  qualifier: "toUser.id = 25793" },
+    { entity: 'CRContact',  qualifier: "emailAddress = 'testaccount@testing.dev'" },
+    { entity: 'CRUser',     qualifier: "userName = 'testaccount@testing.dev'" },
+  ];
+
+  for (const q of queries) {
+    try {
+      const r = await axios.get(`${restBase}${q.entity}`, {
+        params: { qualifier: q.qualifier, limit: 2 },
+        headers, timeout: 8000, responseType: 'text',
+      });
+      results[`${q.entity}|${q.qualifier}`] = r.data?.substring(0, 400);
+    } catch (e) {
+      results[`${q.entity}|${q.qualifier}`] = `ERROR ${e.response?.status}: ${e.message}`;
+    }
+  }
   res.json(results);
 });
 
