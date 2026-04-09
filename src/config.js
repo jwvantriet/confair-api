@@ -28,7 +28,12 @@ export const config = {
     clientSecret:  optional('CARERIX_API_KEY', ''),     // client secret = API key
     tenantId:      optional('CARERIX_TENANT_ID', 'confair'),
 
-    // Derived OAuth2 endpoints
+    // Carerix legacy REST API (api.carerix.com) — used for user authentication
+  restUrl:       optional('CARERIX_REST_URL', 'https://api.carerix.com/'),
+  restUsername:  optional('CARERIX_REST_USERNAME', 'confair'),
+  restPassword:  optional('CARERIX_REST_PASSWORD', ''),
+
+  // Derived OAuth2 endpoints
     get tokenUrl()   { return `${this.authUrl}/token`; },
     get authCodeUrl() { return `${this.authUrl}/auth`; },
     get userInfoUrl() { return `${this.authUrl}/userinfo`; },
