@@ -9,12 +9,11 @@
  * GET  /auth/me                    — Current user profile
  */
 import { Router } from 'express';
+import axios from 'axios';
 import { z } from 'zod';
 import crypto from 'crypto';
 import { adminSupabase, provisionCarerixSession } from '../services/supabase.js';
 import {
-  getCarerixAuthUrl,
-  exchangeCodeForTokens,
   getCarerixUserInfo,
   syncIdentityCache,
 } from '../services/carerix.js';
@@ -76,26 +75,79 @@ router.post('/login/agency', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ── GET /auth/carerix/login — redirect to Carerix login page ──────────────────
-// Query params: roleHint=company|placement
-// State is stateless — encoded as base64 JSON signed with JWT_SECRET
-// This avoids in-memory state being lost on Railway restarts
-router.get('/carerix/login', (req, res) => {
-  const roleHint = req.query.roleHint || 'placement';
-  const redirectUri = `${config.appUrl}/auth/carerix/callback`;
+// ── POST /auth/login/carerix — direct credential login (ROPC flow) ────────────
+// User enters their Carerix email/password on our login page.
+// We send credentials directly to Carerix token endpoint (password grant).
+// No redirects — same UX as Agency login.
+router.post('/login/carerix', async (req, res, next) => {
+  try {
+    const { email, password, roleHint } = req.body;
+    if (!email || !password) throw new ApiError('Email and password are required', 400);
 
-  // Encode state as signed base64 payload — no server-side storage needed
-  const payload = {
-    roleHint,
-    redirectUri,
-    nonce: crypto.randomBytes(8).toString('hex'),
-    exp: Date.now() + 10 * 60 * 1000, // 10 minute expiry
-  };
-  const state = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    // Use Resource Owner Password Credentials (ROPC) grant
+    const tokenRes = await axios.post(config.carerix.tokenUrl,
+      new URLSearchParams({
+        grant_type: 'password',
+        client_id:  config.carerix.clientId,
+        client_secret: config.carerix.clientSecret,
+        username:   email,
+        password:   password,
+        scope:      'openid profile email',
+      }), {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent':   'confair-platform/1.0',
+        },
+        timeout: 10_000,
+      }
+    ).catch(err => {
+      const msg = err.response?.data?.error_description || err.response?.data?.error || err.message;
+      throw new ApiError(`Invalid Carerix credentials: ${msg}`, 401);
+    });
 
-  const authUrl = getCarerixAuthUrl(state, redirectUri);
-  logger.info('Carerix OAuth redirect', { roleHint });
-  res.redirect(authUrl);
+    const { access_token } = tokenRes.data;
+    if (!access_token) throw new ApiError('Carerix did not return an access token', 502);
+
+    // Get user identity from Carerix userinfo endpoint
+    const identity = await getCarerixUserInfo(access_token);
+
+    // Optional role hint validation
+    if (roleHint) {
+      const isPlacement = identity.platformRole === 'placement';
+      const isCompany   = ['company_admin','company_user'].includes(identity.platformRole);
+      if (roleHint === 'placement' && !isPlacement) throw new ApiError('This account is not a Placement', 403);
+      if (roleHint === 'company'   && !isCompany)   throw new ApiError('This account is not a Company user', 403);
+    }
+
+    // Sync to local cache
+    syncIdentityCache(identity).catch(e => logger.error('Cache sync failed', { e }));
+
+    // Provision Supabase session
+    const session = await provisionCarerixSession(identity);
+
+    await writeAuditLog({
+      eventType:   'login_carerix',
+      actorUserId: session.userId,
+      actorRole:   identity.platformRole,
+      payload:     { email, carerixUserId: identity.carerixUserId },
+      ipAddress:   req.ip,
+    });
+
+    res.json({
+      accessToken:  session.accessToken,
+      refreshToken: session.refreshToken,
+      expiresAt:    session.expiresAt,
+      user: {
+        id:              session.userId,
+        email:           identity.email,
+        displayName:     identity.fullName,
+        role:            identity.platformRole,
+        authSource:      'carerix',
+        carerixUserId:   identity.carerixUserId,
+        carerixCompanyId: identity.carerixCompanyId,
+      },
+    });
+  } catch (err) { next(err); }
 });
 
 // ── GET /auth/carerix/callback — OAuth2 callback ──────────────────────────────
