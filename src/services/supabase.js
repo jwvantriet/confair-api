@@ -75,21 +75,20 @@ export async function provisionCarerixSession(identity) {
   }
 
   // createSession was removed in Supabase JS v2.
-  // Use generateLink to get a magic link token, then verifyOtp to exchange it for a session.
+  // Use generateLink to get a magic link, then exchange token_hash for a session.
   const { data: linkData, error: linkErr } = await adminSupabase.auth.admin.generateLink({
     type:  'magiclink',
     email: identity.email,
   });
   if (linkErr) throw new Error(`Failed to generate session link: ${linkErr.message}`);
 
-  // Parse token from the action_link URL
-  const actionUrl  = new URL(linkData.properties.action_link);
-  const token      = actionUrl.searchParams.get('token');
+  // Use token_hash (not the URL token) — this is the correct v2 approach
+  const tokenHash = linkData.properties?.hashed_token;
+  if (!tokenHash) throw new Error('No hashed_token in generateLink response');
 
   const { data: otpData, error: otpErr } = await adminSupabase.auth.verifyOtp({
-    email: identity.email,
-    token,
-    type: 'magiclink',
+    token_hash: tokenHash,
+    type: 'email',
   });
   if (otpErr) throw new Error(`Session creation failed: ${otpErr.message}`);
 
