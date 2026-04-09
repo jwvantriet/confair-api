@@ -75,52 +75,96 @@ router.post('/login/agency', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ── POST /auth/login/carerix — direct credential login (ROPC flow) ────────────
-// User enters their Carerix email/password on our login page.
-// We send credentials directly to Carerix token endpoint (password grant).
-// No redirects — same UX as Agency login.
+// ── POST /auth/login/carerix — Carerix REST API login ────────────────────────
+// Uses the Carerix legacy REST API (api.carerix.com) with encrypted password.
+// Flow:
+//   1. MD5 hash the user's password
+//   2. Call CRUser/login-with-encrypted-password with username + MD5 hash
+//   3. On success, fetch CREmployee or CRContact to determine role
+//   4. Provision Supabase session
 router.post('/login/carerix', async (req, res, next) => {
   try {
-    const { email, password, roleHint } = req.body;
-    if (!email || !password) throw new ApiError('Email and password are required', 400);
+    const { username, password, roleHint } = req.body;
+    if (!username || !password) throw new ApiError('Username and password are required', 400);
 
-    // Use Resource Owner Password Credentials (ROPC) grant
-    const tokenRes = await axios.post(config.carerix.tokenUrl,
-      new URLSearchParams({
-        grant_type: 'password',
-        client_id:  config.carerix.clientId,
-        client_secret: config.carerix.clientSecret,
-        username:   email,
-        password:   password,
-        scope:      'openid profile email',
-      }), {
+    const restBase    = config.carerix.restUrl;
+    const restAuth    = Buffer.from(`${config.carerix.restUsername}:${config.carerix.restPassword}`).toString('base64');
+    const md5password = crypto.createHash('md5').update(password).digest('hex');
+
+    // Step 1: Authenticate via CRUser/login-with-encrypted-password
+    let loginRes;
+    try {
+      loginRes = await axios.get(`${restBase}CRUser/login-with-encrypted-password`, {
+        params: { u: username, p: md5password, show: 'toEmployee.employeeID,toEmployee._id,emailAddress,firstName,lastName' },
         headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'User-Agent':   'confair-platform/1.0',
+          'Authorization': `Basic ${restAuth}`,
+          'Accept':        'application/json',
+          'User-Agent':    'confair-platform/1.0',
         },
-        timeout: 10_000,
+        timeout: 15_000,
+      });
+    } catch (err) {
+      const status = err.response?.status;
+      if (status === 401 || status === 403) {
+        throw new ApiError('Invalid username or password', 401);
       }
-    ).catch(err => {
-      const msg = err.response?.data?.error_description || err.response?.data?.error || err.message;
-      throw new ApiError(`Invalid Carerix credentials: ${msg}`, 401);
-    });
-
-    const { access_token } = tokenRes.data;
-    if (!access_token) throw new ApiError('Carerix did not return an access token', 502);
-
-    // Get user identity from Carerix userinfo endpoint
-    const identity = await getCarerixUserInfo(access_token);
-
-    // Optional role hint validation
-    if (roleHint) {
-      const isPlacement = identity.platformRole === 'placement';
-      const isCompany   = ['company_admin','company_user'].includes(identity.platformRole);
-      if (roleHint === 'placement' && !isPlacement) throw new ApiError('This account is not a Placement', 403);
-      if (roleHint === 'company'   && !isCompany)   throw new ApiError('This account is not a Company user', 403);
+      logger.error('Carerix REST login error', { error: err.message, status });
+      throw new ApiError('Could not connect to Carerix. Please try again.', 502);
     }
 
-    // Sync to local cache
-    syncIdentityCache(identity).catch(e => logger.error('Cache sync failed', { e }));
+    const userData = loginRes.data;
+    if (!userData || userData.errorCode) {
+      throw new ApiError('Invalid username or password', 401);
+    }
+
+    logger.info('Carerix REST login success', { username });
+
+    // Step 2: Determine role — check if they have an Employee or Contact record
+    const carerixUserId  = userData._id || userData.id || String(userData.userID || '');
+    const employeeData   = userData.toEmployee;
+    const employeeId     = employeeData?._id || employeeData?.employeeID || null;
+
+    // Try to find a Contact record if no Employee link
+    let contactData = null;
+    let companyId   = null;
+    if (!employeeId) {
+      try {
+        const contactRes = await axios.get(`${restBase}CRContact`, {
+          params: { qualifier: `toUser._id = ${carerixUserId}`, show: 'toCompany._id,toCompany.name,_id' },
+          headers: { 'Authorization': `Basic ${restAuth}`, 'Accept': 'application/json', 'User-Agent': 'confair-platform/1.0' },
+          timeout: 10_000,
+        });
+        const contacts = contactRes.data?.items || contactRes.data;
+        if (Array.isArray(contacts) && contacts.length > 0) {
+          contactData = contacts[0];
+          companyId   = contactData.toCompany?._id || null;
+        }
+      } catch (e) {
+        logger.warn('Could not fetch contact record', { e: e.message });
+      }
+    }
+
+    // Determine platform role
+    const platformRole = employeeId ? 'placement' : (contactData ? 'company_admin' : 'placement');
+
+    // Validate role hint
+    if (roleHint) {
+      const isPlacement = platformRole === 'placement';
+      const isCompany   = platformRole.startsWith('company');
+      if (roleHint === 'placement' && !isPlacement) throw new ApiError('This account is not registered as a Placement', 403);
+      if (roleHint === 'company'   && !isCompany)   throw new ApiError('This account is not registered as a Company user', 403);
+    }
+
+    const identity = {
+      carerixUserId:    carerixUserId,
+      carerixCompanyId: companyId ? String(companyId) : null,
+      carerixContactId: contactData?._id ? String(contactData._id) : null,
+      email:            userData.emailAddress || username,
+      fullName:         `${userData.firstName || ''} ${userData.lastName || ''}`.trim() || username,
+      roleInCarerix:    employeeId ? 'Employee' : 'Contact',
+      platformRole,
+      rawPayload:       userData,
+    };
 
     // Provision Supabase session
     const session = await provisionCarerixSession(identity);
@@ -129,7 +173,7 @@ router.post('/login/carerix', async (req, res, next) => {
       eventType:   'login_carerix',
       actorUserId: session.userId,
       actorRole:   identity.platformRole,
-      payload:     { email, carerixUserId: identity.carerixUserId },
+      payload:     { username, carerixUserId, role: platformRole },
       ipAddress:   req.ip,
     });
 
