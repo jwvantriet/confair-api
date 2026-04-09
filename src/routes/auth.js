@@ -206,17 +206,14 @@ router.post('/login/carerix', async (req, res, next) => {
       }
     }
 
-    // Determine platform role
-    const platformRole = employeeId ? 'placement' : (contactData ? 'company_admin' : 'placement');
-    logger.info('Role resolved', { username, crUserId, employeeId, hasContact: !!contactData, companyId, platformRole });
+    // Determine platform role from roleHint (user's selection on login form)
+    // Entity lookup (Employee/Contact) enriches data but doesn't block login
+    // Carerix credential validation IS the authentication
+    const platformRole = roleHint === 'company' ? 'company_admin'
+                       : roleHint === 'placement' ? 'placement'
+                       : (employeeId ? 'placement' : (contactData ? 'company_admin' : 'placement'));
 
-    // Validate role hint
-    if (roleHint) {
-      const isPlacement = platformRole === 'placement';
-      const isCompany   = platformRole.startsWith('company');
-      if (roleHint === 'placement' && !isPlacement) throw new ApiError('This account is not registered as a Placement', 403);
-      if (roleHint === 'company'   && !isCompany)   throw new ApiError('This account is not registered as a Company user', 403);
-    }
+    logger.info('Role resolved', { username, crUserId, employeeId, hasContact: !!contactData, companyId, platformRole });
 
     const identity = {
       carerixUserId:    String(crUserId),
