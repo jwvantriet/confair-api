@@ -155,50 +155,54 @@ router.post('/login/carerix', async (req, res, next) => {
     }
 
     if (!employeeId) {
-      // Look up CREmployee by toUser._id
+      // Fetch the CRUser directly by ID with toEmployee and toContact expanded
+      // This avoids reverse-lookup qualifiers (toUser._id = X) which return 500
       try {
-        const empRes = await axios.get(`${restBase}CREmployee`, {
-          params: { qualifier: `toUser._id = ${crUserId}`, show: 'firstName,lastName,emailAddress', limit: 1 },
+        const userRes = await axios.get(`${restBase}CRUser/${crUserId}`, {
+          params: { show: 'toEmployee,toContact,firstName,lastName' },
           headers: { 'Authorization': `Basic ${restAuth}`, 'User-Agent': 'confair-platform/1.0' },
           timeout: 10_000,
           responseType: 'text',
         });
-        const empXml    = empRes.data;
-        const empParsed = parseXml(empXml);
-        // Can be array or single object
-        const empArr    = empParsed?.array?.CREmployee || empParsed?.CREmployee;
-        const emp       = Array.isArray(empArr) ? empArr[0] : empArr;
-        if (emp) {
-          employeeId = getId(emp);
-          fullName   = `${emp.firstName || ''} ${emp.lastName || ''}`.trim() || username;
-          logger.info('Employee found via lookup', { employeeId, fullName });
-        }
-      } catch (e) {
-        logger.info('No employee found', { error: e.message });
-      }
-    }
+        const userXml    = userRes.data;
+        const userParsed = parseXml(userXml);
+        const crUserFull = userParsed?.CRUser || {};
 
-    if (!employeeId) {
-      // Look up CRContact by toUser._id
-      try {
-        const conRes = await axios.get(`${restBase}CRContact`, {
-          params: { qualifier: `toUser._id = ${crUserId}`, show: 'firstName,lastName,toCompany._id,toCompany.name', limit: 1 },
-          headers: { 'Authorization': `Basic ${restAuth}`, 'User-Agent': 'confair-platform/1.0' },
-          timeout: 10_000,
-          responseType: 'text',
+        logger.info('CRUser full fetch', {
+          id:          crUserFull['@_id'],
+          hasEmployee: !!crUserFull.toEmployee,
+          hasContact:  !!crUserFull.toContact,
+          raw:         userXml?.substring(0, 500),
         });
-        const conXml    = conRes.data;
-        const conParsed = parseXml(conXml);
-        const conArr    = conParsed?.array?.CRContact || conParsed?.CRContact;
-        const con       = Array.isArray(conArr) ? conArr[0] : conArr;
-        if (con) {
-          contactData = con;
-          companyId   = getId(con.toCompany?.CRCompany) || getId(con.toCompany) || null;
-          fullName    = `${con.firstName || ''} ${con.lastName || ''}`.trim() || username;
-          logger.info('Contact found via lookup', { contactId: getId(con), companyId, fullName });
+
+        // Check toEmployee
+        const empNode = crUserFull.toEmployee?.CREmployee || crUserFull.toEmployee;
+        if (empNode && getId(empNode)) {
+          employeeId = getId(empNode);
+          fullName   = `${empNode.firstName || crUserFull.firstName || ''} ${empNode.lastName || crUserFull.lastName || ''}`.trim() || username;
+          logger.info('Employee found via CRUser fetch', { employeeId, fullName });
         }
+
+        // Check toContact
+        if (!employeeId) {
+          const conNode = crUserFull.toContact?.CRContact || crUserFull.toContact;
+          if (conNode && getId(conNode)) {
+            contactData = conNode;
+            // Get company from toCompany
+            const compNode = conNode.toCompany?.CRCompany || conNode.toCompany;
+            companyId      = getId(compNode) || null;
+            fullName       = `${conNode.firstName || crUserFull.firstName || ''} ${conNode.lastName || crUserFull.lastName || ''}`.trim() || username;
+            logger.info('Contact found via CRUser fetch', { contactId: getId(conNode), companyId, fullName });
+          }
+        }
+
+        // Fallback: use name from CRUser itself
+        if (!fullName || fullName === username) {
+          fullName = `${crUserFull.firstName || ''} ${crUserFull.lastName || ''}`.trim() || username;
+        }
+
       } catch (e) {
-        logger.info('No contact found', { error: e.message });
+        logger.warn('CRUser full fetch failed', { error: e.message, status: e.response?.status });
       }
     }
 
