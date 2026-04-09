@@ -25,6 +25,7 @@ const corsOptions = {
 };
 
 app.use(helmet({ crossOriginResourcePolicy: false }));
+app.set('trust proxy', 1); // Trust Railway's proxy for correct IP detection
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));  // handle all preflight requests
 
