@@ -12,6 +12,7 @@ import { Router } from 'express';
 import axios from 'axios';
 import { z } from 'zod';
 import crypto from 'crypto';
+import { XMLParser } from 'fast-xml-parser';
 import { adminSupabase, provisionCarerixSession } from '../services/supabase.js';
 import {
   getCarerixUserInfo,
@@ -90,106 +91,120 @@ router.post('/login/carerix', async (req, res, next) => {
     const restBase    = config.carerix.restUrl;
     const restAuth    = Buffer.from(`${config.carerix.restUsername}:${config.carerix.restPassword}`).toString('base64');
     const md5password = crypto.createHash('md5').update(password).digest('hex');
+    const xmlParser   = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
 
-    // Step 1: Authenticate via CRUser/login-with-encrypted-password
-    let loginRes;
+    // Helper: parse Carerix XML response
+    const parseXml = (xml) => {
+      if (typeof xml !== 'string') return xml; // already parsed
+      try { return xmlParser.parse(xml); } catch { return null; }
+    };
+
+    // Helper: get attribute id from parsed XML object
+    const getId = (obj) => obj?.['@_id'] || obj?.id || obj?._id || null;
+
+    // Step 1: Authenticate via CRUser/login-with-encrypted-password (returns XML)
+    let loginXml;
     try {
-      loginRes = await axios.get(`${restBase}CRUser/login-with-encrypted-password`, {
+      const loginRes = await axios.get(`${restBase}CRUser/login-with-encrypted-password`, {
         params: { u: username, p: md5password, show: 'toEmployee' },
-        headers: {
-          'Authorization': `Basic ${restAuth}`,
-          'Accept':        'application/json',
-          'User-Agent':    'confair-platform/1.0',
-        },
+        headers: { 'Authorization': `Basic ${restAuth}`, 'User-Agent': 'confair-platform/1.0' },
         timeout: 15_000,
+        responseType: 'text',
       });
+      loginXml = loginRes.data;
     } catch (err) {
+      const data   = err.response?.data || '';
       const status = err.response?.status;
-      if (status === 401 || status === 403) {
+      if (typeof data === 'string' && data.includes('AuthorizationFailed')) {
         throw new ApiError('Invalid username or password', 401);
       }
+      if (status === 401 || status === 403) throw new ApiError('Invalid username or password', 401);
       logger.error('Carerix REST login error', { error: err.message, status });
       throw new ApiError('Could not connect to Carerix. Please try again.', 502);
     }
 
-    const userData = loginRes.data;
-    if (!userData || userData.errorCode) {
+    // Check for auth failure in XML
+    if (loginXml?.includes('AuthorizationFailed') || loginXml?.includes('NSException')) {
       throw new ApiError('Invalid username or password', 401);
     }
 
-    // Log raw response so we can see the field structure
-    logger.info('Carerix REST raw response', { 
-      keys: Object.keys(userData),
-      _id: userData._id,
-      userID: userData.userID,
-      scrambledUserID: userData.scrambledUserID,
-      employeeID: userData.employeeID,
-      toEmployee: userData.toEmployee,
-      firstName: userData.firstName,
-      lastName: userData.lastName,
-    });
+    // Parse the XML login response
+    const parsed   = parseXml(loginXml);
+    const crUser   = parsed?.CRUser || {};
+    const crUserId = getId(crUser);
 
-    // Step 2: Determine role — check if they have an Employee or Contact record
-    // Carerix REST returns _id as the CRUser ID
-    const carerixUserId  = String(userData._id || userData.userID || '');
-    const employeeData   = userData.toEmployee;
-    // Employee link can be nested or flat depending on what Carerix returns
-    const employeeId     = employeeData?._id || employeeData?.employeeID || null;
-    // Build full name from employee record first, then user record
-    const firstName = employeeData?.firstName || userData.firstName || '';
-    const lastName  = employeeData?.lastName  || userData.lastName  || '';
-    const fullName  = `${firstName} ${lastName}`.trim() || username;
+    logger.info('Carerix login parsed', { crUserId, hasEmployee: !!crUser.toEmployee });
 
-    // Step 2: Determine role by looking up what entity is linked to this CRUser
-    // Carerix uses 'userName' (not email) as the login field on CRUser records.
-    // We look up the CRUser by userName to find their linked Employee or Contact.
+    if (!crUserId) {
+      logger.error('No CRUser id in login response', { loginXml: loginXml?.substring(0, 300) });
+      throw new ApiError('Invalid username or password', 401);
+    }
+
+    // Step 2: Check if this user is an Employee or Contact
+    // Look up CREmployee where toUser._id = crUserId
+    let employeeId  = null;
     let contactData = null;
     let companyId   = null;
+    let fullName    = username;
 
-    // The login response toEmployee tells us if this user is an Employee
-    // If not, look up CRUser by userName to find their Contact link
+    // First check if login response already has toEmployee
+    if (crUser.toEmployee?.CREmployee) {
+      const emp = crUser.toEmployee.CREmployee;
+      employeeId = getId(emp) || crUser.toEmployee.CREmployee?.employeeID;
+      logger.info('Employee found in login response', { employeeId });
+    }
+
     if (!employeeId) {
+      // Look up CREmployee by toUser._id
       try {
-        // Look up CRUser by userName to find linked contact
-        const userRes = await axios.get(`${restBase}CRUser`, {
-          params: {
-            qualifier: `userName = '${username}'`,
-            show:      '_id,userName,toEmployee._id,toEmployee.employeeID,toContact._id,toContact.toCompany._id,toContact.toCompany.name',
-            limit:     1,
-          },
-          headers: {
-            'Authorization': `Basic ${restAuth}`,
-            'Accept':        'application/json',
-            'User-Agent':    'confair-platform/1.0',
-          },
+        const empRes = await axios.get(`${restBase}CREmployee`, {
+          params: { qualifier: `toUser._id = ${crUserId}`, show: 'firstName,lastName,emailAddress', limit: 1 },
+          headers: { 'Authorization': `Basic ${restAuth}`, 'User-Agent': 'confair-platform/1.0' },
           timeout: 10_000,
+          responseType: 'text',
         });
-        const data  = userRes.data;
-        const users = data?.items || (Array.isArray(data) ? data : (data?._id ? [data] : []));
-        if (users.length > 0) {
-          const crUser = users[0];
-          logger.info('CRUser lookup result', {
-            userName: crUser.userName,
-            hasEmployee: !!crUser.toEmployee,
-            hasContact:  !!crUser.toContact,
-            companyId:   crUser.toContact?.toCompany?._id,
-          });
-          if (crUser.toContact?._id) {
-            contactData = crUser.toContact;
-            companyId   = crUser.toContact.toCompany?._id || null;
-          } else if (crUser.toEmployee?._id) {
-            // Employee found via CRUser lookup — override
-            logger.info('Employee found via CRUser lookup', { employeeId: crUser.toEmployee._id });
-          }
+        const empXml    = empRes.data;
+        const empParsed = parseXml(empXml);
+        // Can be array or single object
+        const empArr    = empParsed?.array?.CREmployee || empParsed?.CREmployee;
+        const emp       = Array.isArray(empArr) ? empArr[0] : empArr;
+        if (emp) {
+          employeeId = getId(emp);
+          fullName   = `${emp.firstName || ''} ${emp.lastName || ''}`.trim() || username;
+          logger.info('Employee found via lookup', { employeeId, fullName });
         }
       } catch (e) {
-        logger.warn('CRUser lookup failed', { error: e.message, status: e.response?.status });
+        logger.info('No employee found', { error: e.message });
+      }
+    }
+
+    if (!employeeId) {
+      // Look up CRContact by toUser._id
+      try {
+        const conRes = await axios.get(`${restBase}CRContact`, {
+          params: { qualifier: `toUser._id = ${crUserId}`, show: 'firstName,lastName,toCompany._id,toCompany.name', limit: 1 },
+          headers: { 'Authorization': `Basic ${restAuth}`, 'User-Agent': 'confair-platform/1.0' },
+          timeout: 10_000,
+          responseType: 'text',
+        });
+        const conXml    = conRes.data;
+        const conParsed = parseXml(conXml);
+        const conArr    = conParsed?.array?.CRContact || conParsed?.CRContact;
+        const con       = Array.isArray(conArr) ? conArr[0] : conArr;
+        if (con) {
+          contactData = con;
+          companyId   = getId(con.toCompany?.CRCompany) || getId(con.toCompany) || null;
+          fullName    = `${con.firstName || ''} ${con.lastName || ''}`.trim() || username;
+          logger.info('Contact found via lookup', { contactId: getId(con), companyId, fullName });
+        }
+      } catch (e) {
+        logger.info('No contact found', { error: e.message });
       }
     }
 
     // Determine platform role
     const platformRole = employeeId ? 'placement' : (contactData ? 'company_admin' : 'placement');
-    logger.info('Role resolved', { username, employeeId, hasContact: !!contactData, companyId, platformRole });
+    logger.info('Role resolved', { username, crUserId, employeeId, hasContact: !!contactData, companyId, platformRole });
 
     // Validate role hint
     if (roleHint) {
@@ -200,14 +215,14 @@ router.post('/login/carerix', async (req, res, next) => {
     }
 
     const identity = {
-      carerixUserId:    carerixUserId,
+      carerixUserId:    String(crUserId),
       carerixCompanyId: companyId ? String(companyId) : null,
-      carerixContactId: contactData?._id ? String(contactData._id) : null,
-      email:            userData.emailAddress || username,
-      fullName:         fullName,
+      carerixContactId: contactData ? String(getId(contactData) || '') : null,
+      email:            crUser.emailAddress || username,
+      fullName,
       roleInCarerix:    employeeId ? 'Employee' : 'Contact',
       platformRole,
-      rawPayload:       userData,
+      rawPayload:       { crUserId, employeeId, companyId },
     };
 
     // Provision Supabase session
@@ -217,7 +232,7 @@ router.post('/login/carerix', async (req, res, next) => {
       eventType:   'login_carerix',
       actorUserId: session.userId,
       actorRole:   identity.platformRole,
-      payload:     { username, carerixUserId, role: platformRole },
+      payload:     { username, carerixUserId: String(crUserId), role: platformRole },
       ipAddress:   req.ip,
     });
 
@@ -238,70 +253,6 @@ router.post('/login/carerix', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ── GET /auth/carerix/callback — OAuth2 callback ──────────────────────────────
-router.get('/carerix/callback', async (req, res, next) => {
-  try {
-    const { code, state, error: oauthError, error_description } = req.query;
-
-    if (oauthError) {
-      logger.warn('Carerix OAuth error', { error: oauthError, description: error_description });
-      const frontendUrl = config.cors.origins[0] || 'https://confair-platform.vercel.app';
-      return res.redirect(`${frontendUrl}/login?error=${encodeURIComponent(error_description || oauthError)}`);
-    }
-
-    // Decode stateless state (base64 encoded JSON)
-    let stateData;
-    try {
-      stateData = JSON.parse(Buffer.from(state, 'base64url').toString('utf8'));
-    } catch {
-      throw new ApiError('Invalid OAuth state format', 400);
-    }
-    if (!stateData.exp || Date.now() > stateData.exp) {
-      throw new ApiError('OAuth state has expired. Please try logging in again.', 400);
-    }
-    const { roleHint, redirectUri } = stateData;
-
-    // Exchange code for tokens
-    const tokens = await exchangeCodeForTokens(code, redirectUri);
-
-    // Get user identity from Carerix
-    const identity = await getCarerixUserInfo(tokens.accessToken);
-
-    // Sync to local cache
-    syncIdentityCache(identity).catch(e => logger.error('Cache sync failed', { e }));
-
-    // Provision Supabase session
-    const session = await provisionCarerixSession(identity);
-
-    await writeAuditLog({
-      eventType:   'login_carerix',
-      actorUserId: session.userId,
-      actorRole:   identity.platformRole,
-      payload:     { email: identity.email, carerixUserId: identity.carerixUserId },
-      ipAddress:   req.ip,
-    });
-
-    // Redirect to frontend with session tokens as query params
-    // Frontend JS reads these, saves to localStorage, then redirects to dashboard
-    const frontendUrl = config.cors.origins[0] || 'https://confair-platform.vercel.app';
-    const params = new URLSearchParams({
-      access_token:  session.accessToken,
-      refresh_token: session.refreshToken,
-      expires_at:    String(session.expiresAt),
-      user:          JSON.stringify({
-        id:              session.userId,
-        email:           identity.email,
-        displayName:     identity.fullName,
-        role:            identity.platformRole,
-        authSource:      'carerix',
-        carerixUserId:   identity.carerixUserId,
-        carerixCompanyId: identity.carerixCompanyId,
-      }),
-    });
-
-    res.redirect(`${frontendUrl}/auth/callback?${params.toString()}`);
-  } catch (err) { next(err); }
-});
 
 // ── POST /auth/refresh ────────────────────────────────────────────────────────
 router.post('/refresh', async (req, res, next) => {
