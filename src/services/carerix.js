@@ -33,34 +33,57 @@ async function getServiceToken() {
   const now = Date.now();
   if (_serviceToken && now < _serviceTokenExp) return _serviceToken;
 
+  // Match the working Python app exactly:
+  // 1. Try HTTP Basic Auth first (raw base64, NO URL encoding)
+  // 2. Fall back to credentials in body if 400/401
+  const basicAuth = Buffer.from(
+    `${config.carerix.clientId}:${config.carerix.clientSecret}`
+  ).toString('base64');
+
+  const baseForm = new URLSearchParams({ grant_type: 'client_credentials' });
+
+  let res;
   try {
-    const res = await axios.post(config.carerix.tokenUrl,
-      new URLSearchParams({
+    res = await axios.post(config.carerix.tokenUrl, baseForm, {
+      headers: {
+        'Content-Type':  'application/x-www-form-urlencoded',
+        'Authorization': `Basic ${basicAuth}`,
+        'User-Agent':    'confair-platform/1.0',
+      },
+      timeout: 10_000,
+    });
+  } catch (basicErr) {
+    const status = basicErr.response?.status;
+    logger.warn('Basic Auth failed, trying body params', { status, error: basicErr.response?.data });
+    if (status === 400 || status === 401 || status === 403) {
+      // Fallback: credentials in body
+      const bodyForm = new URLSearchParams({
         grant_type:    'client_credentials',
         client_id:     config.carerix.clientId,
         client_secret: config.carerix.clientSecret,
-        scope:         'urn:cx/cx5Wrapper:data:manage',
-      }), {
+      });
+      res = await axios.post(config.carerix.tokenUrl, bodyForm, {
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
           'User-Agent':   'confair-platform/1.0',
         },
         timeout: 10_000,
-      }
-    );
-    _serviceToken    = res.data.access_token;
-    _serviceTokenExp = now + (res.data.expires_in - 60) * 1000;
-    logger.info('Carerix service token refreshed', { expiresIn: res.data.expires_in });
-    return _serviceToken;
-  } catch (err) {
-    logger.error('Failed to get Carerix service token', {
-      error: err.message,
-      status: err.response?.status,
-      data:   err.response?.data,
-    });
-    throw new Error(`Carerix token fetch failed: ${err.response?.data?.error_description || err.message}`);
+      });
+    } else {
+      throw new Error(`Carerix token fetch failed: ${basicErr.response?.data?.error_description || basicErr.message}`);
+    }
   }
+
+  if (!res?.data?.access_token) {
+    throw new Error(`Carerix token response had no access_token: ${JSON.stringify(res?.data)}`);
+  }
+
+  _serviceToken    = res.data.access_token;
+  _serviceTokenExp = now + (res.data.expires_in - 60) * 1000;
+  logger.info('Carerix service token refreshed', { expiresIn: res.data.expires_in });
+  return _serviceToken;
 }
+
 
 // ── GraphQL client ─────────────────────────────────────────────────────────────
 async function carerixGQL(query, variables = {}) {
