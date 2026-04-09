@@ -140,15 +140,21 @@ router.post('/login/carerix', async (req, res, next) => {
     const lastName  = employeeData?.lastName  || userData.lastName  || '';
     const fullName  = `${firstName} ${lastName}`.trim() || username;
 
-    // Try to find a Contact record by email if no Employee link
+    // Step 2: Determine role by looking up what entity is linked to this CRUser
+    // Carerix uses 'userName' (not email) as the login field on CRUser records.
+    // We look up the CRUser by userName to find their linked Employee or Contact.
     let contactData = null;
     let companyId   = null;
+
+    // The login response toEmployee tells us if this user is an Employee
+    // If not, look up CRUser by userName to find their Contact link
     if (!employeeId) {
       try {
-        const contactRes = await axios.get(`${restBase}CRContact`, {
+        // Look up CRUser by userName to find linked contact
+        const userRes = await axios.get(`${restBase}CRUser`, {
           params: {
-            qualifier: `emailAddress = '${username}'`,
-            show:      'toCompany._id,toCompany.name,_id,emailAddress',
+            qualifier: `userName = '${username}'`,
+            show:      '_id,userName,toEmployee._id,toEmployee.employeeID,toContact._id,toContact.toCompany._id,toContact.toCompany.name',
             limit:     1,
           },
           headers: {
@@ -158,21 +164,32 @@ router.post('/login/carerix', async (req, res, next) => {
           },
           timeout: 10_000,
         });
-        // Carerix REST can return single object or array in items
-        const data = contactRes.data;
-        const contacts = data?.items || (Array.isArray(data) ? data : (data?._id ? [data] : []));
-        if (contacts.length > 0) {
-          contactData = contacts[0];
-          companyId   = contactData.toCompany?._id || null;
+        const data  = userRes.data;
+        const users = data?.items || (Array.isArray(data) ? data : (data?._id ? [data] : []));
+        if (users.length > 0) {
+          const crUser = users[0];
+          logger.info('CRUser lookup result', {
+            userName: crUser.userName,
+            hasEmployee: !!crUser.toEmployee,
+            hasContact:  !!crUser.toContact,
+            companyId:   crUser.toContact?.toCompany?._id,
+          });
+          if (crUser.toContact?._id) {
+            contactData = crUser.toContact;
+            companyId   = crUser.toContact.toCompany?._id || null;
+          } else if (crUser.toEmployee?._id) {
+            // Employee found via CRUser lookup — override
+            logger.info('Employee found via CRUser lookup', { employeeId: crUser.toEmployee._id });
+          }
         }
-        logger.info('Contact lookup result', { found: contacts.length > 0, companyId });
       } catch (e) {
-        logger.warn('Could not fetch contact record', { error: e.message, status: e.response?.status });
+        logger.warn('CRUser lookup failed', { error: e.message, status: e.response?.status });
       }
     }
 
     // Determine platform role
     const platformRole = employeeId ? 'placement' : (contactData ? 'company_admin' : 'placement');
+    logger.info('Role resolved', { username, employeeId, hasContact: !!contactData, companyId, platformRole });
 
     // Validate role hint
     if (roleHint) {
