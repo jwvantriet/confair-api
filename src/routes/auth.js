@@ -95,7 +95,7 @@ router.post('/login/carerix', async (req, res, next) => {
     let loginRes;
     try {
       loginRes = await axios.get(`${restBase}CRUser/login-with-encrypted-password`, {
-        params: { u: username, p: md5password, show: '_id,userID,firstName,lastName,emailAddress,toEmployee._id,toEmployee.employeeID,toEmployee.firstName,toEmployee.lastName' },
+        params: { u: username, p: md5password, show: 'toEmployee' },
         headers: {
           'Authorization': `Basic ${restAuth}`,
           'Accept':        'application/json',
@@ -117,7 +117,17 @@ router.post('/login/carerix', async (req, res, next) => {
       throw new ApiError('Invalid username or password', 401);
     }
 
-    logger.info('Carerix REST login success', { username });
+    // Log raw response so we can see the field structure
+    logger.info('Carerix REST raw response', { 
+      keys: Object.keys(userData),
+      _id: userData._id,
+      userID: userData.userID,
+      scrambledUserID: userData.scrambledUserID,
+      employeeID: userData.employeeID,
+      toEmployee: userData.toEmployee,
+      firstName: userData.firstName,
+      lastName: userData.lastName,
+    });
 
     // Step 2: Determine role — check if they have an Employee or Contact record
     // Carerix REST returns _id as the CRUser ID
@@ -130,23 +140,34 @@ router.post('/login/carerix', async (req, res, next) => {
     const lastName  = employeeData?.lastName  || userData.lastName  || '';
     const fullName  = `${firstName} ${lastName}`.trim() || username;
 
-    // Try to find a Contact record if no Employee link
+    // Try to find a Contact record by email if no Employee link
     let contactData = null;
     let companyId   = null;
     if (!employeeId) {
       try {
         const contactRes = await axios.get(`${restBase}CRContact`, {
-          params: { qualifier: `toUser._id = ${carerixUserId}`, show: 'toCompany._id,toCompany.name,_id' },
-          headers: { 'Authorization': `Basic ${restAuth}`, 'Accept': 'application/json', 'User-Agent': 'confair-platform/1.0' },
+          params: {
+            qualifier: `emailAddress = '${username}'`,
+            show:      'toCompany._id,toCompany.name,_id,emailAddress',
+            limit:     1,
+          },
+          headers: {
+            'Authorization': `Basic ${restAuth}`,
+            'Accept':        'application/json',
+            'User-Agent':    'confair-platform/1.0',
+          },
           timeout: 10_000,
         });
-        const contacts = contactRes.data?.items || contactRes.data;
-        if (Array.isArray(contacts) && contacts.length > 0) {
+        // Carerix REST can return single object or array in items
+        const data = contactRes.data;
+        const contacts = data?.items || (Array.isArray(data) ? data : (data?._id ? [data] : []));
+        if (contacts.length > 0) {
           contactData = contacts[0];
           companyId   = contactData.toCompany?._id || null;
         }
+        logger.info('Contact lookup result', { found: contacts.length > 0, companyId });
       } catch (e) {
-        logger.warn('Could not fetch contact record', { e: e.message });
+        logger.warn('Could not fetch contact record', { error: e.message, status: e.response?.status });
       }
     }
 
