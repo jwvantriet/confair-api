@@ -95,7 +95,7 @@ router.post('/login/carerix', async (req, res, next) => {
     let loginRes;
     try {
       loginRes = await axios.get(`${restBase}CRUser/login-with-encrypted-password`, {
-        params: { u: username, p: md5password, show: 'toEmployee.employeeID,toEmployee._id,emailAddress,firstName,lastName' },
+        params: { u: username, p: md5password, show: '_id,userID,firstName,lastName,emailAddress,toEmployee._id,toEmployee.employeeID,toEmployee.firstName,toEmployee.lastName' },
         headers: {
           'Authorization': `Basic ${restAuth}`,
           'Accept':        'application/json',
@@ -120,9 +120,15 @@ router.post('/login/carerix', async (req, res, next) => {
     logger.info('Carerix REST login success', { username });
 
     // Step 2: Determine role — check if they have an Employee or Contact record
-    const carerixUserId  = userData._id || userData.id || String(userData.userID || '');
+    // Carerix REST returns _id as the CRUser ID
+    const carerixUserId  = String(userData._id || userData.userID || '');
     const employeeData   = userData.toEmployee;
+    // Employee link can be nested or flat depending on what Carerix returns
     const employeeId     = employeeData?._id || employeeData?.employeeID || null;
+    // Build full name from employee record first, then user record
+    const firstName = employeeData?.firstName || userData.firstName || '';
+    const lastName  = employeeData?.lastName  || userData.lastName  || '';
+    const fullName  = `${firstName} ${lastName}`.trim() || username;
 
     // Try to find a Contact record if no Employee link
     let contactData = null;
@@ -160,7 +166,7 @@ router.post('/login/carerix', async (req, res, next) => {
       carerixCompanyId: companyId ? String(companyId) : null,
       carerixContactId: contactData?._id ? String(contactData._id) : null,
       email:            userData.emailAddress || username,
-      fullName:         `${userData.firstName || ''} ${userData.lastName || ''}`.trim() || username,
+      fullName:         fullName,
       roleInCarerix:    employeeId ? 'Employee' : 'Contact',
       platformRole,
       rawPayload:       userData,
