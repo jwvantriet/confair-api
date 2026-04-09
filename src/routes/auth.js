@@ -26,9 +26,6 @@ import { config }      from '../config.js';
 
 const router = Router();
 
-// In-memory state store (replace with Redis for multi-instance)
-const oauthStates = new Map();
-
 const agencySchema = z.object({
   email:    z.string().email(),
   password: z.string().min(8),
@@ -81,25 +78,23 @@ router.post('/login/agency', async (req, res, next) => {
 
 // ── GET /auth/carerix/login — redirect to Carerix login page ──────────────────
 // Query params: roleHint=company|placement
+// State is stateless — encoded as base64 JSON signed with JWT_SECRET
+// This avoids in-memory state being lost on Railway restarts
 router.get('/carerix/login', (req, res) => {
-  const state = crypto.randomBytes(16).toString('hex');
   const roleHint = req.query.roleHint || 'placement';
   const redirectUri = `${config.appUrl}/auth/carerix/callback`;
 
-  // Store state with roleHint so callback knows what we expected
-  oauthStates.set(state, {
+  // Encode state as signed base64 payload — no server-side storage needed
+  const payload = {
     roleHint,
-    createdAt: Date.now(),
     redirectUri,
-  });
-
-  // Clean up old states (older than 10 minutes)
-  for (const [k, v] of oauthStates.entries()) {
-    if (Date.now() - v.createdAt > 10 * 60 * 1000) oauthStates.delete(k);
-  }
+    nonce: crypto.randomBytes(8).toString('hex'),
+    exp: Date.now() + 10 * 60 * 1000, // 10 minute expiry
+  };
+  const state = Buffer.from(JSON.stringify(payload)).toString('base64url');
 
   const authUrl = getCarerixAuthUrl(state, redirectUri);
-  logger.info('Carerix OAuth redirect', { roleHint, state: state.slice(0, 8) });
+  logger.info('Carerix OAuth redirect', { roleHint });
   res.redirect(authUrl);
 });
 
@@ -114,11 +109,16 @@ router.get('/carerix/callback', async (req, res, next) => {
       return res.redirect(`${frontendUrl}/login?error=${encodeURIComponent(error_description || oauthError)}`);
     }
 
-    // Validate state
-    const stateData = oauthStates.get(state);
-    if (!stateData) throw new ApiError('Invalid or expired OAuth state', 400);
-    oauthStates.delete(state);
-
+    // Decode stateless state (base64 encoded JSON)
+    let stateData;
+    try {
+      stateData = JSON.parse(Buffer.from(state, 'base64url').toString('utf8'));
+    } catch {
+      throw new ApiError('Invalid OAuth state format', 400);
+    }
+    if (!stateData.exp || Date.now() > stateData.exp) {
+      throw new ApiError('OAuth state has expired. Please try logging in again.', 400);
+    }
     const { roleHint, redirectUri } = stateData;
 
     // Exchange code for tokens
