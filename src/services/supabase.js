@@ -74,13 +74,29 @@ export async function provisionCarerixSession(identity) {
     });
   }
 
-  const { data: session, error: sessionErr } = await adminSupabase.auth.admin.createSession({ userId: supabaseUserId });
-  if (sessionErr) throw new Error(`Session creation failed: ${sessionErr.message}`);
+  // createSession was removed in Supabase JS v2.
+  // Use generateLink to get a magic link token, then verifyOtp to exchange it for a session.
+  const { data: linkData, error: linkErr } = await adminSupabase.auth.admin.generateLink({
+    type:  'magiclink',
+    email: identity.email,
+  });
+  if (linkErr) throw new Error(`Failed to generate session link: ${linkErr.message}`);
+
+  // Parse token from the action_link URL
+  const actionUrl  = new URL(linkData.properties.action_link);
+  const token      = actionUrl.searchParams.get('token');
+
+  const { data: otpData, error: otpErr } = await adminSupabase.auth.verifyOtp({
+    email: identity.email,
+    token,
+    type: 'magiclink',
+  });
+  if (otpErr) throw new Error(`Session creation failed: ${otpErr.message}`);
 
   return {
-    accessToken:  session.session.access_token,
-    refreshToken: session.session.refresh_token,
-    expiresAt:    session.session.expires_at,
+    accessToken:  otpData.session.access_token,
+    refreshToken: otpData.session.refresh_token,
+    expiresAt:    otpData.session.expires_at,
     userId:       supabaseUserId,
     role:         identity.platformRole,
   };
