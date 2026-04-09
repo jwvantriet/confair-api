@@ -13,6 +13,58 @@ import { ApiError } from '../middleware/errorHandler.js';
 
 const router = Router();
 
+// ── GET /carerix/test-login — diagnose what Carerix returns for a user (no auth)
+router.get('/test-login', async (req, res) => {
+  const { u } = req.query;
+  if (!u) return res.status(400).json({ error: 'Pass ?u=username to test' });
+
+  const axios    = (await import('axios')).default;
+  const config   = (await import('../config.js')).config;
+  const crypto   = (await import('crypto')).default;
+  const restBase = config.carerix.restUrl;
+  const restAuth = Buffer.from(`${config.carerix.restUsername}:${config.carerix.restPassword}`).toString('base64');
+
+  const results = {};
+
+  // Step 1: Try login-with-encrypted-password with a dummy hash to see field structure
+  try {
+    const r = await axios.get(`${restBase}CRUser/login-with-encrypted-password`, {
+      params: { u, p: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', show: 'toEmployee' },
+      headers: { 'Authorization': `Basic ${restAuth}`, 'Accept': 'application/json', 'User-Agent': 'confair-platform/1.0' },
+      timeout: 10_000,
+    });
+    results.loginResponse = r.data;
+  } catch (e) {
+    results.loginError = { status: e.response?.status, data: e.response?.data, message: e.message };
+  }
+
+  // Step 2: Look up CRUser by userName
+  try {
+    const r = await axios.get(`${restBase}CRUser`, {
+      params: { qualifier: `userName = '${u}'`, show: '_id,userName,toEmployee._id,toEmployee.employeeID,toContact._id,toContact.toCompany._id,toContact.toCompany.name', limit: 2 },
+      headers: { 'Authorization': `Basic ${restAuth}`, 'Accept': 'application/json', 'User-Agent': 'confair-platform/1.0' },
+      timeout: 10_000,
+    });
+    results.crUserLookup = r.data;
+  } catch (e) {
+    results.crUserError = { status: e.response?.status, data: e.response?.data?.substring?.(0,500), message: e.message };
+  }
+
+  // Step 3: Look up CRContact by emailAddress
+  try {
+    const r = await axios.get(`${restBase}CRContact`, {
+      params: { qualifier: `emailAddress = '${u}'`, show: '_id,toCompany._id,toCompany.name', limit: 2 },
+      headers: { 'Authorization': `Basic ${restAuth}`, 'Accept': 'application/json', 'User-Agent': 'confair-platform/1.0' },
+      timeout: 10_000,
+    });
+    results.crContactLookup = r.data;
+  } catch (e) {
+    results.crContactError = { status: e.response?.status, message: e.message };
+  }
+
+  res.json(results);
+});
+
 // Diagnostic — no auth required
 router.get('/test', async (req, res) => {
   const results = await testCarerixConnection();
