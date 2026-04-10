@@ -120,44 +120,34 @@ router.post('/login/carerix', async (req, res, next) => {
     }
 
     if (!employeeId) {
-      // Use GraphQL to find linked CREmployee or CRContact for this CRUser
-      try {
-        // Try CREmployee first
-        const empData = await queryGraphQL(`
-          query FindEmployee($qualifier: String) {
-            crEmployeePage(qualifier: $qualifier, pageable: {page: 0, size: 1}) {
-              items { _id firstName lastName emailAddress employeeID }
-            }
-          }
-        `, { qualifier: `toUser.userID = ${crUserId}` });
+      // Use Carerix GraphQL to find linked Contact or Employee
+      // Run both lookups in parallel for speed, catch individually
+      const [empResult, conResult] = await Promise.allSettled([
+        queryGraphQL(
+          `query { crEmployeePage(qualifier: "toUser.userID = ${crUserId}", pageable: {page: 0, size: 1}) { items { _id firstName lastName } } }`
+        ),
+        queryGraphQL(
+          `query { crContactPage(qualifier: "toUser.userID = ${crUserId}", pageable: {page: 0, size: 1}) { items { _id firstName lastName toCompany { _id name } } } }`
+        ),
+      ]);
 
-        const emp = empData?.data?.crEmployeePage?.items?.[0];
-        if (emp?._id) {
-          employeeId = emp._id;
-          fullName   = `${emp.firstName || ''} ${emp.lastName || ''}`.trim() || username;
-          logger.info('Employee found via GraphQL', { employeeId, fullName });
-        }
+      const emp = empResult.status === 'fulfilled' ? empResult.value?.data?.crEmployeePage?.items?.[0] : null;
+      const con = conResult.status === 'fulfilled' ? conResult.value?.data?.crContactPage?.items?.[0] : null;
 
-        // Try CRContact if no employee found
-        if (!employeeId) {
-          const conData = await queryGraphQL(`
-            query FindContact($qualifier: String) {
-              crContactPage(qualifier: $qualifier, pageable: {page: 0, size: 1}) {
-                items { _id firstName lastName toCompany { _id name companyID } }
-              }
-            }
-          `, { qualifier: `toUser.userID = ${crUserId}` });
-
-          const con = conData?.data?.crContactPage?.items?.[0];
-          if (con?._id) {
-            contactData = con;
-            companyId   = con.toCompany?._id || null;
-            fullName    = `${con.firstName || ''} ${con.lastName || ''}`.trim() || username;
-            logger.info('Contact found via GraphQL', { contactId: con._id, companyId, fullName });
-          }
-        }
-      } catch (e) {
-        logger.warn('GraphQL entity lookup failed', { error: e.message });
+      if (emp?._id) {
+        employeeId = emp._id;
+        fullName   = `${emp.firstName || ''} ${emp.lastName || ''}`.trim() || username;
+        logger.info('Employee found via GraphQL', { employeeId, fullName });
+      } else if (con?._id) {
+        contactData = con;
+        companyId   = con.toCompany?._id || null;
+        fullName    = `${con.firstName || ''} ${con.lastName || ''}`.trim() || username;
+        logger.info('Contact found via GraphQL', { contactId: con._id, companyId, fullName });
+      } else {
+        logger.info('No Employee/Contact found — treating as agency user', {
+          empError: empResult.reason?.message,
+          conError: conResult.reason?.message,
+        });
       }
     }
 
