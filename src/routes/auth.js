@@ -17,6 +17,7 @@ import { adminSupabase, provisionCarerixSession } from '../services/supabase.js'
 import {
   getCarerixUserInfo,
   syncIdentityCache,
+  queryGraphQL,
 } from '../services/carerix.js';
 import { requireAuth } from '../middleware/auth.js';
 import { ApiError }    from '../middleware/errorHandler.js';
@@ -120,14 +121,9 @@ router.post('/login/carerix', async (req, res, next) => {
 
     if (!employeeId) {
       // Use GraphQL to find linked CREmployee or CRContact for this CRUser
-      // The REST API show= doesn't expand relationships — GraphQL does
       try {
-        const { fetchAndCacheFee, testCarerixConnection } = await import('../services/carerix.js');
-        // Import the graphql helper directly
-        const carerixMod = await import('../services/carerix.js');
-
-        // Try CREmployee lookup via GraphQL
-        const empData = await carerixMod.queryGraphQL(`
+        // Try CREmployee first
+        const empData = await queryGraphQL(`
           query FindEmployee($qualifier: String) {
             crEmployeePage(qualifier: $qualifier, pageable: {page: 0, size: 1}) {
               items { _id firstName lastName emailAddress employeeID }
@@ -142,9 +138,9 @@ router.post('/login/carerix', async (req, res, next) => {
           logger.info('Employee found via GraphQL', { employeeId, fullName });
         }
 
-        // Try CRContact lookup via GraphQL
+        // Try CRContact if no employee found
         if (!employeeId) {
-          const conData = await carerixMod.queryGraphQL(`
+          const conData = await queryGraphQL(`
             query FindContact($qualifier: String) {
               crContactPage(qualifier: $qualifier, pageable: {page: 0, size: 1}) {
                 items { _id firstName lastName toCompany { _id name companyID } }
