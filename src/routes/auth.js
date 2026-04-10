@@ -119,54 +119,49 @@ router.post('/login/carerix', async (req, res, next) => {
     }
 
     if (!employeeId) {
-      // Fetch the CRUser directly by ID with toEmployee and toContact expanded
-      // This avoids reverse-lookup qualifiers (toUser._id = X) which return 500
+      // Use GraphQL to find linked CREmployee or CRContact for this CRUser
+      // The REST API show= doesn't expand relationships — GraphQL does
       try {
-        const userRes = await axios.get(`${restBase}CRUser/${crUserId}`, {
-          params: { show: 'toEmployee,toContact,firstName,lastName' },
-          headers: { 'Authorization': `Basic ${restAuth}`, 'User-Agent': 'confair-platform/1.0' },
-          timeout: 10_000,
-          responseType: 'text',
-        });
-        const userXml    = userRes.data;
-        const userParsed = parseXml(userXml);
-        const crUserFull = userParsed?.CRUser || {};
+        const { fetchAndCacheFee, testCarerixConnection } = await import('../services/carerix.js');
+        // Import the graphql helper directly
+        const carerixMod = await import('../services/carerix.js');
 
-        logger.info('CRUser full fetch', {
-          id:          crUserFull['@_id'],
-          hasEmployee: !!crUserFull.toEmployee,
-          hasContact:  !!crUserFull.toContact,
-          raw:         userXml?.substring(0, 500),
-        });
+        // Try CREmployee lookup via GraphQL
+        const empData = await carerixMod.queryGraphQL(`
+          query FindEmployee($qualifier: String) {
+            crEmployeePage(qualifier: $qualifier, pageable: {page: 0, size: 1}) {
+              items { _id firstName lastName emailAddress employeeID }
+            }
+          }
+        `, { qualifier: `toUser.userID = ${crUserId}` });
 
-        // Check toEmployee
-        const empNode = crUserFull.toEmployee?.CREmployee || crUserFull.toEmployee;
-        if (empNode && getId(empNode)) {
-          employeeId = getId(empNode);
-          fullName   = `${empNode.firstName || crUserFull.firstName || ''} ${empNode.lastName || crUserFull.lastName || ''}`.trim() || username;
-          logger.info('Employee found via CRUser fetch', { employeeId, fullName });
+        const emp = empData?.data?.crEmployeePage?.items?.[0];
+        if (emp?._id) {
+          employeeId = emp._id;
+          fullName   = `${emp.firstName || ''} ${emp.lastName || ''}`.trim() || username;
+          logger.info('Employee found via GraphQL', { employeeId, fullName });
         }
 
-        // Check toContact
+        // Try CRContact lookup via GraphQL
         if (!employeeId) {
-          const conNode = crUserFull.toContact?.CRContact || crUserFull.toContact;
-          if (conNode && getId(conNode)) {
-            contactData = conNode;
-            // Get company from toCompany
-            const compNode = conNode.toCompany?.CRCompany || conNode.toCompany;
-            companyId      = getId(compNode) || null;
-            fullName       = `${conNode.firstName || crUserFull.firstName || ''} ${conNode.lastName || crUserFull.lastName || ''}`.trim() || username;
-            logger.info('Contact found via CRUser fetch', { contactId: getId(conNode), companyId, fullName });
+          const conData = await carerixMod.queryGraphQL(`
+            query FindContact($qualifier: String) {
+              crContactPage(qualifier: $qualifier, pageable: {page: 0, size: 1}) {
+                items { _id firstName lastName toCompany { _id name companyID } }
+              }
+            }
+          `, { qualifier: `toUser.userID = ${crUserId}` });
+
+          const con = conData?.data?.crContactPage?.items?.[0];
+          if (con?._id) {
+            contactData = con;
+            companyId   = con.toCompany?._id || null;
+            fullName    = `${con.firstName || ''} ${con.lastName || ''}`.trim() || username;
+            logger.info('Contact found via GraphQL', { contactId: con._id, companyId, fullName });
           }
         }
-
-        // Fallback: use name from CRUser itself
-        if (!fullName || fullName === username) {
-          fullName = `${crUserFull.firstName || ''} ${crUserFull.lastName || ''}`.trim() || username;
-        }
-
       } catch (e) {
-        logger.warn('CRUser full fetch failed', { error: e.message, status: e.response?.status });
+        logger.warn('GraphQL entity lookup failed', { error: e.message });
       }
     }
 
