@@ -14,32 +14,12 @@ const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: 
 const parseXml = (xml) => { try { return xmlParser.parse(xml); } catch { return null; } };
 const getId = (obj) => obj?.['@_id'] || obj?.id || obj?._id || null;
 
-// Service token cache
-let _svcToken = null;
-let _svcExp   = 0;
-
-async function getServiceToken() {
-  if (_svcToken && Date.now() < _svcExp) return _svcToken;
-  const res = await axios.post(`${config.carerix.authUrl}/token`,
-    new URLSearchParams({ grant_type: 'client_credentials' }), {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded',
-        'Authorization': `Basic ${Buffer.from(`${config.carerix.clientId}:${config.carerix.clientSecret}`).toString('base64')}` },
-      timeout: 10_000,
-    });
-  _svcToken = res.data.access_token;
-  _svcExp   = Date.now() + (res.data.expires_in - 60) * 1000;
-  return _svcToken;
-}
-
-async function gql(query, variables = {}) {
-  const token = await getServiceToken();
-  const res   = await axios.post(config.carerix.graphApiUrl, { query, variables }, {
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'User-Agent': 'confair-platform/1.0' },
-    timeout: 10_000,
-  });
-  if (res.data.errors) logger.warn('GraphQL errors', { errors: res.data.errors });
-  return res.data;
-}
+// Carerix CRUserRole IDs → platform roles
+// id=1  → Employee (CREmployee linked) → placement
+// id=11 → Contact  (CRCompany linked)  → company_admin
+// other → Office/recruiter              → agency_admin
+const ROLE_CONTACT  = 11;
+const ROLE_EMPLOYEE = 1;
 
 async function loginWithCarerix(username, password) {
   const restBase    = config.carerix.restUrl;
@@ -47,7 +27,8 @@ async function loginWithCarerix(username, password) {
   const md5password = crypto.createHash('md5').update(password).digest('hex');
   const headers     = { Authorization: `Basic ${restAuth}`, 'User-Agent': 'confair-platform/1.0' };
 
-  // Step 1: Authenticate via REST
+  // Call login endpoint WITHOUT any show= parameter
+  // This returns the full CRUser XML including toUserRole, toCompany, toEmployee
   let loginXml;
   try {
     const res = await axios.get(`${restBase}CRUser/login-with-encrypted-password`,
@@ -64,58 +45,34 @@ async function loginWithCarerix(username, password) {
     throw new ApiError('Invalid username or password', 401);
   }
 
-  const crUserId = getId(parseXml(loginXml)?.CRUser);
+  const parsed   = parseXml(loginXml);
+  const crUser   = parsed?.CRUser || {};
+  const crUserId = getId(crUser);
   if (!crUserId) throw new ApiError('Invalid username or password', 401);
 
-  logger.info('Carerix authenticated', { crUserId, username });
+  // Extract role from toUserRole
+  const userRoleId = parseInt(getId(crUser.toUserRole?.CRUserRole || crUser.toUserRole) || '0', 10);
 
-  // Step 2: Use GraphQL crUser query to get entity type
-  // Query CRUser by _id — this is the correct GraphQL approach
-  let platformRole = 'agency_admin';
-  let fullName     = username;
-  let companyId    = null;
+  // Extract linked entity
+  const empNode  = crUser.toEmployee?.CREmployee || crUser.toEmployee;
+  const compNode = crUser.toCompany?.CRCompany   || crUser.toCompany;
+  const empId    = getId(empNode);
+  const compId   = getId(compNode);
 
-  try {
-    const data = await gql(`
-      query GetUser($id: ID!) {
-        crUser(_id: $id) {
-          _id
-          firstName
-          lastName
-          toEmployee { _id employeeID }
-          toContact { _id toCompany { _id name } }
-        }
-      }
-    `, { id: String(crUserId) });
+  // Name
+  const fullName = `${crUser.firstName || ''} ${crUser.lastName || ''}`.trim() || username;
 
-    const u = data?.data?.crUser;
-    logger.info('GraphQL crUser', { 
-      id: u?._id, 
-      hasEmployee: !!u?.toEmployee?._id,
-      hasContact:  !!u?.toContact?._id,
-      companyId:   u?.toContact?.toCompany?._id,
-    });
+  // Role mapping
+  const platformRole = empId || userRoleId === ROLE_EMPLOYEE ? 'placement'
+                     : compId || userRoleId === ROLE_CONTACT  ? 'company_admin'
+                     : 'agency_admin';
 
-    if (u) {
-      fullName = `${u.firstName || ''} ${u.lastName || ''}`.trim() || username;
-
-      if (u.toEmployee?._id) {
-        platformRole = 'placement';
-      } else if (u.toContact?._id) {
-        platformRole = 'company_admin';
-        companyId    = u.toContact.toCompany?._id || null;
-      }
-    }
-  } catch (e) {
-    logger.warn('GraphQL crUser lookup failed', { error: e.message });
-  }
-
-  logger.info('Role resolved', { username, crUserId, platformRole, companyId });
+  logger.info('Carerix login', { crUserId, userRoleId, empId, compId, platformRole, username });
 
   return {
     carerixUserId:    String(crUserId),
-    carerixCompanyId: companyId ? String(companyId) : null,
-    email:            username,
+    carerixCompanyId: compId ? String(compId) : null,
+    email:            crUser.emailAddress || username,
     fullName,
     platformRole,
   };
@@ -124,9 +81,8 @@ async function loginWithCarerix(username, password) {
 router.post('/login/agency', async (req, res, next) => {
   try {
     const user = req.body.username || req.body.email;
-    const { password } = req.body;
-    if (!user || !password) throw new ApiError('Username and password are required', 400);
-    const identity = await loginWithCarerix(user, password);
+    if (!user || !req.body.password) throw new ApiError('Username and password are required', 400);
+    const identity = await loginWithCarerix(user, req.body.password);
     const session  = await provisionCarerixSession(identity);
     await writeAuditLog({ eventType: 'login', actorUserId: session.userId, actorRole: identity.platformRole, payload: { user }, ipAddress: req.ip });
     res.json({ accessToken: session.accessToken, refreshToken: session.refreshToken, expiresAt: session.expiresAt,
