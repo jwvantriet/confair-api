@@ -11,34 +11,27 @@ import { config } from '../config.js';
 
 const router = Router();
 const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
-
-const parseXml = (xml) => {
-  if (typeof xml !== 'string') return xml;
-  try { return xmlParser.parse(xml); } catch { return null; }
-};
+const parseXml = (xml) => { try { return xmlParser.parse(xml); } catch { return null; } };
 const getId = (obj) => obj?.['@_id'] || obj?.id || obj?._id || null;
 
-// ── Shared Carerix REST login helper ─────────────────────────────────────────
 async function loginWithCarerix(username, password) {
   const restBase    = config.carerix.restUrl;
   const restAuth    = Buffer.from(`${config.carerix.restUsername}:${config.carerix.restPassword}`).toString('base64');
   const md5password = crypto.createHash('md5').update(password).digest('hex');
+  const headers     = { 'Authorization': `Basic ${restAuth}`, 'User-Agent': 'confair-platform/1.0' };
 
   // Step 1: Authenticate
   let loginXml;
   try {
     const res = await axios.get(`${restBase}CRUser/login-with-encrypted-password`, {
-      params:       { u: username, p: md5password, show: 'toEmployee' },
-      headers:      { 'Authorization': `Basic ${restAuth}`, 'User-Agent': 'confair-platform/1.0' },
-      timeout:      15_000,
-      responseType: 'text',
+      params: { u: username, p: md5password, show: 'toEmployee' },
+      headers, timeout: 15_000, responseType: 'text',
     });
     loginXml = res.data;
   } catch (err) {
-    const data   = err.response?.data || '';
-    const status = err.response?.status;
+    const data = err.response?.data || '';
     if (typeof data === 'string' && data.includes('AuthorizationFailed')) throw new ApiError('Invalid username or password', 401);
-    if (status === 401 || status === 403) throw new ApiError('Invalid username or password', 401);
+    if (err.response?.status === 401 || err.response?.status === 403) throw new ApiError('Invalid username or password', 401);
     throw new ApiError('Could not connect to Carerix', 502);
   }
 
@@ -57,34 +50,47 @@ async function loginWithCarerix(username, password) {
   let companyId   = null;
   let fullName    = username;
 
-  if (crUser.toEmployee?.CREmployee || crUser.toEmployee?.['@_id']) {
-    const emp = crUser.toEmployee?.CREmployee || crUser.toEmployee;
-    employeeId = getId(emp);
+  const empNode = crUser.toEmployee?.CREmployee || crUser.toEmployee;
+  if (empNode && getId(empNode)) {
+    employeeId = getId(empNode);
+    fullName = `${empNode.firstName || ''} ${empNode.lastName || ''}`.trim() || username;
+    logger.info('Employee in login response', { employeeId });
   }
 
-  // Step 3: If no employee, check CRContact via REST
+  // Step 3: Try to find CRContact if not an employee
   if (!employeeId) {
-    try {
-      const conRes = await axios.get(`${restBase}CRContact`, {
-        params:       { qualifier: `toUser.userName = '${username}'`, limit: 1 },
-        headers:      { 'Authorization': `Basic ${restAuth}`, 'User-Agent': 'confair-platform/1.0' },
-        timeout:      8_000,
-        responseType: 'text',
-      });
-      const cp  = parseXml(conRes.data);
-      const arr = cp?.array?.CRContact || cp?.CRContact;
-      const con = Array.isArray(arr) ? arr[0] : arr;
-      if (con && getId(con)) {
-        contactData = con;
-        companyId   = getId(con.toCompany?.CRCompany || con.toCompany) || null;
-        fullName    = `${con.firstName || ''} ${con.lastName || ''}`.trim() || username;
+    const queries = [
+      `toUser._id = ${crUserId}`,
+      `toUser.userID = ${crUserId}`,
+      `emailAddress = '${username}'`,
+      `emailAddressBusiness = '${username}'`,
+    ];
+    for (const qualifier of queries) {
+      try {
+        const res = await axios.get(`${restBase}CRContact`, {
+          params: { qualifier, limit: 1 },
+          headers, timeout: 6_000, responseType: 'text',
+        });
+        const cp  = parseXml(res.data);
+        const arr = cp?.array?.CRContact || cp?.CRContact;
+        const con = Array.isArray(arr) ? arr[0] : arr;
+        if (con && getId(con)) {
+          contactData = con;
+          const comp  = con.toCompany?.CRCompany || con.toCompany;
+          companyId   = getId(comp) || null;
+          fullName    = `${con.firstName || ''} ${con.lastName || ''}`.trim() || username;
+          logger.info('Contact found', { qualifier, contactId: getId(con), companyId });
+          break;
+        }
+        logger.info('No contact for qualifier', { qualifier });
+      } catch (e) {
+        logger.info('Contact query error', { qualifier, status: e.response?.status });
       }
-    } catch (e) {
-      logger.info('CRContact lookup skipped', { error: e.message });
     }
   }
 
   const platformRole = employeeId ? 'placement' : contactData ? 'company_admin' : 'agency_admin';
+  logger.info('Role resolved', { username, crUserId, platformRole });
 
   return {
     carerixUserId:    String(crUserId),
@@ -96,7 +102,6 @@ async function loginWithCarerix(username, password) {
   };
 }
 
-// ── POST /auth/login/agency ───────────────────────────────────────────────────
 router.post('/login/agency', async (req, res, next) => {
   try {
     const { email, password, username } = req.body;
@@ -110,36 +115,28 @@ router.post('/login/agency', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ── POST /auth/login/carerix ──────────────────────────────────────────────────
 router.post('/login/carerix', async (req, res, next) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) throw new ApiError('Username and password are required', 400);
     const identity = await loginWithCarerix(username, password);
-    logger.info('Carerix login', { username, role: identity.platformRole });
-    const session = await provisionCarerixSession(identity);
+    const session  = await provisionCarerixSession(identity);
     await writeAuditLog({ eventType: 'login_carerix', actorUserId: session.userId, actorRole: identity.platformRole, payload: { username }, ipAddress: req.ip });
     res.json({ accessToken: session.accessToken, refreshToken: session.refreshToken, expiresAt: session.expiresAt,
       user: { id: session.userId, email: identity.email, displayName: identity.fullName, role: identity.platformRole, authSource: 'carerix', carerixUserId: identity.carerixUserId, carerixCompanyId: identity.carerixCompanyId } });
   } catch (err) { next(err); }
 });
 
-// ── POST /auth/forgot-password ────────────────────────────────────────────────
 router.post('/forgot-password', async (req, res, next) => {
   try {
     const { username } = req.body;
     if (!username?.trim()) throw new ApiError('Username or email is required', 400);
-    // Try Supabase reset first
-    const { data: profile } = await adminSupabase.from('user_profiles').select('email').eq('email', username.trim().toLowerCase()).maybeSingle();
-    if (profile) {
-      await adminSupabase.auth.resetPasswordForEmail(profile.email, { redirectTo: `${config.cors.origins[0]}/reset-password` });
-    }
-    // Always return success
+    const { data: profile } = await adminSupabase.from('user_profiles').select('email').ilike('email', username.trim()).maybeSingle();
+    if (profile) await adminSupabase.auth.resetPasswordForEmail(profile.email, { redirectTo: `${config.cors.origins[0]}/reset-password` });
     res.json({ message: 'If an account exists, a reset link has been sent.' });
   } catch (err) { next(err); }
 });
 
-// ── POST /auth/refresh ────────────────────────────────────────────────────────
 router.post('/refresh', async (req, res, next) => {
   try {
     const { refreshToken } = req.body;
@@ -150,7 +147,6 @@ router.post('/refresh', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ── POST /auth/logout ─────────────────────────────────────────────────────────
 router.post('/logout', requireAuth, async (req, res, next) => {
   try {
     await adminSupabase.auth.admin.signOut(req.token);
@@ -158,7 +154,6 @@ router.post('/logout', requireAuth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ── GET /auth/me ──────────────────────────────────────────────────────────────
 router.get('/me', requireAuth, (req, res) => {
   const { id, role, auth_source, display_name, email, carerix_user_id, carerix_company_id } = req.user;
   res.json({ id, role, authSource: auth_source, displayName: display_name, email, carerixUserId: carerix_user_id, carerixCompanyId: carerix_company_id });
