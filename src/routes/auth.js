@@ -24,7 +24,7 @@ async function loginWithCarerix(username, password) {
   let loginXml;
   try {
     const res = await axios.get(`${restBase}CRUser/login-with-encrypted-password`, {
-      params: { u: username, p: md5password, show: 'toEmployee' },
+      params: { u: username, p: md5password, show: 'toEmployee,userRoleID,firstName,lastName,emailAddress' },
       headers, timeout: 15_000, responseType: 'text',
     });
     loginXml = res.data;
@@ -50,47 +50,36 @@ async function loginWithCarerix(username, password) {
   let companyId   = null;
   let fullName    = username;
 
-  const empNode = crUser.toEmployee?.CREmployee || crUser.toEmployee;
+  // userRoleID tells us the user type directly from Carerix:
+  // 11 = Contact (company user), Employee link = placement, other = agency
+  const userRoleID  = parseInt(crUser.userRoleID || '0', 10);
+  const empNode     = crUser.toEmployee?.CREmployee || crUser.toEmployee;
+
   if (empNode && getId(empNode)) {
     employeeId = getId(empNode);
-    fullName = `${empNode.firstName || ''} ${empNode.lastName || ''}`.trim() || username;
-    logger.info('Employee in login response', { employeeId });
+    fullName   = `${empNode.firstName || crUser.firstName || ''} ${empNode.lastName || crUser.lastName || ''}`.trim() || username;
   }
 
-  // Step 3: Try to find CRContact if not an employee
-  if (!employeeId) {
-    const queries = [
-      `toUser._id = ${crUserId}`,
-      `toUser.userID = ${crUserId}`,
-      `emailAddress = '${username}'`,
-      `emailAddressBusiness = '${username}'`,
-    ];
-    for (const qualifier of queries) {
-      try {
-        const res = await axios.get(`${restBase}CRContact`, {
-          params: { qualifier, limit: 1 },
-          headers, timeout: 6_000, responseType: 'text',
-        });
-        const cp  = parseXml(res.data);
-        const arr = cp?.array?.CRContact || cp?.CRContact;
-        const con = Array.isArray(arr) ? arr[0] : arr;
-        if (con && getId(con)) {
-          contactData = con;
-          const comp  = con.toCompany?.CRCompany || con.toCompany;
-          companyId   = getId(comp) || null;
-          fullName    = `${con.firstName || ''} ${con.lastName || ''}`.trim() || username;
-          logger.info('Contact found', { qualifier, contactId: getId(con), companyId });
-          break;
-        }
-        logger.info('No contact for qualifier', { qualifier });
-      } catch (e) {
-        logger.info('Contact query error', { qualifier, status: e.response?.status });
-      }
-    }
+  // Role mapping based on userRoleID
+  // userRoleID=11 → Contact → company_admin
+  // toEmployee present → placement
+  // anything else → agency_admin (office/recruiter user)
+  let platformRole;
+  if (employeeId) {
+    platformRole = 'placement';
+  } else if (userRoleID === 11) {
+    platformRole = 'company_admin';
+    contactData  = { userRoleID };  // mark as contact type
+  } else {
+    platformRole = 'agency_admin';
   }
 
-  const platformRole = employeeId ? 'placement' : contactData ? 'company_admin' : 'agency_admin';
-  logger.info('Role resolved', { username, crUserId, platformRole });
+  // Get name from CRUser directly if not set from employee
+  if (!fullName || fullName === username) {
+    fullName = `${crUser.firstName || ''} ${crUser.lastName || ''}`.trim() || username;
+  }
+
+  logger.info('Role resolved', { username, crUserId, userRoleID, platformRole });
 
   return {
     carerixUserId:    String(crUserId),
