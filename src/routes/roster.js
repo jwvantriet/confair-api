@@ -17,7 +17,18 @@ import {
   fetchRostersForCrew, rosterItemsList, mapRosterToRows,
   buildDailySummary, dayIsPayable, monthBounds,
 } from '../services/raido.js';
-import { queryGraphQL } from '../services/carerix.js';
+// queryGraphQL imported lazily to avoid startup crash if not yet exported
+let _queryGraphQL = null;
+async function getQueryGraphQL() {
+  if (_queryGraphQL) return _queryGraphQL;
+  try {
+    const mod = await import('../services/carerix.js');
+    _queryGraphQL = mod.queryGraphQL || mod.default?.queryGraphQL;
+  } catch (e) {
+    console.warn('queryGraphQL not available:', e.message);
+  }
+  return _queryGraphQL;
+}
 
 const router = Router();
 router.use(requireAuth);
@@ -38,7 +49,9 @@ const CHARGE_TYPE_MAP = {
 async function fetchRatesForPlacement(jobId) {
   if (!jobId) return [];
   try {
-    const data = await queryGraphQL(`
+    const qGraphQL = await getQueryGraphQL();
+    if (!qGraphQL) { logger.warn('queryGraphQL not available, skipping rate fetch'); return []; }
+    const data = await qGraphQL(`
       query JobFinancePage($qualifier: String, $pageable: Pageable) {
         crJobFinancePage(qualifier: $qualifier, pageable: $pageable) {
           items {
