@@ -113,7 +113,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
     // Get all placements with crew_id set
     const { data: placements } = await adminSupabase
       .from('placements')
-      .select('id, placement_ref, display_name, crew_id, crew_nia, carerix_placement_id')
+      .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, user_profile_id')
       .not('crew_id', 'is', null);
 
     if (!placements?.length) {
@@ -193,10 +193,10 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
           }
         }
 
-        results.push({ placement: placement.display_name, days: crewSummary.days.length, items: itemsCreated });
+        results.push({ placement: placement.full_name, days: crewSummary.days.length, items: itemsCreated });
         synced++;
       } catch (e) {
-        logger.error('Sync failed for placement', { placement: placement.display_name, error: e.message });
+        logger.error('Sync failed for placement', { placement: placement.full_name, error: e.message });
         errors++;
       }
     }
@@ -223,7 +223,7 @@ router.get('/summary/:periodId', async (req, res, next) => {
         total_value,
         status,
         charge_types ( code, label, sort_order ),
-        placements ( id, display_name, crew_id, company_id )
+        placements ( id, full_name, crew_id, company_id )
       `)
       .eq('period_id', periodId)
       .order('charge_date');
@@ -232,7 +232,7 @@ router.get('/summary/:periodId', async (req, res, next) => {
     if (user.role === 'placement') {
       // Find their placement record
       const { data: placement } = await adminSupabase
-        .from('placements').select('id').eq('carerix_user_id', user.carerix_user_id).maybeSingle();
+        .from('placements').select('id').eq('user_profile_id', user.id).maybeSingle();
       if (!placement) return res.json({ placements: [] });
       query = query.eq('placement_id', placement.id);
     } else if (user.role === 'company_admin') {
@@ -252,7 +252,7 @@ router.get('/summary/:periodId', async (req, res, next) => {
       if (!byPlacement.has(pid)) {
         byPlacement.set(pid, {
           placementId:   pid,
-          displayName:   item.placements?.display_name || '',
+          displayName:   item.placements?.full_name || '',
           chargeTypes:   new Map(),
           totalValue:    0,
           currency:      item.currency,
@@ -286,7 +286,7 @@ router.get('/daily/:periodId/:placementId', async (req, res, next) => {
     // Access control
     if (req.user.role === 'placement') {
       const { data: p } = await adminSupabase
-        .from('placements').select('id').eq('carerix_user_id', req.user.carerix_user_id).maybeSingle();
+        .from('placements').select('id').eq('user_profile_id', req.user.id).maybeSingle();
       if (!p || p.id !== placementId) throw new ApiError('Access denied', 403);
     }
 
@@ -331,7 +331,7 @@ router.post('/correction', async (req, res, next) => {
 
     // Get placement for this user
     const { data: placement } = await adminSupabase
-      .from('placements').select('id').eq('carerix_user_id', req.user.carerix_user_id).maybeSingle();
+      .from('placements').select('id').eq('user_profile_id', req.user.id).maybeSingle();
     if (!placement) throw new ApiError('No placement found for this user', 404);
 
     const { data, error } = await adminSupabase.from('charge_corrections').insert({
