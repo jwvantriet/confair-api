@@ -14,6 +14,7 @@ import runsRoutes        from './routes/runs.js';
 import invoicesRoutes    from './routes/invoices.js';
 import importRoutes      from './routes/import.js';
 import carerixRoutes     from './routes/carerix.js';
+import rosterRoutes      from './routes/roster.js';
 
 const app = express();
 
@@ -55,6 +56,7 @@ app.use('/runs',        runsRoutes);
 app.use('/invoices',    invoicesRoutes);
 app.use('/import',      importRoutes);
 app.use('/carerix',     carerixRoutes);
+app.use('/roster',      rosterRoutes);
 app.use(errorHandler);
 
 app.listen(config.port, () =>
