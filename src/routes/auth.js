@@ -17,7 +17,6 @@ import { adminSupabase, provisionCarerixSession } from '../services/supabase.js'
 import {
   getCarerixUserInfo,
   syncIdentityCache,
-  queryGraphQL,
 } from '../services/carerix.js';
 import { requireAuth } from '../middleware/auth.js';
 import { ApiError }    from '../middleware/errorHandler.js';
@@ -120,34 +119,27 @@ router.post('/login/carerix', async (req, res, next) => {
     }
 
     if (!employeeId) {
-      // Use Carerix GraphQL to find linked Contact or Employee
-      // Run both lookups in parallel for speed, catch individually
-      const [empResult, conResult] = await Promise.allSettled([
-        queryGraphQL(
-          `query { crEmployeePage(qualifier: "toUser.userID = ${crUserId}", pageable: {page: 0, size: 1}) { items { _id firstName lastName } } }`
-        ),
-        queryGraphQL(
-          `query { crContactPage(qualifier: "toUser.userID = ${crUserId}", pageable: {page: 0, size: 1}) { items { _id firstName lastName toCompany { _id name } } } }`
-        ),
-      ]);
-
-      const emp = empResult.status === 'fulfilled' ? empResult.value?.data?.crEmployeePage?.items?.[0] : null;
-      const con = conResult.status === 'fulfilled' ? conResult.value?.data?.crContactPage?.items?.[0] : null;
-
-      if (emp?._id) {
-        employeeId = emp._id;
-        fullName   = `${emp.firstName || ''} ${emp.lastName || ''}`.trim() || username;
-        logger.info('Employee found via GraphQL', { employeeId, fullName });
-      } else if (con?._id) {
-        contactData = con;
-        companyId   = con.toCompany?._id || null;
-        fullName    = `${con.firstName || ''} ${con.lastName || ''}`.trim() || username;
-        logger.info('Contact found via GraphQL', { contactId: con._id, companyId, fullName });
-      } else {
-        logger.info('No Employee/Contact found — treating as agency user', {
-          empError: empResult.reason?.message,
-          conError: conResult.reason?.message,
+      // Try to find linked CRContact via Carerix REST API
+      // Search by username directly on CRContact records
+      try {
+        const conRes = await axios.get(`${restBase}CRContact`, {
+          params: { qualifier: `toUser.userName = '${username}'`, limit: 1 },
+          headers: { 'Authorization': `Basic ${restAuth}`, 'User-Agent': 'confair-platform/1.0' },
+          timeout: 8_000,
+          responseType: 'text',
         });
+        const conXml    = conRes.data;
+        const conParsed = parseXml(conXml);
+        const conArr    = conParsed?.array?.CRContact || conParsed?.CRContact;
+        const con       = Array.isArray(conArr) ? conArr[0] : conArr;
+        if (con && getId(con)) {
+          contactData = con;
+          companyId   = getId(con.toCompany?.CRCompany || con.toCompany) || null;
+          fullName    = `${con.firstName || ''} ${con.lastName || ''}`.trim() || username;
+          logger.info('Contact found via REST', { contactId: getId(con), companyId, fullName });
+        }
+      } catch (e) {
+        logger.info('CRContact REST lookup result', { error: e.message });
       }
     }
 
