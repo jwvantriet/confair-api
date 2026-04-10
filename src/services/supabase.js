@@ -88,17 +88,18 @@ export async function provisionCarerixSession(identity) {
       supabaseUserId = newUser.user.id;
     }
 
-    await adminSupabase.from('user_profiles').insert({
+    await adminSupabase.from('user_profiles').upsert({
       id:                     supabaseUserId,
       auth_source:            'carerix',
       role:                   identity.platformRole,
       display_name:           identity.fullName,
       email:                  identity.email,
-      carerix_user_id:        identity.carerixUserId,
+      carerix_user_id:        identity.carerixUserId || '',
       carerix_company_id:     identity.carerixCompanyId,
       carerix_contact_id:     identity.carerixContactId,
       carerix_last_synced_at: new Date().toISOString(),
-    });
+      is_active:              true,
+    }, { onConflict: 'id' });
   }
 
   // createSession was removed in Supabase JS v2.
