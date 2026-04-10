@@ -99,6 +99,37 @@ router.get('/test-user', async (req, res) => {
   res.json(results);
 });
 
+
+// ── GET /carerix/inspect-user/:id — inspect raw CRUser XML
+router.get('/inspect-user/:id', async (req, res) => {
+  const axios  = (await import('axios')).default;
+  const config = (await import('../config.js')).config;
+  const restBase = config.carerix.restUrl;
+  const restAuth = Buffer.from(`${config.carerix.restUsername}:${config.carerix.restPassword}`).toString('base64');
+  const headers  = { 'Authorization': `Basic ${restAuth}`, 'User-Agent': 'confair-platform/1.0' };
+  const results  = {};
+
+  // Fetch CRUser with various show params
+  const shows = [
+    'toEmployee,toContact,firstName,lastName,userRoleID',
+    'toEmployee',
+    'toContact',
+    'userRoleID,firstName,lastName',
+  ];
+
+  for (const show of shows) {
+    try {
+      const r = await axios.get(`${restBase}CRUser/${req.params.id}`, {
+        params: { show }, headers, timeout: 8000, responseType: 'text',
+      });
+      results[`show=${show}`] = r.data?.substring(0, 800);
+    } catch (e) {
+      results[`show=${show}`] = `ERROR ${e.response?.status}: ${e.message}`;
+    }
+  }
+  res.json(results);
+});
+
 // Diagnostic — no auth required
 router.get('/test', async (req, res) => {
   const results = await testCarerixConnection();
