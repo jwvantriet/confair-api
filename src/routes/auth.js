@@ -14,17 +14,22 @@ const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: 
 const parseXml = (xml) => { try { return xmlParser.parse(xml); } catch { return null; } };
 const getId = (obj) => obj?.['@_id'] || obj?.id || obj?._id || null;
 
+// Carerix userRoleID → platform role mapping
+// 11 = Contact (company user)
+// Other non-employee values = agency (office/recruiter)
+const CONTACT_ROLE_ID = 11;
+
 async function loginWithCarerix(username, password) {
   const restBase    = config.carerix.restUrl;
   const restAuth    = Buffer.from(`${config.carerix.restUsername}:${config.carerix.restPassword}`).toString('base64');
   const md5password = crypto.createHash('md5').update(password).digest('hex');
   const headers     = { 'Authorization': `Basic ${restAuth}`, 'User-Agent': 'confair-platform/1.0' };
 
-  // Step 1: Authenticate
+  // Step 1: Authenticate — get CRUser id
   let loginXml;
   try {
     const res = await axios.get(`${restBase}CRUser/login-with-encrypted-password`, {
-      params: { u: username, p: md5password, show: 'toEmployee,userRoleID,firstName,lastName,emailAddress' },
+      params: { u: username, p: md5password },
       headers, timeout: 15_000, responseType: 'text',
     });
     loginXml = res.data;
@@ -39,55 +44,89 @@ async function loginWithCarerix(username, password) {
     throw new ApiError('Invalid username or password', 401);
   }
 
-  const parsed   = parseXml(loginXml);
-  const crUser   = parsed?.CRUser || {};
-  const crUserId = getId(crUser);
+  const loginParsed = parseXml(loginXml);
+  const loginUser   = loginParsed?.CRUser || {};
+  const crUserId    = getId(loginUser);
   if (!crUserId) throw new ApiError('Invalid username or password', 401);
 
-  // Step 2: Check toEmployee in login response
-  let employeeId  = null;
-  let contactData = null;
-  let companyId   = null;
+  logger.info('Carerix login success', { crUserId, username });
+
+  // Step 2: Fetch full CRUser record without show= to get all scalar fields
+  // (show= only expands relationships; without it we get all scalars including userRoleID)
+  let userRoleID  = null;
   let fullName    = username;
+  let employeeId  = null;
+  let companyId   = null;
 
-  // userRoleID tells us the user type directly from Carerix:
-  // 11 = Contact (company user), Employee link = placement, other = agency
-  const userRoleID  = parseInt(crUser.userRoleID || '0', 10);
-  const empNode     = crUser.toEmployee?.CREmployee || crUser.toEmployee;
-
-  if (empNode && getId(empNode)) {
-    employeeId = getId(empNode);
-    fullName   = `${empNode.firstName || crUser.firstName || ''} ${empNode.lastName || crUser.lastName || ''}`.trim() || username;
+  try {
+    const userRes  = await axios.get(`${restBase}CRUser/${crUserId}`, {
+      headers, timeout: 8_000, responseType: 'text',
+    });
+    const userParsed = parseXml(userRes.data);
+    const crUser     = userParsed?.CRUser || {};
+    userRoleID       = parseInt(crUser.userRoleID || '0', 10);
+    fullName         = `${crUser.firstName || ''} ${crUser.lastName || ''}`.trim() || username;
+    logger.info('CRUser full record', { crUserId, userRoleID, fullName, keys: Object.keys(crUser) });
+  } catch (e) {
+    logger.warn('CRUser fetch failed', { error: e.message });
   }
 
-  // Role mapping based on userRoleID
-  // userRoleID=11 → Contact → company_admin
-  // toEmployee present → placement
-  // anything else → agency_admin (office/recruiter user)
-  let platformRole;
-  if (employeeId) {
-    platformRole = 'placement';
-  } else if (userRoleID === 11) {
-    platformRole = 'company_admin';
-    contactData  = { userRoleID };  // mark as contact type
-  } else {
-    platformRole = 'agency_admin';
+  // Step 3: If employee type, get employee ID
+  if (userRoleID && userRoleID !== CONTACT_ROLE_ID) {
+    try {
+      const empRes = await axios.get(`${restBase}CREmployee`, {
+        params: { qualifier: `toUser.userID = ${crUserId}`, limit: 1 },
+        headers, timeout: 6_000, responseType: 'text',
+      });
+      const ep  = parseXml(empRes.data);
+      const arr = ep?.array?.CREmployee || ep?.CREmployee;
+      const emp = Array.isArray(arr) ? arr[0] : arr;
+      if (emp && getId(emp)) {
+        employeeId = getId(emp);
+        fullName   = `${emp.firstName || ''} ${emp.lastName || ''}`.trim() || fullName;
+      }
+    } catch (e) {
+      logger.info('Employee lookup skipped', { error: e.message });
+    }
   }
 
-  // Get name from CRUser directly if not set from employee
-  if (!fullName || fullName === username) {
-    fullName = `${crUser.firstName || ''} ${crUser.lastName || ''}`.trim() || username;
+  // Step 4: If contact type, get company
+  if (userRoleID === CONTACT_ROLE_ID) {
+    try {
+      const conRes = await axios.get(`${restBase}CRContact`, {
+        params: { qualifier: `emailAddress = '${username}'`, limit: 1, show: 'toCompany' },
+        headers, timeout: 6_000, responseType: 'text',
+      });
+      const cp  = parseXml(conRes.data);
+      const arr = cp?.array?.CRContact || cp?.CRContact;
+      const con = Array.isArray(arr) ? arr[0] : arr;
+      if (con) {
+        const comp = con.toCompany?.CRCompany || con.toCompany;
+        companyId  = getId(comp) || null;
+        fullName   = `${con.firstName || ''} ${con.lastName || ''}`.trim() || fullName;
+      }
+    } catch (e) {
+      logger.info('Contact company lookup skipped', { error: e.message });
+    }
   }
 
-  logger.info('Role resolved', { username, crUserId, userRoleID, platformRole });
+  // Role mapping:
+  // employeeId present → placement
+  // userRoleID=11 (Contact) → company_admin  
+  // anything else → agency_admin
+  const platformRole = employeeId ? 'placement'
+                     : userRoleID === CONTACT_ROLE_ID ? 'company_admin'
+                     : 'agency_admin';
+
+  logger.info('Role resolved', { username, crUserId, userRoleID, platformRole, employeeId, companyId });
 
   return {
     carerixUserId:    String(crUserId),
     carerixCompanyId: companyId ? String(companyId) : null,
-    email:            crUser.emailAddress || username,
+    email:            username,
     fullName,
     platformRole,
-    rawPayload: { crUserId, employeeId, companyId },
+    rawPayload: { crUserId, userRoleID, employeeId, companyId },
   };
 }
 
