@@ -8,6 +8,10 @@ const required = (key) => {
 const optional = (key, fallback = '') => process.env[key] || fallback;
 
 export const config = {
+  raido: {
+    baseUrl:    process.env.RAIDO_BASE_URL || 'https://aai-apim-prod-northeu-01.azure-api.net/raido/v1/nocrestapi/v1',
+    apiKey:     process.env.RAIDO_API_KEY  || '',
+  },
   port:    process.env.PORT || 3000,
   nodeEnv: process.env.NODE_ENV || 'development',
 
