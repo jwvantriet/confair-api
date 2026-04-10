@@ -31,49 +31,13 @@ const agencySchema = z.object({
   password: z.string().min(8),
 });
 
-// ── POST /auth/login/agency ───────────────────────────────────────────────────
-router.post('/login/agency', async (req, res, next) => {
-  try {
-    const parsed = agencySchema.safeParse(req.body);
-    if (!parsed.success) throw new ApiError(parsed.error.issues[0].message, 400);
-    const { email, password } = parsed.data;
-
-    const { data, error } = await adminSupabase.auth.signInWithPassword({ email, password });
-    if (error) {
-      logger.warn('Agency login failed', { email });
-      throw new ApiError('Invalid email or password', 401);
-    }
-
-    const { data: profile } = await adminSupabase
-      .from('user_profiles')
-      .select('role, display_name, is_active')
-      .eq('id', data.user.id)
-      .single();
-
-    if (!profile?.role?.startsWith('agency_')) throw new ApiError('Invalid email or password', 401);
-    if (!profile.is_active) throw new ApiError('Account is inactive', 403);
-
-    await writeAuditLog({
-      eventType:   'login_agency',
-      actorUserId: data.user.id,
-      actorRole:   profile.role,
-      payload:     { email },
-      ipAddress:   req.ip,
-    });
-
-    res.json({
-      accessToken:  data.session.access_token,
-      refreshToken: data.session.refresh_token,
-      expiresAt:    data.session.expires_at,
-      user: {
-        id:          data.user.id,
-        email:       data.user.email,
-        displayName: profile.display_name,
-        role:        profile.role,
-        authSource:  'supabase',
-      },
-    });
-  } catch (err) { next(err); }
+// ── POST /auth/login/agency ── forwards to unified Carerix login ─────────────
+// All users now authenticate via Carerix. Agency users are CRUser records
+// linked to an office in Carerix. Kept for backwards compatibility.
+router.post('/login/agency', (req, res, next) => {
+  req.body.username = req.body.username || req.body.email;
+  req.url = '/login/carerix';
+  router.handle(req, res, next);
 });
 
 // ── POST /auth/login/carerix — Carerix REST API login ────────────────────────
@@ -206,9 +170,13 @@ router.post('/login/carerix', async (req, res, next) => {
       }
     }
 
-    // Determine platform role from entity type found in Carerix
-    // Employee → placement, Contact → company_admin, fallback → placement
-    const platformRole = employeeId ? 'placement' : (contactData ? 'company_admin' : 'placement');
+    // Determine platform role from entity type found in Carerix:
+    // CREmployee → placement
+    // CRContact  → company_admin
+    // CRUser linked to office (no Employee/Contact) → agency_admin
+    const platformRole = employeeId ? 'placement'
+                       : contactData ? 'company_admin'
+                       : 'agency_admin';
 
     logger.info('Role resolved', { username, crUserId, employeeId, hasContact: !!contactData, companyId, platformRole });
 
@@ -251,6 +219,54 @@ router.post('/login/carerix', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+
+// ── POST /auth/forgot-password ────────────────────────────────────────────────
+// Sends a password reset link.
+// For Agency users: Supabase password reset email.
+// For Carerix users: Carerix PASSWORDLINK email template via REST API.
+// Always returns success to avoid username enumeration.
+router.post('/forgot-password', async (req, res, next) => {
+  try {
+    const { username } = req.body;
+    if (!username?.trim()) throw new ApiError('Username or email is required', 400);
+
+    const email = username.trim().toLowerCase();
+
+    // Try Agency user first (Supabase)
+    const { data: profile } = await adminSupabase
+      .from('user_profiles')
+      .select('id, auth_source, email')
+      .or(`email.eq.${email}`)
+      .eq('auth_source', 'supabase')
+      .maybeSingle();
+
+    if (profile) {
+      // Agency user — use Supabase password reset
+      await adminSupabase.auth.resetPasswordForEmail(profile.email, {
+        redirectTo: `${config.cors.origins[0]}/reset-password`,
+      });
+      logger.info('Agency password reset sent', { email: profile.email });
+    } else {
+      // Carerix user — use Carerix PASSWORDLINK via REST API
+      const restBase = config.carerix.restUrl;
+      const restAuth = Buffer.from(`${config.carerix.restUsername}:${config.carerix.restPassword}`).toString('base64');
+      try {
+        await axios.get(`${restBase}CRUser/send-password-link`, {
+          params: { u: username },
+          headers: { 'Authorization': `Basic ${restAuth}`, 'User-Agent': 'confair-platform/1.0' },
+          timeout: 10_000,
+        });
+        logger.info('Carerix password reset sent', { username });
+      } catch (e) {
+        // Silently ignore — Carerix may not have this endpoint, don't leak info
+        logger.warn('Carerix password reset attempt', { error: e.message });
+      }
+    }
+
+    // Always return success — never reveal if account exists
+    res.json({ message: 'If an account exists, a reset link has been sent.' });
+  } catch (err) { next(err); }
+});
 
 // ── POST /auth/refresh ────────────────────────────────────────────────────────
 router.post('/refresh', async (req, res, next) => {
