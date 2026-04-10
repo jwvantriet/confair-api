@@ -120,8 +120,8 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
       return res.json({ message: 'No placements with crew_id configured', synced: 0 });
     }
 
-    const periodFrom = period.period_start;
-    const periodTo   = period.period_end;
+    const periodFrom = period.start_date;
+    const periodTo   = period.end_date;
 
     let synced = 0, errors = 0;
     const results = [];
