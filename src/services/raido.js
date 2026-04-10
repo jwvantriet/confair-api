@@ -284,24 +284,61 @@ export function buildDailySummary(rows) {
 }
 
 // ── Map RAIDO roster objects to flat activity rows ────────────────────────────
+// RAIDO API structure:
+// Each roster item has: { Crew: { Number, Firstname, Lastname, Base, Bases, ... }, Activities: [...] }
+// Each activity has: { ActivityCode, ActivityType, ActivitySubType, Designator, Start, End, Times: {...} }
 export function mapRosterToRows(rosterItems, crewId, crewNia) {
   const rows = [];
   for (const item of rosterItems) {
+    if (!item || typeof item !== 'object') continue;
+
+    // Extract crew info from nested Crew object or top-level
+    const crewObj = typeof item.Crew === 'object' && item.Crew ? item.Crew : item;
+    const itemCrewId = string(
+      crewObj.Number || crewObj.EmployeeNumber || crewObj.Code1 || crewObj.Code2 ||
+      item.CrewUniqueId || item.CrewId || crewId || ''
+    ).trim();
+
+    const firstName = crewObj.Firstname || crewObj.FirstName || '';
+    const lastName  = crewObj.Lastname  || crewObj.LastName  || '';
+    const itemCrewName = `${firstName} ${lastName}`.trim() || crewObj.FullName || crewObj.Name || '';
+
+    // Extract crew NIA/base
+    let itemCrewNia = crewNia || '';
+    if (!itemCrewNia) {
+      itemCrewNia = string(crewObj.Base || '').trim().toUpperCase();
+      if (!itemCrewNia && Array.isArray(crewObj.Bases) && crewObj.Bases.length > 0) {
+        const baseObj = crewObj.Bases[0]?.Base || crewObj.Bases[0];
+        itemCrewNia = string(baseObj?.Code || baseObj?.ShortCode || '').trim().toUpperCase();
+      }
+    }
+
     const activities = item.Activities || item.RosterActivities || [];
+    if (!Array.isArray(activities) || activities.length === 0) continue;
+
     for (const act of activities) {
+      if (!act || typeof act !== 'object') continue;
+
+      // Times can be nested: act.Times.ActualStart / act.Times.PlannedStart
+      const times    = act.Times || act.times || {};
+      const startTs  = times.ActualStart || times.PlannedStart || act.Start || act.StartUtc || act.StartLocal || '';
+      const endTs    = times.ActualEnd   || times.PlannedEnd   || act.End   || act.EndUtc   || act.EndLocal   || '';
+      const startBase = string(act.StartBase || act.DepartureStation || act.StartAirport || '').toUpperCase();
+      const endBase   = string(act.EndBase   || act.ArrivalStation  || act.EndAirport   || '').toUpperCase();
+
       rows.push({
-        crew_id:       crewId || item.CrewId || item.crewId || '',
-        crew_nia:      crewNia || '',
-        crew_name:     item.CrewName || item.CrewDisplayName || '',
-        ActivityCode:  act.ActivityCode || act.Code || '',
-        ActivityType:  act.ActivityType || act.Type || '',
-        ActivitySubType: act.ActivitySubType || act.SubType || '',
-        Designator:    act.Designator || act.RosterDesignator || '',
-        start_activity: act.StartUtc || act.Start || act.StartLocal || '',
-        end_activity:   act.EndUtc   || act.End   || act.EndLocal   || '',
-        start_base:    act.StartBase || act.DepartureStation || '',
-        end_base:      act.EndBase   || act.ArrivalStation  || '',
-        Times:         act.Times || {},
+        crew_id:         itemCrewId  || crewId || '',
+        crew_nia:        itemCrewNia || crewNia || '',
+        crew_name:       itemCrewName,
+        ActivityCode:    string(act.ActivityCode || act.Code || ''),
+        ActivityType:    string(act.ActivityType || act.Type || ''),
+        ActivitySubType: string(act.ActivitySubType || act.SubType || ''),
+        Designator:      string(act.Designator || act.RosterDesignator || ''),
+        start_activity:  startTs,
+        end_activity:    endTs,
+        start_base:      startBase,
+        end_base:        endBase,
+        Times:           times,
       });
     }
   }
