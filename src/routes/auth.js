@@ -85,7 +85,7 @@ router.post('/login/agency', async (req, res, next) => {
 //   4. Provision Supabase session
 router.post('/login/carerix', async (req, res, next) => {
   try {
-    const { username, password, roleHint } = req.body;
+    const { username, password } = req.body;
     if (!username || !password) throw new ApiError('Username and password are required', 400);
 
     const restBase    = config.carerix.restUrl;
@@ -206,12 +206,9 @@ router.post('/login/carerix', async (req, res, next) => {
       }
     }
 
-    // Determine platform role from roleHint (user's selection on login form)
-    // Entity lookup (Employee/Contact) enriches data but doesn't block login
-    // Carerix credential validation IS the authentication
-    const platformRole = roleHint === 'company' ? 'company_admin'
-                       : roleHint === 'placement' ? 'placement'
-                       : (employeeId ? 'placement' : (contactData ? 'company_admin' : 'placement'));
+    // Determine platform role from entity type found in Carerix
+    // Employee → placement, Contact → company_admin, fallback → placement
+    const platformRole = employeeId ? 'placement' : (contactData ? 'company_admin' : 'placement');
 
     logger.info('Role resolved', { username, crUserId, employeeId, hasContact: !!contactData, companyId, platformRole });
 
