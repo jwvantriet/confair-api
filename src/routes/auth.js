@@ -14,41 +14,13 @@ const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: 
 const parseXml = (xml) => { try { return xmlParser.parse(xml); } catch { return null; } };
 const getId = (obj) => obj?.['@_id'] || obj?.id || obj?._id || null;
 
-// Service token cache for GraphQL calls
-let _svcToken = null;
-let _svcTokenExp = 0;
-
-async function getServiceToken() {
-  if (_svcToken && Date.now() < _svcTokenExp) return _svcToken;
-  const res = await axios.post(`${config.carerix.authUrl}/token`,
-    new URLSearchParams({ grant_type: 'client_credentials' }), {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Authorization': `Basic ${Buffer.from(`${config.carerix.clientId}:${config.carerix.clientSecret}`).toString('base64')}`,
-      }, timeout: 10_000,
-    }
-  );
-  _svcToken    = res.data.access_token;
-  _svcTokenExp = Date.now() + (res.data.expires_in - 60) * 1000;
-  return _svcToken;
-}
-
-async function graphql(query, variables = {}) {
-  const token = await getServiceToken();
-  const res = await axios.post(config.carerix.graphApiUrl, { query, variables }, {
-    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'User-Agent': 'confair-platform/1.0' },
-    timeout: 10_000,
-  });
-  return res.data;
-}
-
 async function loginWithCarerix(username, password) {
   const restBase    = config.carerix.restUrl;
   const restAuth    = Buffer.from(`${config.carerix.restUsername}:${config.carerix.restPassword}`).toString('base64');
   const md5password = crypto.createHash('md5').update(password).digest('hex');
   const headers     = { 'Authorization': `Basic ${restAuth}`, 'User-Agent': 'confair-platform/1.0' };
 
-  // Step 1: Authenticate via Carerix REST
+  // Step 1: Authenticate
   let loginXml;
   try {
     const res = await axios.get(`${restBase}CRUser/login-with-encrypted-password`, {
@@ -66,48 +38,56 @@ async function loginWithCarerix(username, password) {
     throw new ApiError('Invalid username or password', 401);
   }
 
-  const parsed   = parseXml(loginXml);
-  const crUser   = parsed?.CRUser || {};
-  const crUserId = getId(crUser);
+  const loginParsed = parseXml(loginXml);
+  const loginUser   = loginParsed?.CRUser || {};
+  const crUserId    = getId(loginUser);
   if (!crUserId) throw new ApiError('Invalid username or password', 401);
 
-  logger.info('Carerix login success', { crUserId, username });
-
-  // Step 2: Use GraphQL (service token) to determine entity type
-  // Check if CREmployee exists for this user
-  let platformRole  = 'agency_admin';
-  let fullName      = username;
-  let companyId     = null;
+  // Step 2: Fetch full CRUser with toCompany and toEmployee expanded
+  // The CRUser record directly has toCompany (for contacts) and toEmployee (for placements)
+  let crUser     = {};
+  let fullName   = username;
+  let companyId  = null;
+  let employeeId = null;
 
   try {
-    const [empData, conData] = await Promise.allSettled([
-      graphql(`{ crEmployeePage(qualifier: "toUser.userID = ${crUserId}", pageable: {page:0,size:1}) { totalElements items { _id firstName lastName } } }`),
-      graphql(`{ crContactPage(qualifier: "toUser.userID = ${crUserId}", pageable: {page:0,size:1}) { totalElements items { _id firstName lastName toCompany { _id name } } } }`),
-    ]);
+    const res = await axios.get(`${restBase}CRUser/${crUserId}`, {
+      params: { show: 'toEmployee,toCompany' },
+      headers, timeout: 8_000, responseType: 'text',
+    });
+    const parsed = parseXml(res.data);
+    crUser = parsed?.CRUser || {};
 
-    const emp = empData.status === 'fulfilled' ? empData.value?.data?.crEmployeePage?.items?.[0] : null;
-    const con = conData.status === 'fulfilled' ? conData.value?.data?.crContactPage?.items?.[0] : null;
-
-    logger.info('GraphQL entity lookup', {
-      empTotal: empData.status === 'fulfilled' ? empData.value?.data?.crEmployeePage?.totalElements : 'error',
-      conTotal: conData.status === 'fulfilled' ? conData.value?.data?.crContactPage?.totalElements : 'error',
-      empError: empData.reason?.message,
-      conError: conData.reason?.message,
+    // Log ALL keys so we can see the structure
+    logger.info('CRUser fetch', {
+      crUserId,
+      keys:        Object.keys(crUser),
+      toCompany:   crUser.toCompany ? JSON.stringify(crUser.toCompany).substring(0, 200) : null,
+      toEmployee:  crUser.toEmployee ? JSON.stringify(crUser.toEmployee).substring(0, 200) : null,
+      firstName:   crUser.firstName,
+      lastName:    crUser.lastName,
     });
 
-    if (emp?._id) {
-      platformRole = 'placement';
-      fullName     = `${emp.firstName || ''} ${emp.lastName || ''}`.trim() || username;
-    } else if (con?._id) {
-      platformRole = 'company_admin';
-      companyId    = con.toCompany?._id || null;
-      fullName     = `${con.firstName || ''} ${con.lastName || ''}`.trim() || username;
-    }
+    fullName = `${crUser.firstName || ''} ${crUser.lastName || ''}`.trim() || username;
+
+    // Check toEmployee
+    const emp = crUser.toEmployee?.CREmployee || crUser.toEmployee;
+    if (emp && getId(emp)) employeeId = getId(emp);
+
+    // Check toCompany — present on company contacts directly on CRUser
+    const comp = crUser.toCompany?.CRCompany || crUser.toCompany;
+    if (comp && getId(comp)) companyId = getId(comp);
+
   } catch (e) {
-    logger.warn('GraphQL entity lookup failed', { error: e.message });
+    logger.warn('CRUser fetch failed', { error: e.message, status: e.response?.status });
   }
 
-  logger.info('Role resolved', { username, crUserId, platformRole, companyId });
+  // Role: employee → placement, has company → company_admin, else → agency_admin
+  const platformRole = employeeId ? 'placement'
+                     : companyId  ? 'company_admin'
+                     : 'agency_admin';
+
+  logger.info('Role resolved', { username, crUserId, employeeId, companyId: companyId?.toString(), platformRole });
 
   return {
     carerixUserId:    String(crUserId),
@@ -115,7 +95,7 @@ async function loginWithCarerix(username, password) {
     email:            crUser.emailAddress || username,
     fullName,
     platformRole,
-    rawPayload: { crUserId, companyId },
+    rawPayload: { crUserId, employeeId, companyId },
   };
 }
 
