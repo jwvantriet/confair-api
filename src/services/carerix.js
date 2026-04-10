@@ -86,6 +86,10 @@ async function getServiceToken() {
 
 
 // ── GraphQL client ─────────────────────────────────────────────────────────────
+export async function queryGraphQL(query, variables = {}) {
+  return carerixGQL(query, variables);
+}
+
 async function carerixGQL(query, variables = {}) {
   const token = await getServiceToken();
   const res = await axios.post(config.carerix.graphApiUrl, { query, variables }, {
