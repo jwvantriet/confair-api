@@ -169,7 +169,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
             has_ground: day.hasGround || false, has_sim: day.hasSim || false,
             sold_off: day.soldOff || false, bod: day.bod || false,
             fetched_at: new Date().toISOString(),
-          }, { onConflict: 'placement_id,roster_date', returning: 'minimal' });
+          }, { onConflict: 'placement_id,period_id,roster_date', returning: 'minimal' });
 
           for (const [code, qty] of Object.entries(day.charges || {})) {
             if (!qty) continue;
@@ -237,7 +237,7 @@ router.post('/refresh/:periodId/:placementId', requireCompanyOrAbove, async (req
         crew_id: placement.crew_id, crew_nia: placement.crew_nia,
         activities, is_payable: day.isPayable || false,
         fetched_at: new Date().toISOString(),
-      }, { onConflict: 'placement_id,roster_date', returning: 'minimal' });
+      }, { onConflict: 'placement_id,period_id,roster_date', returning: 'minimal' });
 
       for (const [code, qty] of Object.entries(day.charges || {})) {
         if (!qty) continue;
