@@ -31,14 +31,10 @@ async function httpGet(path, params = {}) {
 // ── Date helpers ──────────────────────────────────────────────────────────────
 function toExclusiveDateStr(value) {
   if (!value) return '';
-  // Cap to today to avoid API rejections
-  const today = new Date();
-  today.setHours(23, 59, 59, 999);
+  // Simply add one day for exclusive end — RAIDO API uses exclusive To date
   let d;
-  try { d = new Date(value); } catch { return ''; }
-  if (d > today) d = today;
-  // Add one day for exclusive end
-  d.setDate(d.getDate() + 1);
+  try { d = new Date(value + 'T00:00:00Z'); } catch { return ''; }
+  d.setUTCDate(d.getUTCDate() + 1);
   return d.toISOString().split('T')[0];
 }
 
@@ -284,50 +280,41 @@ export function buildDailySummary(rows) {
 }
 
 // ── Map RAIDO roster objects to flat activity rows ────────────────────────────
-// RAIDO API structure:
-// Each roster item has: { Crew: { Number, Firstname, Lastname, Base, Bases, ... }, Activities: [...] }
-// Each activity has: { ActivityCode, ActivityType, ActivitySubType, Designator, Start, End, Times: {...} }
+// RAIDO API returns a flat list where each item IS the crew object:
+// { Number, Code1, Firstname, Lastname, Base, RosterActivities: [...], ... }
 export function mapRosterToRows(rosterItems, crewId, crewNia) {
   const rows = [];
   for (const item of rosterItems) {
     if (!item || typeof item !== 'object') continue;
 
-    // Extract crew info from nested Crew object or top-level
-    const crewObj = typeof item.Crew === 'object' && item.Crew ? item.Crew : item;
-    const itemCrewId = string(
-      crewObj.Number || crewObj.EmployeeNumber || crewObj.Code1 || crewObj.Code2 ||
-      item.CrewUniqueId || item.CrewId || crewId || ''
-    ).trim();
+    // Crew ID from Number field directly on item
+    const itemCrewId = string(item.Number || item.Code1 || item.Code2 || item.UniqueId || crewId || '').trim();
 
-    const firstName = crewObj.Firstname || crewObj.FirstName || '';
-    const lastName  = crewObj.Lastname  || crewObj.LastName  || '';
-    const itemCrewName = `${firstName} ${lastName}`.trim() || crewObj.FullName || crewObj.Name || '';
+    // Only process the specific crew we're looking for
+    if (crewId && itemCrewId && itemCrewId.toUpperCase() !== crewId.toUpperCase()) continue;
 
-    // Extract crew NIA/base
-    let itemCrewNia = crewNia || '';
-    if (!itemCrewNia) {
-      itemCrewNia = string(crewObj.Base || '').trim().toUpperCase();
-      if (!itemCrewNia && Array.isArray(crewObj.Bases) && crewObj.Bases.length > 0) {
-        const baseObj = crewObj.Bases[0]?.Base || crewObj.Bases[0];
-        itemCrewNia = string(baseObj?.Code || baseObj?.ShortCode || '').trim().toUpperCase();
-      }
-    }
+    const firstName = item.Firstname || item.FirstName || '';
+    const lastName  = item.Lastname  || item.LastName  || '';
+    const itemCrewName = `${firstName} ${lastName}`.trim();
 
-    const activities = item.Activities || item.RosterActivities || [];
+    // NIA/base from Base field directly on item
+    let itemCrewNia = string(item.Base || crewNia || '').trim().toUpperCase();
+
+    // Activities are in RosterActivities
+    const activities = item.RosterActivities || item.Activities || [];
     if (!Array.isArray(activities) || activities.length === 0) continue;
 
     for (const act of activities) {
       if (!act || typeof act !== 'object') continue;
 
-      // Times can be nested: act.Times.ActualStart / act.Times.PlannedStart
-      const times    = act.Times || act.times || {};
-      const startTs  = times.ActualStart || times.PlannedStart || act.Start || act.StartUtc || act.StartLocal || '';
-      const endTs    = times.ActualEnd   || times.PlannedEnd   || act.End   || act.EndUtc   || act.EndLocal   || '';
-      const startBase = string(act.StartBase || act.DepartureStation || act.StartAirport || '').toUpperCase();
-      const endBase   = string(act.EndBase   || act.ArrivalStation  || act.EndAirport   || '').toUpperCase();
+      const times     = act.Times || act.times || {};
+      const startTs   = times.ActualStart || times.PlannedStart || act.Start || act.StartUtc || act.StartLocal || '';
+      const endTs     = times.ActualEnd   || times.PlannedEnd   || act.End   || act.EndUtc   || act.EndLocal   || '';
+      const startBase = string(act.StartBase || act.DepartureStation || '').toUpperCase();
+      const endBase   = string(act.EndBase   || act.ArrivalStation  || '').toUpperCase();
 
       rows.push({
-        crew_id:         itemCrewId  || crewId || '',
+        crew_id:         itemCrewId || crewId || '',
         crew_nia:        itemCrewNia || crewNia || '',
         crew_name:       itemCrewName,
         ActivityCode:    string(act.ActivityCode || act.Code || ''),
@@ -336,7 +323,7 @@ export function mapRosterToRows(rosterItems, crewId, crewNia) {
         Designator:      string(act.Designator || act.RosterDesignator || ''),
         start_activity:  startTs,
         end_activity:    endTs,
-        start_base:      startBase,
+        start_base:      startBase || itemCrewNia,
         end_base:        endBase,
         Times:           times,
       });
