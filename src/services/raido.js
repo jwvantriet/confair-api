@@ -377,41 +377,46 @@ export function mapRosterToRows(rosterItems, crewId, crewNia) {
       // Designator "P" = pseudo/positioning — suppress aBLH
       if (string(designator).toUpperCase() === 'P') aBLH = null;
 
-      // ── Midnight splitting (UTC) ───────────────────────────────────────────
-      // Matches Python: split at UTC midnight, ending 23:59:59Z / resuming 00:00:01Z
-      const dtStart = parseIsoStrict(startTs);
-      const dtEnd   = parseIsoStrict(endTs);
+      // ── Midnight splitting (UTC) then localize ─────────────────────────────
+      // Matches Python: split at UTC midnight first, then apply base-local offset per segment
+      // Use rawStart/rawEnd (UTC) for splitting, then localize each segment
+      const rawDtStart = parseIsoStrict(rawStart || startTs);
+      const rawDtEnd   = parseIsoStrict(rawEnd   || endTs);
 
       let segs = [];
-      if (dtStart && dtEnd && dtEnd > dtStart) {
-        let segStart = new Date(dtStart);
+      if (rawDtStart && rawDtEnd && rawDtEnd > rawDtStart) {
+        let segStart = new Date(rawDtStart);
         while (true) {
           const segStartDate = segStart.toISOString().split('T')[0];
-          const segEndDate   = dtEnd.toISOString().split('T')[0];
+          const segEndDate   = rawDtEnd.toISOString().split('T')[0];
           if (segStartDate < segEndDate) {
-            // Split: end just before midnight UTC
             const nextMidnight = new Date(segStartDate);
             nextMidnight.setUTCDate(nextMidnight.getUTCDate() + 1);
             const endBeforeMidnight = new Date(nextMidnight.getTime() - 1000);
-            segs.push({ s: isoZ(segStart), e: isoZ(endBeforeMidnight), isLast: false });
+            segs.push({ sUtc: isoZ(segStart), eUtc: isoZ(endBeforeMidnight), isLast: false });
             segStart = new Date(nextMidnight.getTime() + 1000);
           } else {
-            segs.push({ s: isoZ(segStart), e: isoZ(dtEnd), isLast: true });
+            segs.push({ sUtc: isoZ(segStart), eUtc: isoZ(rawDtEnd), isLast: true });
             break;
           }
         }
       } else {
-        segs = [{ s: string(startTs), e: string(endTs), isLast: true }];
+        segs = [{ sUtc: string(rawStart || startTs), eUtc: string(rawEnd || endTs), isLast: true }];
       }
 
-      // Emit one row per segment
+      // Emit one row per segment — localize AFTER splitting (match Python)
       for (let si = 0; si < segs.length; si++) {
         const seg = segs[si];
-        // Use local date from the ORIGINAL local start string for the first segment
-        // For subsequent segments, use the UTC date of the segment start
+        // Apply base-local offset to segment timestamps
+        const outStart = (sameStartBase && act.StartBaseTimeDiff != null)
+          ? withMinutesOffset(seg.sUtc, act.StartBaseTimeDiff) : seg.sUtc;
+        const outEnd   = (sameEndBase && act.EndBaseTimeDiff != null)
+          ? withMinutesOffset(seg.eUtc, act.EndBaseTimeDiff) : seg.eUtc;
+
+        // Local date: extract from localized start string
         const segDateStr = si === 0
-          ? (localDateStr(startTs) || seg.s.split('T')[0])
-          : seg.s.split('T')[0];
+          ? (localDateStr(outStart) || seg.sUtc.split('T')[0])
+          : seg.sUtc.split('T')[0];
 
         rows.push({
           crew_id:         itemCrewId || crewId || '',
@@ -421,11 +426,12 @@ export function mapRosterToRows(rosterItems, crewId, crewNia) {
           ActivityType:    activityType,
           ActivitySubType: string(act.ActivitySubType || act.SubType || ''),
           Designator:      designator,
-          start_activity:  seg.s,
-          end_activity:    seg.e,
-          // aBLH: only on the last segment of a flight
+          start_activity:  outStart,
+          end_activity:    outEnd,
+          start_base:      dep || '',
+          end_base:        arr || '',
           aBLH:            (isFlightActivity && seg.isLast) ? aBLH : null,
-          _date:           segDateStr, // explicit local date for bucketing
+          _date:           segDateStr,
         });
       }
     }
