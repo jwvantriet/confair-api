@@ -124,8 +124,21 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
 
     const today  = new Date().toISOString().split('T')[0];
     const safeTo = period.end_date < today ? period.end_date : today;
-    const rosters = await fetchRostersForCrew(period.start_date, safeTo, null);
-    const allItems = rosterItemsList(rosters);
+    logger.info('Sync: fetching RAIDO', { from: period.start_date, to: safeTo });
+    let rosters, allItems;
+    try {
+      rosters  = await fetchRostersForCrew(period.start_date, safeTo, null);
+      allItems = rosterItemsList(rosters);
+      logger.info('Sync: RAIDO response', {
+        type: Array.isArray(rosters) ? 'array' : typeof rosters,
+        itemCount: allItems.length,
+        firstItemKeys: allItems[0] ? Object.keys(allItems[0]).slice(0, 8) : [],
+        raidoMessage: rosters?.message || null,
+      });
+    } catch (raidoError) {
+      logger.error('Sync: RAIDO fetch failed', { error: raidoError.message });
+      return res.status(500).json({ error: 'RAIDO fetch failed: ' + raidoError.message });
+    }
 
     const { data: chargeTypes } = await adminSupabase.from('charge_types').select('id, code');
     const ctByCode = Object.fromEntries((chargeTypes || []).map(ct => [ct.code, ct]));
@@ -136,6 +149,11 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
         const rows       = mapRosterToRows(allItems, placement.crew_id, placement.crew_nia);
         const summaries  = buildDailySummary(rows);
         const crewSummary = summaries.find(c => c.crewId?.toUpperCase() === placement.crew_id?.toUpperCase()) || summaries[0];
+        logger.info('Sync: placement mapping', {
+          placement: placement.full_name, crew_id: placement.crew_id,
+          totalRows: rows.length, summaryCount: summaries.length,
+          crewSummaryCrewId: crewSummary?.crewId, days: crewSummary?.days?.length || 0,
+        });
 
         for (const day of crewSummary?.days || []) {
           const activities = (day.activities || []).map(r => ({
