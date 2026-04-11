@@ -139,7 +139,7 @@ router.get('/summary/:periodId', async (req, res, next) => {
 
     // Get placement names
     const pids = [...new Set((items || []).map(i => i.placement_id))];
-    const placementMap = {};
+    let placementMap = {};
     if (pids.length) {
       const { data: ps } = await adminSupabase.from('placements').select('id, full_name').in('id', pids);
       placementMap = Object.fromEntries((ps || []).map(p => [p.id, p.full_name]));
