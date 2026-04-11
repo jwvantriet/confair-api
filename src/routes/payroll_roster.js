@@ -159,7 +159,9 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
           const activities = (day.activities || []).map(r => ({
             ActivityCode: r.ActivityCode, ActivityType: r.ActivityType,
             ActivitySubType: r.ActivitySubType, start_activity: r.start_activity,
-            end_activity: r.end_activity, aBLH: r.aBLH ?? null, Designator: r.Designator,
+            end_activity: r.end_activity, aBLH: r.aBLH ?? null,
+            Designator: r.Designator, start_base: r.start_base || '',
+            end_base: r.end_base || '',
           }));
 
           await adminSupabase.from('roster_days').upsert({
