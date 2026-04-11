@@ -222,13 +222,27 @@ router.post('/correction', async (req, res, next) => {
 });
 
 // ── GET /roster/corrections/:periodId ─────────────────────────────────────────
-router.get('/corrections/:periodId', requireCompanyOrAbove, async (req, res, next) => {
+router.get('/corrections/:periodId?', requireCompanyOrAbove, async (req, res, next) => {
   try {
-    const { data, error } = await adminSupabase
+    // Company admin sees only their placements' corrections
+    let query = adminSupabase
       .from('charge_corrections')
-      .select('*, charge_types(code, label), placements(full_name)')
-      .eq('period_id', req.params.periodId)
+      .select('*, charge_types(code, label), placements(full_name), payroll_periods(period_ref)')
       .order('created_at', { ascending: false });
+
+    if (req.params.periodId) query = query.eq('period_id', req.params.periodId);
+
+    if (req.user.role === 'company_admin' || req.user.role === 'company_user') {
+      const { data: company } = await adminSupabase
+        .from('companies').select('id').eq('carerix_company_id', req.user.carerix_company_id).maybeSingle();
+      if (!company) return res.json([]);
+      const { data: plist } = await adminSupabase.from('placements').select('id').eq('company_id', company.id);
+      const pids = (plist || []).map(p => p.id);
+      if (!pids.length) return res.json([]);
+      query = query.in('placement_id', pids);
+    }
+
+    const { data, error } = await query;
     if (error) throw new ApiError(error.message);
     res.json(data || []);
   } catch (err) { next(err); }
