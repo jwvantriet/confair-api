@@ -262,4 +262,77 @@ router.patch('/correction/:id', requireCompanyOrAbove, async (req, res, next) =>
   } catch (err) { next(err); }
 });
 
+
+// ── GET /roster/placement/:periodId ─────────────────────────────────────────
+// Full day-by-day activity view for a placement user
+router.get('/placement/:periodId', async (req, res, next) => {
+  try {
+    const { periodId } = req.params;
+    const { user }     = req;
+
+    // Find the placement for this user
+    let placementId;
+    if (user.role === 'placement') {
+      const { data: p } = await adminSupabase.from('placements').select('id').eq('user_profile_id', user.id).maybeSingle();
+      if (!p) return res.json({ days: [] });
+      placementId = p.id;
+    } else {
+      // Agency/company can pass placement_id as query param
+      placementId = req.query.placement_id;
+      if (!placementId) return res.status(400).json({ error: 'placement_id required' });
+    }
+
+    const { data: period } = await adminSupabase.from('payroll_periods').select('*').eq('id', periodId).single();
+    if (!period) return res.json({ days: [] });
+
+    // Get all roster days for this placement/period
+    const { data: rosterDays } = await adminSupabase
+      .from('roster_days')
+      .select('roster_date, activities, is_payable, has_ground, has_sim, sold_off, bod, crew_nia')
+      .eq('placement_id', placementId)
+      .eq('period_id', periodId)
+      .order('roster_date');
+
+    // Get all charge items for this placement/period
+    const { data: chargeItems } = await adminSupabase
+      .from('charge_items')
+      .select('charge_date, quantity, charge_types(code)')
+      .eq('placement_id', placementId)
+      .eq('period_id', periodId);
+
+    // Build charge lookup: date -> { code: quantity }
+    const chargeByDate = {};
+    for (const ci of chargeItems || []) {
+      const d = ci.charge_date;
+      if (!chargeByDate[d]) chargeByDate[d] = {};
+      chargeByDate[d][ci.charge_types?.code] = Number(ci.quantity || 0);
+    }
+
+    // Build full month calendar
+    const start = new Date(period.start_date);
+    const end   = new Date(period.end_date);
+    const today = new Date();
+
+    const rosterMap = Object.fromEntries((rosterDays || []).map(d => [d.roster_date, d]));
+    const days = [];
+
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      const dateStr = d.toISOString().split('T')[0];
+      const rd      = rosterMap[dateStr];
+      const charges = chargeByDate[dateStr] || {};
+      const isFuture = d > today;
+
+      days.push({
+        date:       dateStr,
+        isFuture,
+        isPayable:  rd?.is_payable || false,
+        activities: rd?.activities || [],
+        charges,
+      });
+    }
+
+    res.json({ days, period });
+  } catch (err) { next(err); }
+});
+
 export default router;
