@@ -218,51 +218,54 @@ router.get('/summary/:periodId', async (req, res, next) => {
     const { periodId } = req.params;
     const { user } = req;
 
-    let query = adminSupabase
-      .from('charge_items')
-      .select(`
-        placement_id,
-        charge_type_id,
-        charge_date,
-        quantity,
-        rate_amount,
-        currency,
-        total_value,
-        status,
-        charge_types ( code, label, sort_order ),
-        placements ( id, full_name, crew_id, company_id )
-      `)
-      .eq('period_id', periodId)
-      .order('charge_date');
+    // Build placement_id filter based on role
+    let placementIds = null; // null = all placements
 
-    // Filter by role
     if (user.role === 'placement') {
-      // Find their placement record
-      const { data: placement } = await adminSupabase
+      const { data: p } = await adminSupabase
         .from('placements').select('id').eq('user_profile_id', user.id).maybeSingle();
-      if (!placement) return res.json({ placements: [] });
-      query = query.eq('placement_id', placement.id);
+      if (!p) return res.json({ placements: [] });
+      placementIds = [p.id];
     } else if (user.role === 'company_admin') {
       const { data: company } = await adminSupabase
         .from('companies').select('id').eq('carerix_company_id', user.carerix_company_id).maybeSingle();
       if (!company) return res.json({ placements: [] });
-      query = query.eq('placements.company_id', company.id);
+      // Get all placements for this company
+      const { data: plist } = await adminSupabase
+        .from('placements').select('id').eq('company_id', company.id);
+      if (!plist?.length) return res.json({ placements: [] });
+      placementIds = plist.map(p => p.id);
     }
+
+    // Fetch charge items
+    let query = adminSupabase
+      .from('charge_items')
+      .select('placement_id, charge_type_id, charge_date, quantity, rate_amount, currency, total_value, status, charge_types ( code, label, sort_order )')
+      .eq('period_id', periodId)
+      .order('charge_date');
+
+    if (placementIds) query = query.in('placement_id', placementIds);
 
     const { data: items, error } = await query;
     if (error) throw new ApiError(error.message);
 
-    // Group by placement → charge type → totals
+    // Fetch placement names separately
+    const allPids = [...new Set((items || []).map(i => i.placement_id))];
+    const { data: placements } = await adminSupabase
+      .from('placements').select('id, full_name').in('id', allPids.length ? allPids : ['00000000-0000-0000-0000-000000000000']);
+    const placementMap = Object.fromEntries((placements || []).map(p => [p.id, p.full_name]));
+
+    // Group by placement
     const byPlacement = new Map();
     for (const item of items || []) {
       const pid = item.placement_id;
       if (!byPlacement.has(pid)) {
         byPlacement.set(pid, {
-          placementId:   pid,
-          displayName:   item.placements?.full_name || '',
-          chargeTypes:   new Map(),
-          totalValue:    0,
-          currency:      item.currency,
+          placementId: pid,
+          displayName: placementMap[pid] || 'Unknown',
+          chargeTypes: new Map(),
+          totalValue:  0,
+          currency:    item.currency,
         });
       }
       const p    = byPlacement.get(pid);
