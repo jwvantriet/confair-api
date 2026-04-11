@@ -50,8 +50,10 @@ router.get('/sync-test/:periodId', async (req, res) => {
       allItems = rosterItemsList(rosters);
       const isArray = Array.isArray(rosters);
       const msg = rosters?.message || null;
+      const raidoError = rosters?._raidoError;
       add('RAIDO fetch', allItems.length > 0,
-        msg ? `ERROR from RAIDO: ${msg}` :
+        raidoError ? `RAIDO ERROR status=${rosters.status} msg=${rosters.message} body=${JSON.stringify(rosters.body)}` :
+        msg ? `RAIDO message: ${msg}` :
         `${allItems.length} crew items | type=${isArray ? 'array' : typeof rosters} | from=${period.start_date} to=${safeTo}`
       );
       if (allItems.length === 0) return res.json(report);
