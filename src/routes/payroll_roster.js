@@ -378,6 +378,26 @@ router.post('/resolve-correction/:correctionId', requireCompanyOrAbove, async (r
   } catch (err) { next(err); }
 });
 
+// ── GET /payroll-roster/my-summary/:periodId ─────────────────────────────────
+// Placement: get own summary by period — looks up placementId from session
+router.get('/my-summary/:periodId', async (req, res, next) => {
+  try {
+    const { periodId } = req.params;
+    const { data: placement } = await adminSupabase.from('placements').select('id').eq('user_profile_id', req.user.id).maybeSingle();
+    if (!placement) return res.status(404).json({ error: 'No placement found for this user' });
+
+    const [{ data: chargeItems }, { data: rosterDays }, { data: corrections }, { data: rosterStatus }] = await Promise.all([
+      adminSupabase.from('charge_items').select('*, charge_types(code, label, sort_order)').eq('placement_id', placement.id).eq('period_id', periodId).order('charge_date'),
+      adminSupabase.from('roster_days').select('roster_date, activities, is_payable').eq('placement_id', placement.id).eq('period_id', periodId).order('roster_date'),
+      adminSupabase.from('charge_corrections').select('*, charge_types(code, label)').eq('placement_id', placement.id).eq('period_id', periodId).order('created_at', { ascending: false }),
+      adminSupabase.from('roster_period_status').select('*').eq('placement_id', placement.id).eq('period_id', periodId).maybeSingle(),
+    ]);
+
+    const rosterMap = Object.fromEntries((rosterDays || []).map(d => [d.roster_date, d]));
+    return res.json({ status: rosterStatus, chargeItems: chargeItems || [], rosterDays: rosterMap, corrections: corrections || [] });
+  } catch (err) { next(err); }
+});
+
 // ── GET /payroll-roster/summary/:placementId/:periodId ────────────────────────
 // Get full payroll summary for a placement/period (used by My Payroll expansion)
 router.get('/summary/:placementId/:periodId', async (req, res, next) => {
