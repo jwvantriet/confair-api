@@ -264,74 +264,169 @@ router.patch('/correction/:id', requireCompanyOrAbove, async (req, res, next) =>
 
 
 // ── GET /roster/placement/:periodId ─────────────────────────────────────────
-// Full day-by-day activity view for a placement user
+// Full day-by-day activity view — fetches live from RAIDO for open periods,
+// reads from DB for closed/completed periods (payroll frozen).
 router.get('/placement/:periodId', async (req, res, next) => {
   try {
     const { periodId } = req.params;
     const { user }     = req;
 
-    // Find the placement for this user
-    let placementId;
+    // Resolve placement
+    let placement;
     if (user.role === 'placement') {
-      const { data: p } = await adminSupabase.from('placements').select('id').eq('user_profile_id', user.id).maybeSingle();
-      if (!p) return res.json({ days: [] });
-      placementId = p.id;
+      const { data: p } = await adminSupabase
+        .from('placements')
+        .select('id, crew_id, crew_nia, full_name')
+        .eq('user_profile_id', user.id)
+        .maybeSingle();
+      if (!p) return res.json({ days: [], source: 'none' });
+      placement = p;
     } else {
-      // Agency/company can pass placement_id as query param
-      placementId = req.query.placement_id;
-      if (!placementId) return res.status(400).json({ error: 'placement_id required' });
+      // Agency/company: pass ?placement_id=xxx
+      const pid = req.query.placement_id;
+      if (!pid) return res.status(400).json({ error: 'placement_id required' });
+      const { data: p } = await adminSupabase
+        .from('placements')
+        .select('id, crew_id, crew_nia, full_name')
+        .eq('id', pid)
+        .maybeSingle();
+      if (!p) return res.json({ days: [], source: 'none' });
+      placement = p;
     }
 
-    const { data: period } = await adminSupabase.from('payroll_periods').select('*').eq('id', periodId).single();
-    if (!period) return res.json({ days: [] });
+    const { data: period } = await adminSupabase
+      .from('payroll_periods').select('*').eq('id', periodId).single();
+    if (!period) return res.json({ days: [], source: 'none' });
 
-    // Get all roster days for this placement/period
-    const { data: rosterDays } = await adminSupabase
-      .from('roster_days')
-      .select('roster_date, activities, is_payable, has_ground, has_sim, sold_off, bod, crew_nia')
-      .eq('placement_id', placementId)
-      .eq('period_id', periodId)
-      .order('roster_date');
+    const today    = new Date();
+    const isOpen   = period.status === 'open';
+    const periodEnd = new Date(period.end_date);
+    // Cap RAIDO end date to today (API rejects future dates)
+    const raidoTo  = periodEnd > today
+      ? today.toISOString().split('T')[0]
+      : period.end_date;
 
-    // Get all charge items for this placement/period
-    const { data: chargeItems } = await adminSupabase
-      .from('charge_items')
-      .select('charge_date, quantity, charge_types(code)')
-      .eq('placement_id', placementId)
-      .eq('period_id', periodId);
+    let rosterDayMap = {};
+    let source = 'db';
 
-    // Build charge lookup: date -> { code: quantity }
-    const chargeByDate = {};
-    for (const ci of chargeItems || []) {
-      const d = ci.charge_date;
-      if (!chargeByDate[d]) chargeByDate[d] = {};
-      chargeByDate[d][ci.charge_types?.code] = Number(ci.quantity || 0);
+    // For open periods with a crew_id, fetch live from RAIDO
+    if (isOpen && placement.crew_id) {
+      try {
+        const rosters = await fetchRostersForCrew(period.start_date, raidoTo, placement.crew_id);
+        const items   = rosterItemsList(rosters);
+        const rows    = mapRosterToRows(items, placement.crew_id, placement.crew_nia);
+
+        logger.info('Placement RAIDO fetch', {
+          crew_id: placement.crew_id, items: items.length, rows: rows.length
+        });
+
+        // buildDailySummary returns [{crewId, days:[{date,isPayable,activities,charges,...}]}]
+        const crewSummaries = buildDailySummary(rows);
+        const crewSummary   = crewSummaries.find(c =>
+          c.crewId?.toUpperCase() === placement.crew_id?.toUpperCase()
+        ) || crewSummaries[0];
+
+        // Load charge type IDs for DB persistence
+        const { data: chargeTypes } = await adminSupabase
+          .from('charge_types').select('id, code');
+        const ctByCode = Object.fromEntries((chargeTypes || []).map(ct => [ct.code, ct]));
+
+        for (const day of (crewSummary?.days || [])) {
+          const activities = (day.activities || []).map(r => ({
+            ActivityCode:    r.ActivityCode,
+            ActivityType:    r.ActivityType,
+            ActivitySubType: r.ActivitySubType,
+            start_activity:  r.start_activity,
+            end_activity:    r.end_activity,
+            aBLH:            r.aBLH ?? null,
+            Designator:      r.Designator,
+          }));
+
+          rosterDayMap[day.date] = {
+            activities,
+            isPayable: day.isPayable || false,
+            charges:   day.charges   || {},
+          };
+
+          // Persist to DB (overwrite — period is open)
+          await adminSupabase.from('roster_days').upsert({
+            placement_id: placement.id, period_id: periodId, roster_date: day.date,
+            crew_id: placement.crew_id, crew_nia: placement.crew_nia,
+            activities, is_payable: day.isPayable || false,
+            has_ground: day.hasGround || false, has_sim: day.hasSim || false,
+            sold_off: day.soldOff || false, bod: day.bod || false,
+            fetched_at: new Date().toISOString(),
+          }, { onConflict: 'placement_id,roster_date', returning: 'minimal' });
+
+          // Upsert charge items
+          for (const [code, qty] of Object.entries(day.charges || {})) {
+            if (!qty) continue;
+            const ct = ctByCode[code];
+            if (!ct) continue;
+            await adminSupabase.from('charge_items').upsert({
+              placement_id: placement.id, period_id: periodId,
+              charge_type_id: ct.id, charge_date: day.date,
+              quantity: qty, rate_amount: null, currency: 'USD',
+              total_value: null, status: 'confirmed',
+            }, { onConflict: 'placement_id,charge_date,charge_type_id', returning: 'minimal' });
+          }
+        }
+        source = 'raido';
+      } catch (raidoErr) {
+        logger.warn('RAIDO fetch failed, falling back to DB', { error: raidoErr.message });
+      }
+    }
+
+    // Always fall back to DB for closed periods or RAIDO failures
+    if (source === 'db' || Object.keys(rosterDayMap).length === 0) {
+      const { data: rosterDays } = await adminSupabase
+        .from('roster_days')
+        .select('roster_date, activities, is_payable')
+        .eq('placement_id', placement.id)
+        .eq('period_id', periodId)
+        .order('roster_date');
+
+      const { data: chargeItems } = await adminSupabase
+        .from('charge_items')
+        .select('charge_date, quantity, charge_types(code)')
+        .eq('placement_id', placement.id)
+        .eq('period_id', periodId);
+
+      const chargeByDate = {};
+      for (const ci of chargeItems || []) {
+        if (!chargeByDate[ci.charge_date]) chargeByDate[ci.charge_date] = {};
+        chargeByDate[ci.charge_date][ci.charge_types?.code] = Number(ci.quantity || 0);
+      }
+
+      for (const rd of rosterDays || []) {
+        rosterDayMap[rd.roster_date] = {
+          activities: rd.activities || [],
+          isPayable:  rd.is_payable || false,
+          charges:    chargeByDate[rd.roster_date] || {},
+        };
+      }
     }
 
     // Build full month calendar
+    const days = [];
     const start = new Date(period.start_date);
     const end   = new Date(period.end_date);
-    const today = new Date();
-
-    const rosterMap = Object.fromEntries((rosterDays || []).map(d => [d.roster_date, d]));
-    const days = [];
 
     for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-      const dateStr = d.toISOString().split('T')[0];
-      const rd      = rosterMap[dateStr];
-      const charges = chargeByDate[dateStr] || {};
+      const dateStr  = d.toISOString().split('T')[0];
+      const rd       = rosterDayMap[dateStr];
       const isFuture = d > today;
 
       days.push({
         date:       dateStr,
         isFuture,
-        isPayable:  rd?.is_payable || false,
+        isPayable:  rd?.isPayable || false,
         activities: rd?.activities || [],
-        charges,
+        charges:    rd?.charges || {},
       });
     }
 
-    res.json({ days, period });
+    res.json({ days, period, source });
   } catch (err) { next(err); }
 });
 
