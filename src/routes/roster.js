@@ -131,7 +131,14 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
         // Fetch RAIDO roster for this crew
         const rosters    = await fetchRostersForCrew(periodFrom, periodTo, placement.crew_id);
         const items      = rosterItemsList(rosters);
+        logger.info('RAIDO response', {
+          crew_id:     placement.crew_id,
+          itemCount:   items.length,
+          firstKeys:   items[0] ? Object.keys(items[0]).slice(0, 10) : [],
+          firstItem:   JSON.stringify(items[0] || {}).substring(0, 300),
+        });
         const rows       = mapRosterToRows(items, placement.crew_id, placement.crew_nia);
+        logger.info('Mapped rows', { count: rows.length, firstRow: rows[0] ? JSON.stringify(rows[0]).substring(0, 200) : 'none' });
         const summary    = buildDailySummary(rows);
         const crewSummary = summary.find(c => c.crewId === placement.crew_id) || { days: [], totals: {} };
 
