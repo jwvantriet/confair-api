@@ -15,6 +15,7 @@ import invoicesRoutes    from './routes/invoices.js';
 import importRoutes      from './routes/import.js';
 import carerixRoutes     from './routes/carerix.js';
 import rosterRoutes      from './routes/roster.js';
+import payrollRosterRoutes from './routes/payroll_roster.js';
 
 const app = express();
 
@@ -57,6 +58,7 @@ app.use('/invoices',    invoicesRoutes);
 app.use('/import',      importRoutes);
 app.use('/carerix',     carerixRoutes);
 app.use('/roster',      rosterRoutes);
+app.use('/payroll-roster', payrollRosterRoutes);
 app.use(errorHandler);
 
 app.listen(config.port, () =>
