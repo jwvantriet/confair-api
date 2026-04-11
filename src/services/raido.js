@@ -183,8 +183,10 @@ export function buildDailySummary(rows) {
     const crewName = row.crew_name || row.CrewName || '';
     const crewNia  = string(row.crew_nia || row.CrewNia || '').trim().toUpperCase();
 
-    const ts  = row.start_activity || row.StartUtc || row.Start;
-    const day = activityDayFromTimestamp(ts);
+    const ts  = row._date || row.start_activity || row.StartUtc || row.Start;
+    // _date is the explicit local calendar date set by mapRosterToRows
+    // For _date we use it directly; for raw timestamps extract the local date prefix
+    const day = row._date || activityDayFromTimestamp(ts);
     if (!day) continue;
 
     const key = `${crewId}|${day}`;
@@ -280,53 +282,166 @@ export function buildDailySummary(rows) {
 }
 
 // ── Map RAIDO roster objects to flat activity rows ────────────────────────────
-// RAIDO API returns a flat list where each item IS the crew object:
-// { Number, Code1, Firstname, Lastname, Base, RosterActivities: [...], ... }
+// Matches the Python ServerModule1.py _map_rosters_with_flights logic:
+// 1. Date bucketing uses LOCAL string date (not UTC) from act.Start
+// 2. Activities crossing UTC midnight are split at 23:59:59Z / 00:00:01Z
+// 3. Timestamps shown in base-local time when StartBase == crew NIA
+// 4. aBLH is HH:MM string for flights only, from ActualStart/ActualEnd duration
+
+function isoZ(dt) {
+  // Convert Date to ISO Z string
+  return dt.toISOString().replace('.000Z', 'Z').replace(/\.\d+Z$/, 'Z');
+}
+
+function parseIsoStrict(ts) {
+  if (!ts) return null;
+  const d = new Date(ts);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function minutesToHHMM(totalMinutes) {
+  const m = Math.max(0, Math.round(totalMinutes));
+  const h = Math.floor(m / 60);
+  const min = m % 60;
+  return `${String(h).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
+}
+
+function withMinutesOffset(isoTs, offsetMinutes) {
+  // Convert a UTC ISO timestamp to local time with given offset, returning local ISO string
+  if (!isoTs || offsetMinutes == null) return isoTs;
+  const dt = parseIsoStrict(isoTs);
+  if (!dt) return isoTs;
+  const off = Number(offsetMinutes);
+  if (isNaN(off)) return isoTs;
+  const localMs = dt.getTime() + off * 60000;
+  const localDt = new Date(localMs);
+  const sign = off >= 0 ? '+' : '-';
+  const absOff = Math.abs(off);
+  const hh = String(Math.floor(absOff / 60)).padStart(2, '0');
+  const mm = String(absOff % 60).padStart(2, '0');
+  return localDt.toISOString().replace('Z', '') + `${sign}${hh}:${mm}`;
+}
+
+function localDateStr(isoTs) {
+  // Extract YYYY-MM-DD from the LOCAL part of an ISO timestamp string
+  // e.g. "2026-04-02T00:00:00+02:00" -> "2026-04-02"
+  // e.g. "2026-04-01T22:00:00Z" -> "2026-04-01"
+  if (!isoTs) return null;
+  const m = String(isoTs).match(/^(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : null;
+}
+
 export function mapRosterToRows(rosterItems, crewId, crewNia) {
   const rows = [];
+
   for (const item of rosterItems) {
     if (!item || typeof item !== 'object') continue;
 
-    // Crew ID from Number field directly on item
-    const itemCrewId = string(item.Number || item.Code1 || item.Code2 || item.UniqueId || crewId || '').trim();
+    const crewObj     = typeof item.Crew === 'object' && item.Crew ? item.Crew : item;
+    const itemCrewId  = string(crewObj.Number || crewObj.EmployeeNumber || crewObj.Code1 || item.CrewUniqueId || crewId || '').trim();
+    const firstName   = crewObj.Firstname || crewObj.FirstName || '';
+    const lastName    = crewObj.Lastname  || crewObj.LastName  || '';
+    const itemCrewName = `${firstName} ${lastName}`.trim();
+    const itemCrewNia  = string(crewObj.Base || crewNia || '').trim().toUpperCase();
 
-    // Only process the specific crew we're looking for
+    // Filter to only the requested crew when crewId is provided
     if (crewId && itemCrewId && itemCrewId.toUpperCase() !== crewId.toUpperCase()) continue;
 
-    const firstName = item.Firstname || item.FirstName || '';
-    const lastName  = item.Lastname  || item.LastName  || '';
-    const itemCrewName = `${firstName} ${lastName}`.trim();
+    const crewNiaBases = new Set(itemCrewNia.split(',').map(b => b.trim()).filter(Boolean));
 
-    // NIA/base from Base field directly on item
-    let itemCrewNia = string(item.Base || crewNia || '').trim().toUpperCase();
-
-    // Activities are in RosterActivities
     const activities = item.RosterActivities || item.Activities || [];
-    if (!Array.isArray(activities) || activities.length === 0) continue;
+    if (!Array.isArray(activities)) continue;
 
     for (const act of activities) {
       if (!act || typeof act !== 'object') continue;
 
-      const times     = act.Times || act.times || {};
-      const startTs   = times.ActualStart || times.PlannedStart || act.Start || act.StartUtc || act.StartLocal || '';
-      const endTs     = times.ActualEnd   || times.PlannedEnd   || act.End   || act.EndUtc   || act.EndLocal   || '';
-      const startBase = string(act.StartBase || act.DepartureStation || '').toUpperCase();
-      const endBase   = string(act.EndBase   || act.ArrivalStation  || '').toUpperCase();
+      const times         = act.Times || act.times || {};
+      const actualStart   = times.ActualStart || '';
+      const actualEnd     = times.ActualEnd   || '';
+      const activityType  = string(act.ActivityType || act.Type || '');
+      const isFlightActivity = activityType.toUpperCase() === 'FLIGHT';
 
-      rows.push({
-        crew_id:         itemCrewId || crewId || '',
-        crew_nia:        itemCrewNia || crewNia || '',
-        crew_name:       itemCrewName,
-        ActivityCode:    string(act.ActivityCode || act.Code || ''),
-        ActivityType:    string(act.ActivityType || act.Type || ''),
-        ActivitySubType: string(act.ActivitySubType || act.SubType || ''),
-        Designator:      string(act.Designator || act.RosterDesignator || ''),
-        start_activity:  startTs,
-        end_activity:    endTs,
-        start_base:      startBase || itemCrewNia,
-        end_base:        endBase,
-        Times:           times,
-      });
+      // Source timestamps: prefer act.Start (local) for non-flight; ActualStart for flights
+      const rawStart = string(isFlightActivity && actualStart ? actualStart : (act.Start || act.StartUtc || act.StartLocal || actualStart));
+      const rawEnd   = string(isFlightActivity && actualEnd   ? actualEnd   : (act.End   || act.EndUtc   || act.EndLocal   || actualEnd));
+
+      // Base-local display: if dep/arr airport matches crew NIA, localize using BaseTimeDiff
+      const dep = string(act.StartAirportCode || act.DepartureAirport || act.Dep || '').toUpperCase();
+      const arr = string(act.EndAirportCode   || act.ArrivalAirport   || act.Arr || '').toUpperCase();
+      const sameStartBase = dep && crewNiaBases.has(dep);
+      const sameEndBase   = arr && crewNiaBases.has(arr);
+
+      const startTs = sameStartBase && act.StartBaseTimeDiff != null
+        ? withMinutesOffset(rawStart, act.StartBaseTimeDiff) : rawStart;
+      const endTs   = sameEndBase && act.EndBaseTimeDiff != null
+        ? withMinutesOffset(rawEnd, act.EndBaseTimeDiff) : rawEnd;
+
+      // aBLH: HH:MM string for flights only, from ActualStart/ActualEnd duration
+      let aBLH = null;
+      if (isFlightActivity) {
+        const dtS = parseIsoStrict(actualStart || rawStart);
+        const dtE = parseIsoStrict(actualEnd   || rawEnd);
+        if (dtS && dtE && dtE > dtS) {
+          const mins = (dtE - dtS) / 60000;
+          aBLH = minutesToHHMM(mins);
+        }
+      }
+
+      const designator = string(act.RosterDesignator || act.Designator || '');
+      // Designator "P" = pseudo/positioning — suppress aBLH
+      if (string(designator).toUpperCase() === 'P') aBLH = null;
+
+      // ── Midnight splitting (UTC) ───────────────────────────────────────────
+      // Matches Python: split at UTC midnight, ending 23:59:59Z / resuming 00:00:01Z
+      const dtStart = parseIsoStrict(startTs);
+      const dtEnd   = parseIsoStrict(endTs);
+
+      let segs = [];
+      if (dtStart && dtEnd && dtEnd > dtStart) {
+        let segStart = new Date(dtStart);
+        while (true) {
+          const segStartDate = segStart.toISOString().split('T')[0];
+          const segEndDate   = dtEnd.toISOString().split('T')[0];
+          if (segStartDate < segEndDate) {
+            // Split: end just before midnight UTC
+            const nextMidnight = new Date(segStartDate);
+            nextMidnight.setUTCDate(nextMidnight.getUTCDate() + 1);
+            const endBeforeMidnight = new Date(nextMidnight.getTime() - 1000);
+            segs.push({ s: isoZ(segStart), e: isoZ(endBeforeMidnight), isLast: false });
+            segStart = new Date(nextMidnight.getTime() + 1000);
+          } else {
+            segs.push({ s: isoZ(segStart), e: isoZ(dtEnd), isLast: true });
+            break;
+          }
+        }
+      } else {
+        segs = [{ s: string(startTs), e: string(endTs), isLast: true }];
+      }
+
+      // Emit one row per segment
+      for (let si = 0; si < segs.length; si++) {
+        const seg = segs[si];
+        // Use local date from the ORIGINAL local start string for the first segment
+        // For subsequent segments, use the UTC date of the segment start
+        const segDateStr = si === 0
+          ? (localDateStr(startTs) || seg.s.split('T')[0])
+          : seg.s.split('T')[0];
+
+        rows.push({
+          crew_id:         itemCrewId || crewId || '',
+          crew_nia:        itemCrewNia || crewNia || '',
+          crew_name:       itemCrewName,
+          ActivityCode:    string(act.ActivityCode || act.Code || ''),
+          ActivityType:    activityType,
+          ActivitySubType: string(act.ActivitySubType || act.SubType || ''),
+          Designator:      designator,
+          start_activity:  seg.s,
+          end_activity:    seg.e,
+          // aBLH: only on the last segment of a flight
+          aBLH:            (isFlightActivity && seg.isLast) ? aBLH : null,
+          _date:           segDateStr, // explicit local date for bucketing
+        });
+      }
     }
   }
   return rows;
