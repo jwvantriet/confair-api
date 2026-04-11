@@ -23,19 +23,25 @@ async function httpGet(path, params = {}) {
     const res = await axios.get(url, { headers: HEADERS(), params, timeout: 30_000 });
     return res.data;
   } catch (err) {
-    logger.error('RAIDO API error', { path, params, status: err.response?.status, error: err.message });
-    return {};
+    const status = err.response?.status;
+    const body   = err.response?.data;
+    logger.error('RAIDO API error', { path, params, status, error: err.message, body });
+    // Return structured error so callers can detect failure
+    return { _raidoError: true, status, message: err.message, body };
   }
 }
 
 // ── Date helpers ──────────────────────────────────────────────────────────────
 function toExclusiveDateStr(value) {
   if (!value) return '';
-  // Simply add one day for exclusive end — RAIDO API uses exclusive To date
+  // Cap To date to today — RAIDO rejects future dates
+  const today = new Date();
+  const todayStr = today.toISOString().split('T')[0];
   let d;
   try { d = new Date(value + 'T00:00:00Z'); } catch { return ''; }
-  d.setUTCDate(d.getUTCDate() + 1);
-  return d.toISOString().split('T')[0];
+  // Return the lesser of requested date or today
+  const valueStr = d.toISOString().split('T')[0];
+  return valueStr < todayStr ? valueStr : todayStr;
 }
 
 function monthBounds(year, month) {
@@ -52,31 +58,11 @@ export async function fetchRosters(from, to) {
 }
 
 export async function fetchRostersForCrew(from, to, crewId) {
-  if (!crewId?.trim()) return fetchRosters(from, to);
-  const toExcl = toExclusiveDateStr(to);
-  const cid    = crewId.trim();
-
-  // Try candidate param names — RAIDO API varies
-  const candidates = [
-    { From: from, To: toExcl, UniqueId:       cid, RequestData: 'Times' },
-    { From: from, To: toExcl, CrewUniqueId:   cid, RequestData: 'Times' },
-    { From: from, To: toExcl, Crew:           cid, RequestData: 'Times' },
-    { From: from, To: toExcl, EmployeeNumber: cid, RequestData: 'Times' },
-    { From: from, To: toExcl, CrewCode:       cid, RequestData: 'Times' },
-  ];
-
-  for (const params of candidates) {
-    try {
-      const resp = await httpGet('/rosters', params);
-      const items = rosterItemsList(resp);
-      if (items.length > 0) {
-        logger.info('RAIDO roster fetched', { crewId, param: Object.keys(params).find(k => !['From','To','RequestData'].includes(k)), count: items.length });
-        return resp;
-      }
-    } catch { /* try next */ }
-  }
-  // Fallback to full window
-  return fetchRosters(from, to);
+  // RAIDO does not reliably filter by crew via params — fetch all, filter client-side
+  const today  = new Date().toISOString().split('T')[0];
+  const safeTo = to < today ? to : today;
+  logger.info('RAIDO fetch', { from, to: safeTo, crewId });
+  return fetchRosters(from, safeTo);
 }
 
 export async function testConnection() {
