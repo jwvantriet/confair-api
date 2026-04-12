@@ -10,6 +10,81 @@ import { logger } from '../utils/logger.js';
 import { fetchRostersForCrew, rosterItemsList, mapRosterToRows, buildDailySummary } from '../services/raido.js';
 
 const router = Router();
+
+/**
+ * Fetch rates for a placement from Carerix crJobFinancePage.
+ * Returns a map of { carerix_type_id -> { amount, currency } }
+ * Uses toFinance.toKindNode.dataNodeID to match charge types.
+ */
+/** Normalize Carerix currency label to ISO code */
+function normalizeCurrency(raw) {
+  if (!raw) return 'EUR';
+  const u = raw.toUpperCase().trim();
+  if (u === 'EUR' || u.includes('EURO')) return 'EUR';
+  if (u === 'USD' || u.includes('DOLLAR') || u.includes('US ')) return 'USD';
+  if (u === 'GBP' || u.includes('POUND') || u.includes('STERLING')) return 'GBP';
+  // If it looks like an ISO code already (3 letters), use it
+  if (/^[A-Z]{3}$/.test(u)) return u;
+  return 'EUR'; // safe fallback
+}
+
+async function fetchCarerixRatesForJob(carerixJobId) {
+  try {
+    const { queryGraphQL } = await import('../services/carerix.js');
+    const result = await queryGraphQL(`
+      query JobFinancePage($qualifier: String, $pageable: Pageable) {
+        crJobFinancePage(qualifier: $qualifier, pageable: $pageable) {
+          items {
+            _id
+            toFinance {
+              _id
+              amount
+              startDate
+              endDate
+              toKindNode { dataNodeID value }
+              toCurrencyNode { dataNodeID value }
+              toTypeNode { typeID }
+            }
+          }
+        }
+      }
+    `, {
+      qualifier: 'toJob.jobID == ' + parseInt(carerixJobId),
+      pageable: { page: 0, size: 100 }
+    });
+
+    const items = result?.data?.crJobFinancePage?.items || [];
+    const rateMap = {};
+    const today = new Date().toISOString().split('T')[0];
+
+    for (const item of items) {
+      const finance = item?.toFinance;
+      if (!finance) continue;
+
+      // Skip expired rates (endDate in the past)
+      const endDate = finance.endDate ? String(finance.endDate).split('T')[0] : null;
+      if (endDate && endDate < today) continue;
+
+      const kindId = finance.toKindNode?.dataNodeID;
+      if (!kindId) continue;
+
+      const amount   = finance.amount != null ? Number(finance.amount) : null;
+      // Normalize currency: Carerix may return "Euro", "US Dollar" etc
+    const rawCurrency = (finance.toCurrencyNode?.value || '').trim();
+    const currency = normalizeCurrency(rawCurrency);
+
+      // Keep the first (most recent / active) rate per kind node
+      if (!rateMap[kindId] && amount != null) {
+        rateMap[kindId] = { amount, currency };
+      }
+    }
+
+    return rateMap;
+  } catch (err) {
+    logger.warn('fetchCarerixRatesForJob failed', { carerixJobId, error: err.message });
+    return {};
+  }
+}
 router.use(requireAuth);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -102,7 +177,7 @@ router.get('/periods', async (req, res, next) => {
         ...s,
         chargeSummary: Object.values(summary),
         totalValue,
-        currency: charges?.[0]?.currency || 'USD',
+        currency: charges?.[0]?.currency || 'EUR',
         corrections: corrections || [],
       };
     }));
@@ -120,7 +195,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
     if (!period) throw new ApiError('Period not found', 404);
 
     const { data: placements } = await adminSupabase
-      .from('placements').select('id, crew_id, crew_nia, full_name').not('crew_id', 'is', null);
+      .from('placements').select('id, crew_id, crew_nia, full_name, carerix_job_id').not('crew_id', 'is', null);
 
     const today  = new Date().toISOString().split('T')[0];
     const safeTo = period.end_date < today ? period.end_date : today;
@@ -140,12 +215,53 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
       return res.status(500).json({ error: 'RAIDO fetch failed: ' + raidoError.message });
     }
 
-    const { data: chargeTypes } = await adminSupabase.from('charge_types').select('id, code');
+    const { data: chargeTypes } = await adminSupabase.from('charge_types').select('id, code, carerix_type_id');
     const ctByCode = Object.fromEntries((chargeTypes || []).map(ct => [ct.code, ct]));
+
+    // Pre-fetch all placement rates from DB (fallback if Carerix unavailable)
+    const { data: allRates } = await adminSupabase
+      .from('placement_rates')
+      .select('placement_id, charge_type_id, rate_per_unit, currency');
+    const ratesByKey = Object.fromEntries(
+      (allRates || []).map(r => [`${r.placement_id}:${r.charge_type_id}`, r])
+    );
 
     let synced = 0;
     for (const placement of placements || []) {
       try {
+        // Fetch live rates from Carerix for this placement's job
+        let carerixRateMap = {};
+        if (placement.carerix_job_id) {
+          carerixRateMap = await fetchCarerixRatesForJob(placement.carerix_job_id);
+          logger.info('Sync: Carerix rates fetched', {
+            placement: placement.full_name,
+            jobId: placement.carerix_job_id,
+            rateCount: Object.keys(carerixRateMap).length,
+            kindIds: Object.keys(carerixRateMap),
+          });
+
+          // Upsert live rates into placement_rates table for each charge type
+          for (const ct of chargeTypes || []) {
+            const kindId = ct.carerix_type_id;
+            if (!kindId || !carerixRateMap[kindId]) continue;
+            const { amount, currency } = carerixRateMap[kindId];
+            await adminSupabase.from('placement_rates').upsert({
+              placement_id:   placement.id,
+              charge_type_id: ct.id,
+              rate_per_unit:  amount,
+              currency,
+              updated_at:     new Date().toISOString(),
+            }, { onConflict: 'placement_id,charge_type_id' });
+            // Also update the in-memory ratesByKey
+            ratesByKey[`${placement.id}:${ct.id}`] = {
+              placement_id:   placement.id,
+              charge_type_id: ct.id,
+              rate_per_unit:  amount,
+              currency,
+            };
+          }
+        }
+
         const rows       = mapRosterToRows(allItems, placement.crew_id, placement.crew_nia);
         const summaries  = buildDailySummary(rows);
         const crewSummary = summaries.find(c => c.crewId?.toUpperCase() === placement.crew_id?.toUpperCase()) || summaries[0];
@@ -177,10 +293,16 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
             if (!qty) continue;
             const ct = ctByCode[code];
             if (!ct) continue;
+            const rateKey  = `${placement.id}:${ct.id}`;
+            const rateRow  = ratesByKey[rateKey];
+            const rate     = rateRow?.rate_per_unit ?? null;
+            const currency = rateRow?.currency ?? 'EUR';
+            const total    = rate != null ? Math.round(qty * Number(rate) * 100) / 100 : null;
             await adminSupabase.from('charge_items').upsert({
               placement_id: placement.id, period_id: periodId,
               charge_type_id: ct.id, charge_date: day.date,
-              quantity: qty, currency: 'USD', status: 'draft',
+              quantity: qty, rate_per_unit: rate, total_amount: total,
+              currency, status: 'draft',
             }, { onConflict: 'placement_id,charge_date,charge_type_id', returning: 'minimal' });
           }
         }
@@ -224,8 +346,16 @@ router.post('/refresh/:periodId/:placementId', requireCompanyOrAbove, async (req
     const summaries  = buildDailySummary(rows);
     const crewSummary = summaries.find(c => c.crewId?.toUpperCase() === placement.crew_id?.toUpperCase()) || summaries[0];
 
-    const { data: chargeTypes } = await adminSupabase.from('charge_types').select('id, code');
+    const { data: chargeTypes } = await adminSupabase.from('charge_types').select('id, code, carerix_type_id');
     const ctByCode = Object.fromEntries((chargeTypes || []).map(ct => [ct.code, ct]));
+
+    // Pre-fetch all placement rates from DB (fallback if Carerix unavailable)
+    const { data: allRates } = await adminSupabase
+      .from('placement_rates')
+      .select('placement_id, charge_type_id, rate_per_unit, currency');
+    const ratesByKey = Object.fromEntries(
+      (allRates || []).map(r => [`${r.placement_id}:${r.charge_type_id}`, r])
+    );
 
     for (const day of crewSummary?.days || []) {
       const activities = (day.activities || []).map(r => ({
@@ -248,7 +378,7 @@ router.post('/refresh/:periodId/:placementId', requireCompanyOrAbove, async (req
         await adminSupabase.from('charge_items').upsert({
           placement_id: placementId, period_id: periodId,
           charge_type_id: ct.id, charge_date: day.date,
-          quantity: qty, currency: 'USD', status: 'draft',
+          quantity: qty, currency: 'EUR', status: 'draft',
         }, { onConflict: 'placement_id,charge_date,charge_type_id', returning: 'minimal' });
       }
     }
