@@ -205,4 +205,71 @@ router.get('/placement-rates/:carerixPlacementId', requireAuth, requireAgency, a
   } catch (err) { next(err); }
 });
 
+
+// ── GET /carerix/employee-finances/:employeeId — fetch finances via service token ──
+// Uses Carerix service credentials directly, no user auth needed
+router.get('/employee-finances/:employeeId', async (req, res, next) => {
+  try {
+    const { queryGraphQL } = await import('../services/carerix.js');
+    const { employeeId } = req.params;
+    const result = await queryGraphQL(`
+      query EmployeeFinancePage($qualifier: String, $pageable: Pageable) {
+        crEmployeeFinancePage(qualifier: $qualifier, pageable: $pageable) {
+          items {
+            _id
+            toFinance {
+              _id
+              startDate
+              endDate
+              amount
+              cost
+              info
+              toKindNode { dataNodeID value }
+              toCurrencyNode { dataNodeID value }
+              toTypeNode { typeID identifier }
+            }
+          }
+        }
+      }
+    `, {
+      qualifier: 'toEmployee.employeeID == ' + empId,
+      pageable: { page: 0, size: 100 }
+    });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+// ── GET /carerix/job-finances/:jobId — fetch job-level finances ────────────────
+router.get('/job-finances/:jobId', async (req, res, next) => {
+  try {
+    const { queryGraphQL } = await import('../services/carerix.js');
+    const { jobId } = req.params;
+    const result = await queryGraphQL(`
+      query JobFinancePage($qualifier: String, $pageable: Pageable) {
+        crJobFinancePage(qualifier: $qualifier, pageable: $pageable) {
+          items {
+            _id
+            toJob { _id jobID name }
+            toFinance {
+              _id
+              startDate
+              endDate
+              amount
+              cost
+              info
+              toKindNode { dataNodeID value }
+              toCurrencyNode { dataNodeID value }
+              toTypeNode { typeID identifier }
+            }
+          }
+        }
+      }
+    `, {
+      qualifier: 'toJob.jobID == ' + jobId,
+      pageable: { page: 0, size: 100 }
+    });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
 export default router;
