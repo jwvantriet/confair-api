@@ -146,4 +146,63 @@ router.get('/fees/status/:periodId', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+
+
+// ── POST /carerix/gql-explore — explore Carerix GraphQL (agency only) ─────────
+router.post('/gql-explore', requireAuth, requireAgency, async (req, res, next) => {
+  try {
+    const { query, variables } = req.body;
+    if (!query) return res.status(400).json({ error: 'query required' });
+    const { queryGraphQL } = await import('../services/carerix.js');
+    const result = await queryGraphQL(query, variables || {});
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+// ── GET /carerix/rate-table/:id — fetch a specific Carerix rate table ─────────
+router.get('/rate-table/:id', requireAuth, requireAgency, async (req, res, next) => {
+  try {
+    const { queryGraphQL } = await import('../services/carerix.js');
+    const result = await queryGraphQL(`
+      query RateTable($id: ID!) {
+        crRateTable(id: $id) {
+          _id
+          name
+          description
+          crRateTableLines {
+            _id
+            amount
+            validFrom
+            validUntil
+            description
+          }
+        }
+      }
+    `, { id: req.params.id });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+// ── GET /carerix/placement-rates/:carerixPlacementId — rates for a placement ──
+router.get('/placement-rates/:carerixPlacementId', requireAuth, requireAgency, async (req, res, next) => {
+  try {
+    const { queryGraphQL } = await import('../services/carerix.js');
+    const result = await queryGraphQL(`
+      query PlacementRates($id: ID!) {
+        crMatch(id: $id) {
+          _id
+          toPublication { _id salary salaryMax }
+          toCRRateTable { _id name crRateTableLines { _id amount validFrom validUntil description } }
+          crMatchConditions {
+            _id
+            amount
+            toCRRateTable { _id name crRateTableLines { _id amount validFrom validUntil description } }
+          }
+        }
+      }
+    `, { id: req.params.carerixPlacementId });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
 export default router;
