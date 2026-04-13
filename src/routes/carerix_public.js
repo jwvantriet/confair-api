@@ -71,7 +71,14 @@ router.get('/invoice-data/:jobId', async (req, res) => {
   }
 
   // 3. Office (BILL TO — office linked to vacancy)
-  const officeId = out.job.toOffice?._id;
+  // Try to get office via separate query (toOffice may not be on crJob directly)
+  let officeId = null;
+  const offQ = await safe('office_q', 'query J($id:ID!){ crJob(_id:$id){ toOffice{_id name} } }', { id: String(req.params.jobId) });
+  officeId = offQ?.crJob?.toOffice?._id;
+  if (!officeId) {
+    const vacQ = await safe('vac_q', 'query J($id:ID!){ crJob(_id:$id){ toVacancy{ toOffice{_id name} toCompany{_id name} } } }', { id: String(req.params.jobId) });
+    officeId = vacQ?.crJob?.toVacancy?.toOffice?._id;
+  }
   if (officeId) {
     const od = await safe('office', 'query O($id:ID!){ crOffice(_id:$id){ _id name } }', { id: String(officeId) });
     out.office = od?.crOffice || null;
