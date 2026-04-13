@@ -95,49 +95,139 @@ router.get('/inspect-login', async (req, res) => {
 });
 
 
-// ── GET /carerix/job-detail/:jobId — full job data for invoice (service token) ─
-router.get('/job-detail/:jobId', async (req, res, next) => {
+// ── GET /carerix/invoice-data/:jobId — all data needed for invoice generation ─
+// Uses _id param (correct Carerix convention), fetches job + employee + company
+router.get('/invoice-data/:jobId', async (req, res, next) => {
   try {
     const { queryGraphQL } = await import('../services/carerix.js');
-    const result = await queryGraphQL(`
+
+    // Step 1: fetch job to get employee ID and company
+    const jobResult = await queryGraphQL(`
       query JobDetail($id: ID!) {
-        crJob(id: $id) {
+        crJob(_id: $id) {
           _id jobID name
           additionalInfo
-          toOffice { _id name }
-          toEmployee {
-            _id employeeID
-            toUser {
-              visitAddress { line1 line2 }
-              visitCity visitPostalCode
-              toVisitCountryNode { value }
-              homeAddress { line1 line2 }
-              homeCity homePostalCode
-              toHomeCountryNode { value }
-              paymentIbanCode paymentBicCode paymentAccountName
+          additionalInfoList
+          toCompany { _id companyID name }
+          toEmployee { _id employeeID }
+        }
+      }
+    `, { id: String(req.params.jobId) });
+
+    const job = jobResult?.data?.crJob;
+    if (!job) return res.json({ error: 'Job not found', raw: jobResult });
+
+    // Step 2: fetch employee detail with address + banking
+    const empId = job.toEmployee?._id;
+    let employee = null;
+    if (empId) {
+      const empResult = await queryGraphQL(`
+        query EmpDetail($id: ID!) {
+          crEmployee(_id: $id) {
+            _id employeeID firstName lastName name
+            paymentIbanCode paymentBicCode paymentAccountName
+            homeFullAddress homeStreet homeNumber homeNumberSuffix
+            homePostalCode homeCity
+            toHomeCountryNode { value }
+          }
+        }
+      `, { id: String(empId) });
+      employee = empResult?.data?.crEmployee;
+    }
+
+    // Step 3: fetch company details
+    const compId = job.toCompany?._id;
+    let company = null;
+    if (compId) {
+      const compResult = await queryGraphQL(`
+        query CompDetail($id: ID!) {
+          crCompany(_id: $id) {
+            _id companyID name
+            visitCity visitPostalCode visitStreet visitNumber
+            toVisitCountryNode { value }
+            emailAddress phone vatNumber
+          }
+        }
+      `, { id: String(compId) });
+      company = compResult?.data?.crCompany;
+    }
+
+    // Parse additionalInfo for legal name (10278) and VAT (10978)
+    const ai = {};
+    const rawAI = job.additionalInfo || job.additionalInfoList || {};
+    if (typeof rawAI === 'object') {
+      for (const [k, v] of Object.entries(rawAI)) {
+        ai[k.replace(/^_/, '')] = v;
+      }
+    }
+
+    res.json({ job, employee, company, additionalInfo: ai });
+  } catch (err) { next(err); }
+});
+
+
+// ── GET /carerix/employee-finances/:employeeId — fetch finances via service token ──
+// Uses Carerix service credentials directly, no user auth needed
+router.get('/employee-finances/:employeeId', async (req, res, next) => {
+  try {
+    const { queryGraphQL } = await import('../services/carerix.js');
+    const { employeeId } = req.params;
+    const result = await queryGraphQL(`
+      query EmployeeFinancePage($qualifier: String, $pageable: Pageable) {
+        crEmployeeFinancePage(qualifier: $qualifier, pageable: $pageable) {
+          items {
+            _id
+            toFinance {
+              _id
+              startDate
+              endDate
+              amount
+              cost
+              info
+              toKindNode { dataNodeID value }
+              toCurrencyNode { dataNodeID value }
+              toTypeNode { typeID identifier }
             }
           }
         }
       }
-    `, { id: String(req.params.jobId) });
+    `, {
+      qualifier: 'toEmployee.employeeID == ' + empId,
+      pageable: { page: 0, size: 100 }
+    });
     res.json(result);
   } catch (err) { next(err); }
 });
 
-// ── GET /carerix/office/:officeId — office details (service token) ────────────
-router.get('/office/:officeId', async (req, res, next) => {
+// ── GET /carerix/job-finances/:jobId — fetch job-level finances ────────────────
+router.get('/job-finances/:jobId', async (req, res, next) => {
   try {
     const { queryGraphQL } = await import('../services/carerix.js');
+    const { jobId } = req.params;
     const result = await queryGraphQL(`
-      query Office($id: ID!) {
-        crOffice(id: $id) {
-          _id name
-          toAddress { line1 line2 city postalCode }
-          toCountryNode { value }
-          email phone vatNumber
+      query JobFinancePage($qualifier: String, $pageable: Pageable) {
+        crJobFinancePage(qualifier: $qualifier, pageable: $pageable) {
+          items {
+            _id
+            toJob { _id jobID name }
+            toFinance {
+              _id
+              startDate
+              endDate
+              amount
+              cost
+              info
+              toKindNode { dataNodeID value }
+              toCurrencyNode { dataNodeID value }
+              toTypeNode { typeID identifier }
+            }
+          }
         }
       }
-    `, { id: String(req.params.officeId) });
+    `, {
+      qualifier: 'toJob.jobID == ' + jobId,
+      pageable: { page: 0, size: 100 }
+    });
     res.json(result);
   } catch (err) { next(err); }
 });
@@ -249,73 +339,6 @@ router.get('/placement-rates/:carerixPlacementId', requireAuth, requireAgency, a
         }
       }
     `, { id: req.params.carerixPlacementId });
-    res.json(result);
-  } catch (err) { next(err); }
-});
-
-
-// ── GET /carerix/employee-finances/:employeeId — fetch finances via service token ──
-// Uses Carerix service credentials directly, no user auth needed
-router.get('/employee-finances/:employeeId', async (req, res, next) => {
-  try {
-    const { queryGraphQL } = await import('../services/carerix.js');
-    const { employeeId } = req.params;
-    const result = await queryGraphQL(`
-      query EmployeeFinancePage($qualifier: String, $pageable: Pageable) {
-        crEmployeeFinancePage(qualifier: $qualifier, pageable: $pageable) {
-          items {
-            _id
-            toFinance {
-              _id
-              startDate
-              endDate
-              amount
-              cost
-              info
-              toKindNode { dataNodeID value }
-              toCurrencyNode { dataNodeID value }
-              toTypeNode { typeID identifier }
-            }
-          }
-        }
-      }
-    `, {
-      qualifier: 'toEmployee.employeeID == ' + empId,
-      pageable: { page: 0, size: 100 }
-    });
-    res.json(result);
-  } catch (err) { next(err); }
-});
-
-// ── GET /carerix/job-finances/:jobId — fetch job-level finances ────────────────
-router.get('/job-finances/:jobId', async (req, res, next) => {
-  try {
-    const { queryGraphQL } = await import('../services/carerix.js');
-    const { jobId } = req.params;
-    const result = await queryGraphQL(`
-      query JobFinancePage($qualifier: String, $pageable: Pageable) {
-        crJobFinancePage(qualifier: $qualifier, pageable: $pageable) {
-          items {
-            _id
-            toJob { _id jobID name }
-            toFinance {
-              _id
-              startDate
-              endDate
-              amount
-              cost
-              info
-              toKindNode { dataNodeID value }
-              toCurrencyNode { dataNodeID value }
-              toTypeNode { typeID identifier }
-            }
-          }
-        }
-      }
-    `, {
-      qualifier: 'toJob.jobID == ' + jobId,
-      pageable: { page: 0, size: 100 }
-    });
     res.json(result);
   } catch (err) { next(err); }
 });
