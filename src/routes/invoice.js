@@ -352,11 +352,9 @@ function buildPDF(doc, { isConcept, invoiceNumber, invoiceDate, monthLabel, from
     y += rowH;
   });
 
-  // Overtime row — show 0 if no OT, with rate from DB if available
-  const otEntry = chargeMap['Overtime'];
-  const otRate  = otEntry?.rate != null ? otEntry.rate : null;
-  const otQty   = 0; // OT hours calc'd per rotation, not by day count
-  const otTotal = 0;
+  // Overtime row — show 0 if no OT; rate from lines array (chargeMap not in scope here)
+  const otLine  = lines.find(l => l && l.label?.toLowerCase().includes('overtime'));
+  const otRate  = otLine?.rate != null ? otLine.rate : null;
   doc.fillColor(lines.length % 2 === 0 ? 'white' : GREY).rect(M, y, CW, rowH).fill();
   doc.fillColor('#1a1a1a').font('Helvetica').fontSize(8.5);
   doc.text('Overtime', cols.desc + 6, y + 7);
