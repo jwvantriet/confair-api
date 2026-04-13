@@ -1,110 +1,113 @@
 /**
- * Confair Expense API integration
- * Tests connection and proxies expense data
+ * Minggo Expense API integration (via api.confair.eu/minggo/api/v1)
+ * OAuth2 Password grant — client_id=minggo, Auth/login endpoint
  */
 import { Router } from 'express';
 import { logger } from '../utils/logger.js';
 const router = Router();
 
-const CONFAIR_API = 'https://api.confair.eu';
+// Minggo API bases — OrgID=5 confirmed from hrportal.confair.eu AppData
+const MINGGO_BASES = [
+  'https://api-test.confair.eu/minggo/api/v1',
+  'https://api.confair.eu/minggo/api/v1',
+];
+const ORG_ID = 5; // Wizz Air Group / Confair OrgID from hrportal
 
-// Token cache
-let tokenCache = { token: null, expiresAt: 0 };
+let tokenCache = { token: null, expiresAt: 0, base: null };
 
-async function getConfairToken() {
-  if (tokenCache.token && Date.now() < tokenCache.expiresAt) return tokenCache.token;
+async function getMinggoToken() {
+  if (tokenCache.token && Date.now() < tokenCache.expiresAt) return { token: tokenCache.token, base: tokenCache.base };
 
-  const clientId     = process.env.CONFAIR_API_CLIENT_ID;
-  const clientSecret = process.env.CONFAIR_API_CLIENT_SECRET;
+  const username = process.env.CONFAIR_API_CLIENT_ID;
+  const password = process.env.CONFAIR_API_CLIENT_SECRET;
 
-  if (!clientId || !clientSecret) throw new Error('CONFAIR_API_CLIENT_ID or CONFAIR_API_CLIENT_SECRET not set');
+  if (!username || !password) throw new Error('CONFAIR_API_CLIENT_ID or CONFAIR_API_CLIENT_SECRET not set in Railway env');
 
-  // Try different companyID values (0, 1, 6)
-  const companyIDs = [0, 1, 6, 658];
-  const roles      = ['EXPENSE_MANAGER', 'ROLE_WEB_USER', undefined];
-
-  for (const companyID of companyIDs) {
-    for (const role of roles) {
-      const body = { username: clientId, password: clientSecret, companyID };
-      if (role) body.role = role;
-
+  for (const base of MINGGO_BASES) {
+    // Try JSON body first
+    for (const [contentType, body] of [
+      ['application/json', JSON.stringify({ username, password, client_id: 'minggo' })],
+      ['application/json', JSON.stringify({ username, password })],
+      ['application/x-www-form-urlencoded', new URLSearchParams({ grant_type: 'password', client_id: 'minggo', client_secret: 'minggo', username, password }).toString()],
+      ['application/x-www-form-urlencoded', new URLSearchParams({ grant_type: 'password', username, password }).toString()],
+    ]) {
       try {
-        const r = await fetch(`${CONFAIR_API}/api/account/signin`, {
+        const r = await fetch(`${base}/Auth/login`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
+          headers: { 'Content-Type': contentType, 'Accept': 'application/json' },
+          body,
         });
-        const data = await r.json();
-        logger.info('Confair signin attempt', { companyID, role, status: r.status, keys: Object.keys(data) });
+        const text = await r.text();
+        let data;
+        try { data = JSON.parse(text); } catch { data = { raw: text }; }
 
-        if (r.ok && (data.token || data.userToken || data.accessToken || data.UserToken)) {
-          const token = data.token || data.userToken || data.accessToken || data.UserToken;
-          tokenCache = { token, expiresAt: Date.now() + 50 * 60 * 1000 };
-          logger.info('Confair token obtained', { companyID, role });
-          return token;
-        }
+        logger.info('Minggo auth attempt', { base, contentType, status: r.status, keys: Object.keys(data) });
+
         if (r.ok) {
-          // Log full response to see what keys we get back
-          logger.info('Confair signin OK but no token key found', { companyID, role, data: JSON.stringify(data).substring(0, 200) });
+          const token = data.access_token || data.token || data.accessToken || data.userToken || data.UserToken || data.jwt;
+          if (token) {
+            tokenCache = { token, base, expiresAt: Date.now() + 55 * 60 * 1000 };
+            logger.info('Minggo token obtained!', { base, contentType, tokenPreview: token.substring(0, 20) });
+            return { token, base };
+          }
+          // 200 but no token — log full response
+          logger.info('Minggo auth 200 but no token key', { base, contentType, data: JSON.stringify(data).substring(0, 300) });
+          return { token: null, base, rawResponse: data };
+        }
+        if (r.status !== 401 && r.status !== 400) {
+          logger.warn('Minggo unexpected status', { base, contentType, status: r.status, data: JSON.stringify(data).substring(0, 200) });
         }
       } catch (e) {
-        logger.error('Confair signin error', { companyID, role, error: e.message });
+        logger.error('Minggo auth fetch error', { base, contentType, error: e.message });
       }
     }
   }
-  throw new Error('Could not authenticate with Confair API');
+  throw new Error('All Minggo auth attempts failed');
 }
 
-// ── GET /confair-expense/test — test auth and return result ────────────────────
+// ── GET /confair-expense/test ──────────────────────────────────────────────────
 router.get('/test', async (req, res) => {
-  const clientId     = process.env.CONFAIR_API_CLIENT_ID;
-  const clientSecret = process.env.CONFAIR_API_CLIENT_SECRET;
+  const username = process.env.CONFAIR_API_CLIENT_ID;
+  const password = process.env.CONFAIR_API_CLIENT_SECRET;
+  const results  = [];
 
-  const results = [];
-
-  // Try all companyID / role combos and return full responses
-  const companyIDs = [0, 1, 6, 658];
-  for (const companyID of companyIDs) {
-    const body = { username: clientId, password: clientSecret, companyID };
-    try {
-      const r   = await fetch(`${CONFAIR_API}/api/account/signin`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      const data = await r.json();
-      results.push({ companyID, status: r.status, keys: Object.keys(data), data });
-    } catch (e) {
-      results.push({ companyID, error: e.message });
+  for (const base of MINGGO_BASES) {
+    for (const [label, contentType, body] of [
+      // companyID=5 (OrgID from hrportal AppData = Wizz Air Group)
+      ['JSON+companyID5',    'application/json', JSON.stringify({ username, password, companyID: 5 })],
+      ['JSON+client+org5',   'application/json', JSON.stringify({ username, password, client_id: 'minggo', companyID: 5 })],
+      ['FORM+org5',          'application/x-www-form-urlencoded', new URLSearchParams({ grant_type: 'password', client_id: 'minggo', client_secret: 'minggo', username, password, companyID: '5' }).toString()],
+      // Also try without companyID  
+      ['JSON+client_id',     'application/json', JSON.stringify({ username, password, client_id: 'minggo' })],
+      ['JSON only',          'application/json', JSON.stringify({ username, password })],
+      ['FORM OAuth2',        'application/x-www-form-urlencoded', new URLSearchParams({ grant_type: 'password', client_id: 'minggo', client_secret: 'minggo', username, password }).toString()],
+    ]) {
+      try {
+        const r    = await fetch(`${base}/Auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': contentType, Accept: 'application/json' },
+          body,
+        });
+        const text = await r.text();
+        let data; try { data = JSON.parse(text); } catch { data = { raw: text.substring(0, 200) }; }
+        results.push({ base, label, status: r.status, keys: Object.keys(data), data });
+      } catch (e) {
+        results.push({ base, label, error: e.message });
+      }
     }
   }
 
   res.json({
-    clientIdSet: !!clientId,
-    clientSecretSet: !!clientSecret,
-    clientIdValue: clientId ? `${clientId.substring(0,3)}***` : null,
+    envSet: { clientId: !!username, clientIdMasked: username ? username.substring(0,3) + '***' : null, secret: !!password },
     results,
   });
 });
 
-// ── GET /confair-expense/statuses — fetch expense statuses ─────────────────────
-router.get('/statuses', async (req, res, next) => {
+// ── GET /confair-expense/expenses — proxy list ─────────────────────────────────
+router.get('/expenses', async (req, res, next) => {
   try {
-    const token = await getConfairToken();
-    const r = await fetch(`${CONFAIR_API}/api/expense-statuses`, {
-      headers: { UserToken: token }
-    });
-    res.json(await r.json());
-  } catch (err) { next(err); }
-});
-
-// ── GET /confair-expense/list — fetch expenses ─────────────────────────────────
-router.get('/list', async (req, res, next) => {
-  try {
-    const token = await getConfairToken();
-    const r = await fetch(`${CONFAIR_API}/api/expenses?limit=20`, {
-      headers: { UserToken: token }
-    });
+    const { token, base } = await getMinggoToken();
+    const r = await fetch(`${base}/expenses`, { headers: { Authorization: `Bearer ${token}` } });
     res.json(await r.json());
   } catch (err) { next(err); }
 });
