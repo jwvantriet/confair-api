@@ -27,7 +27,7 @@ async function fetchCarerixInvoiceData(carerixJobId) {
 
     // 1. Job — employee + company (no toOffice in combined query — causes 400)
     const jd = await safeQ(
-      'query J($id:ID!){ crJob(_id:$id){ _id jobID name additionalInfo additionalInfoList toCompany{_id companyID name} toEmployee{_id employeeID} } }',
+      'query J($id:ID!){ crJob(_id:$id){ _id jobID name additionalInfo toCompany{_id companyID name} toEmployee{_id employeeID} } }',
       { id: String(carerixJobId) }
     );
     const job = jd?.crJob;
