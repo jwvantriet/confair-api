@@ -1,106 +1,120 @@
 /**
- * Carerix PUBLIC routes — no user auth, service token only
+ * Carerix PUBLIC debug routes — no user auth, service token only
  */
 import { Router } from 'express';
 import { logger } from '../utils/logger.js';
 const router = Router();
 
-// ── GET /cx-pub/probe ─────────────────────────────────────────────────────────
-router.get('/probe', async (req, res) => {
+const gql = async (query, vars = {}) => {
   const { queryGraphQL } = await import('../services/carerix.js');
+  try { return await queryGraphQL(query, vars); }
+  catch(e) { return { error: e.message }; }
+};
+
+// ── GET /cx-pub/schema/:type — introspect a GraphQL type ─────────────────────
+router.get('/schema/:type', async (req, res) => {
+  const result = await gql(`
+    query TypeInfo($name: String!) {
+      __type(name: $name) {
+        name
+        fields {
+          name
+          type { name kind ofType { name kind } }
+        }
+      }
+    }
+  `, { name: req.params.type });
+  res.json(result);
+});
+
+// ── GET /cx-pub/raw — run a raw query with field list ─────────────────────────
+// Usage: /cx-pub/raw?type=crJob&id=418&fields=_id,jobID,name,additionalInfo
+router.get('/raw', async (req, res) => {
+  const { type, id, fields } = req.query;
+  if (!type || !id || !fields) return res.status(400).json({ error: 'need type, id, fields params' });
+  const query = `query Q($id:ID!){ ${type}(_id:$id){ ${fields} } }`;
+  logger.info('cx-pub raw', { query });
+  const result = await gql(query, { id: String(id) });
+  res.json({ query, result });
+});
+
+// ── GET /cx-pub/probe — comprehensive debug of job 418 + office 6 ─────────────
+router.get('/probe', async (req, res) => {
   const r = {};
-  const q = async (k, query, vars={}) => {
-    try { const x = await queryGraphQL(query, vars); r[k] = x?.data || {errors: x?.errors}; }
-    catch(e) { r[k] = 'ERR: ' + e.message.substring(0,80); }
+  const q = async (k, query, vars = {}) => {
+    const x = await gql(query, vars);
+    r[k] = x?.data || x;
   };
 
-  await q('health',    '{ __typename }');
-  await q('job',       'query J($id:ID!){ crJob(_id:$id){ _id jobID name additionalInfo toCompany{_id name companyID} toEmployee{_id employeeID} toOffice{_id name} toVacancy{ _id toCompany{_id name} } } }', { id: '5319' });
+  // 1. Health
+  await q('health', '{ __typename }');
 
-  // Employee 23593 — the contractor on this job
-  await q('emp23593',  'query E($id:ID!){ crEmployee(_id:$id){ _id employeeID firstName lastName name paymentIbanCode paymentBicCode paymentAccountName homeFullAddress homeStreet homeNumber homeNumberSuffix homePostalCode homeCity toHomeCountryNode{value} } }', { id: '23593' });
+  // 2. Job 418 — minimal first
+  await q('job418_min',    'query J($id:ID!){ crJob(_id:$id){ _id jobID name } }', { id: '418' });
+  await q('job418_emp',    'query J($id:ID!){ crJob(_id:$id){ toEmployee{_id employeeID} } }', { id: '418' });
+  await q('job418_comp',   'query J($id:ID!){ crJob(_id:$id){ toCompany{_id name companyID} } }', { id: '418' });
+  await q('job418_ai',     'query J($id:ID!){ crJob(_id:$id){ additionalInfo } }', { id: '418' });
+  await q('job418_office', 'query J($id:ID!){ crJob(_id:$id){ toOffice{_id name} } }', { id: '418' });
 
-  // Try to get office details — attempt multiple field names
-  const officeId = r.job?.crJob?.toOffice?._id;
-  if (officeId) {
-    await q('office_basic', 'query O($id:ID!){ crOffice(_id:$id){ _id name } }', { id: officeId });
-    await q('office_addr1', 'query O($id:ID!){ crOffice(_id:$id){ city postalCode street number toCountryNode{value} emailAddress phone } }', { id: officeId });
-    await q('office_addr2', 'query O($id:ID!){ crOffice(_id:$id){ visitCity visitPostalCode visitStreet visitNumber vatNumber } }', { id: officeId });
-    await q('office_addr3', 'query O($id:ID!){ crOffice(_id:$id){ homeCity homePostalCode homeStreet homeNumber toHomeCountryNode{value} } }', { id: officeId });
+  // 3. Office 6 — introspect available fields
+  await q('office6_name',  'query O($id:ID!){ crOffice(_id:$id){ _id name } }', { id: '6' });
+
+  // Test every plausible address field individually
+  for (const field of ['city','postalCode','street','number','emailAddress','vatNumber',
+    'visitCity','visitCityCode','visitPostalCode','visitStreet','visitNumber','visitFullAddress',
+    'homeCity','homePostalCode','homeStreet','homeNumber','homeFullAddress']) {
+    await q(`off6_${field}`, `query O($id:ID!){ crOffice(_id:$id){ ${field} } }`, { id: '6' });
   }
 
-  // Company address field attempts
-  const compId = r.job?.crJob?.toCompany?._id || r.job?.crJob?.toVacancy?.toCompany?._id;
-  if (compId) {
-    await q('comp_basic', 'query C($id:ID!){ crCompany(_id:$id){ _id name } }', { id: compId });
-    await q('comp_addr1', 'query C($id:ID!){ crCompany(_id:$id){ city postalCode street number toCountryNode{value} vatNumber emailAddress } }', { id: compId });
-    await q('comp_addr2', 'query C($id:ID!){ crCompany(_id:$id){ visitCity visitPostalCode visitStreet visitNumber toVisitCountryNode{value} } }', { id: compId });
-  }
+  // Country nodes
+  await q('off6_visitCountry', 'query O($id:ID!){ crOffice(_id:$id){ toVisitCountryNode{value} } }', { id: '6' });
+  await q('off6_homeCountry',  'query O($id:ID!){ crOffice(_id:$id){ toHomeCountryNode{value} } }', { id: '6' });
+  await q('off6_country',      'query O($id:ID!){ crOffice(_id:$id){ toCountryNode{value} } }', { id: '6' });
+
+  // 4. Employee 23593
+  await q('emp23593', 'query E($id:ID!){ crEmployee(_id:$id){ _id firstName lastName paymentIbanCode paymentBicCode paymentAccountName homeFullAddress homePostalCode homeCity toHomeCountryNode{value} } }', { id: '23593' });
 
   res.json(r);
 });
 
 // ── GET /cx-pub/invoice-data/:jobId ───────────────────────────────────────────
 router.get('/invoice-data/:jobId', async (req, res) => {
-  const { queryGraphQL } = await import('../services/carerix.js');
-  const out = { job:null, employee:null, office:null, company:null, additionalInfo:{}, errors:{} };
-
-  const safe = async (k, q, v={}) => {
-    try { const r = await queryGraphQL(q, v); return r?.data || null; }
-    catch(e) { out.errors[k] = e.message; return null; }
+  const out = { job: null, employee: null, office: null, additionalInfo: {}, errors: {} };
+  const safe = async (k, q, v = {}) => {
+    const r = await gql(q, v);
+    if (r.error) { out.errors[k] = r.error; return null; }
+    return r?.data || null;
   };
 
-  // 1. Job
-  const jd = await safe('job',
-    'query J($id:ID!){ crJob(_id:$id){ _id jobID name additionalInfo toCompany{_id name companyID} toEmployee{_id employeeID} toOffice{_id name} toVacancy{_id toCompany{_id name}} } }',
-    { id: String(req.params.jobId) });
-  out.job = jd?.crJob;
-  if (!out.job) return res.json({ error: 'Job not found', raw: jd });
+  // Query fields separately — Carerix 400s when combining additionalInfo with relations
+  const jBasic = await safe('job_basic', 'query J($id:ID!){ crJob(_id:$id){ _id jobID name } }', { id: String(req.params.jobId) });
+  if (!jBasic?.crJob) return res.json({ error: 'Job not found', raw: jBasic, errors: out.errors });
+  out.job = jBasic.crJob;
 
-  // Parse additionalInfo
-  for (const [k,v] of Object.entries(out.job.additionalInfo || {}))
-    if (v != null && v !== '') out.additionalInfo[k.replace(/^_/,'')] = v;
+  const jAI  = await safe('job_ai',   'query J($id:ID!){ crJob(_id:$id){ additionalInfo } }', { id: String(req.params.jobId) });
+  const jEmp = await safe('job_emp',  'query J($id:ID!){ crJob(_id:$id){ toEmployee{_id employeeID} } }', { id: String(req.params.jobId) });
 
-  // 2. Employee (contractor — FROM)
-  const empId = out.job.toEmployee?._id;
+  for (const [k, v] of Object.entries(jAI?.crJob?.additionalInfo || {}))
+    if (v != null && v !== '') out.additionalInfo[k.replace(/^_/, '')] = v;
+
+  const empId = jEmp?.crJob?.toEmployee?._id;
   if (empId) {
-    const ed = await safe('emp',
-      'query E($id:ID!){ crEmployee(_id:$id){ _id employeeID firstName lastName name paymentIbanCode paymentBicCode paymentAccountName homeFullAddress homeStreet homeNumber homeNumberSuffix homePostalCode homeCity toHomeCountryNode{value} } }',
-      { id: String(empId) });
-    out.employee = ed?.crEmployee;
+    const ed = await safe('emp', 'query E($id:ID!){ crEmployee(_id:$id){ _id firstName lastName name paymentIbanCode paymentBicCode paymentAccountName homeFullAddress homePostalCode homeCity toHomeCountryNode{value} } }', { id: String(empId) });
+    out.employee = ed?.crEmployee || null;
   }
 
-  // 3. Office (BILL TO — office linked to vacancy)
-  // Try to get office via separate query (toOffice may not be on crJob directly)
-  let officeId = null;
-  const offQ = await safe('office_q', 'query J($id:ID!){ crJob(_id:$id){ toOffice{_id name} } }', { id: String(req.params.jobId) });
-  officeId = offQ?.crJob?.toOffice?._id;
-  if (!officeId) {
-    const vacQ = await safe('vac_q', 'query J($id:ID!){ crJob(_id:$id){ toVacancy{ toOffice{_id name} toCompany{_id name} } } }', { id: String(req.params.jobId) });
-    officeId = vacQ?.crJob?.toVacancy?.toOffice?._id;
-  }
+  const offQ = await safe('office_link', 'query J($id:ID!){ crJob(_id:$id){ toOffice{_id name} } }', { id: String(req.params.jobId) });
+  logger.info('office_link result', { offQ: JSON.stringify(offQ) });
+  const officeId = offQ?.crJob?.toOffice?._id;
   if (officeId) {
-    const od = await safe('office', 'query O($id:ID!){ crOffice(_id:$id){ _id name } }', { id: String(officeId) });
-    out.office = od?.crOffice || null;
-    // Try address fields
-    for (const q of [
-      'query O($id:ID!){ crOffice(_id:$id){ city postalCode street number toCountryNode{value} emailAddress vatNumber } }',
-      'query O($id:ID!){ crOffice(_id:$id){ visitCity visitPostalCode visitStreet visitNumber toVisitCountryNode{value} } }',
-      'query O($id:ID!){ crOffice(_id:$id){ homeCity homePostalCode homeStreet toHomeCountryNode{value} } }',
-    ]) {
-      const r = await safe('office_addr', q, { id: String(officeId) });
-      if (r?.crOffice) { Object.assign(out.office, r.crOffice); break; }
-    }
+    out.office = { _id: officeId, name: offQ.crJob.toOffice.name };
+    // Only use confirmed working fields
+    const oa = await safe('office_addr',
+      'query O($id:ID!){ crOffice(_id:$id){ visitCityCode visitPostalCode visitStreet visitNumber toVisitCountryNode{value} vatNumber emailAddress } }',
+      { id: String(officeId) });
+    if (oa?.crOffice) Object.assign(out.office, oa.crOffice);
   }
 
-  // 4. Company (fallback if no office)
-  const compId = out.job.toCompany?._id || out.job.toVacancy?.toCompany?._id;
-  if (compId && !out.office) {
-    const cd = await safe('comp', 'query C($id:ID!){ crCompany(_id:$id){ _id name } }', { id: String(compId) });
-    out.company = cd?.crCompany;
-  }
-
-  logger.info('cx-pub invoice-data', { jobId: req.params.jobId, empId, officeId, hasIban: !!out.employee?.paymentIbanCode });
   res.json(out);
 });
 
