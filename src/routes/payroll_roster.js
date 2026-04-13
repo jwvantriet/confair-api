@@ -153,7 +153,7 @@ router.get('/periods', async (req, res, next) => {
     const enriched = await Promise.all(filtered.map(async s => {
       const { data: charges } = await adminSupabase
         .from('charge_items')
-        .select('charge_type_id, quantity, total_value, currency, charge_types(code, label)')
+        .select('charge_type_id, quantity, total_amount, currency, charge_types(code, label)')
         .eq('placement_id', s.placement_id)
         .eq('period_id', s.period_id);
 
@@ -163,8 +163,8 @@ router.get('/periods', async (req, res, next) => {
         const code = c.charge_types?.code;
         if (!summary[code]) summary[code] = { code, label: c.charge_types?.label, quantity: 0, totalValue: 0, currency: c.currency };
         summary[code].quantity   += Number(c.quantity || 0);
-        summary[code].totalValue += Number(c.total_value || 0);
-        totalValue += Number(c.total_value || 0);
+        summary[code].totalValue += Number(c.total_amount || 0);
+        totalValue += Number(c.total_amount || 0);
       }
 
       const { data: corrections } = await adminSupabase
