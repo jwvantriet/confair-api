@@ -38,21 +38,27 @@ async function fetchCarerixInvoiceData(carerixJobId) {
     for (const [k, v] of Object.entries(job.additionalInfo || {}))
       if (v != null && v !== '') ai[k.replace(/^_/, '')] = v;
 
-    // 2. Employee + Office in parallel
+    // 2. Employee (fetch in parallel with office attempts)
     const empId = job.toEmployee?._id;
-    const [empData, officeIdRes] = await Promise.all([
-      empId ? safeQ(
-        'query E($id:ID!){ crEmployee(_id:$id){ _id firstName lastName name paymentIbanCode paymentBicCode paymentAccountName homeFullAddress homePostalCode homeCity toHomeCountryNode{value} } }',
-        { id: String(empId) }
-      ) : Promise.resolve(null),
-      safeQ('query J($id:ID!){ crJob(_id:$id){ toOffice{_id name} } }', { id: String(carerixJobId) }),
-    ]);
+    const empData = empId ? await safeQ(
+      'query E($id:ID!){ crEmployee(_id:$id){ _id firstName lastName name paymentIbanCode paymentBicCode paymentAccountName homeFullAddress homePostalCode homeCity toHomeCountryNode{value} } }',
+      { id: String(empId) }
+    ) : null;
+    const emp = empData?.crEmployee;
 
-    const emp      = empData?.crEmployee;
-    const officeId = officeIdRes?.crJob?.toOffice?._id;
+    // 3. Office — try multiple query paths
+    let officeId = null;
+    for (const [path, q] of [
+      ['direct',  'query J($id:ID!){ crJob(_id:$id){ toOffice{_id name} } }'],
+      ['vacancy', 'query J($id:ID!){ crJob(_id:$id){ toVacancy{ toOffice{_id name} } } }'],
+    ]) {
+      const r = await safeQ(q, { id: String(carerixJobId) });
+      officeId = r?.crJob?.toOffice?._id || r?.crJob?.toVacancy?.toOffice?._id;
+      if (officeId) { logger.info('Found office via ' + path, { officeId }); break; }
+    }
 
-    // 3. Office address (try multiple field conventions)
-    let office = officeIdRes?.crJob?.toOffice || null;
+    // 4. Office address (try multiple field conventions)
+    let office = officeId ? { _id: officeId } : null;
     if (officeId) {
       for (const q of [
         'query O($id:ID!){ crOffice(_id:$id){ _id name city postalCode street number toCountryNode{value} emailAddress vatNumber } }',
@@ -210,11 +216,11 @@ router.get('/pdf/:placementId/:periodId', async (req, res, next) => {
     const bic         = placement.inv_bic             || '';
     const accountName = placement.inv_account_name    || fromName;
 
-    // 4. BILL TO — cached office on companies table
+    // 4. BILL TO — cached office/company data from Supabase
     const co          = placement.companies || {};
-    const companyName = co.inv_office_name    || co.name || 'Client';
-    const companyAddr = co.inv_office_address || co.address || '';
-    const companyVat  = co.inv_office_vat     ? `VAT: ${co.inv_office_vat}` : '';
+    const companyName = co.inv_office_name || co.name || 'Client';
+    const companyAddr = co.inv_office_address || '';  // populated by sync-carerix
+    const companyVat  = co.inv_office_vat ? `VAT: ${co.inv_office_vat}` : '';
 
     // 5. Aggregate charges
     const chargeMap = {};
@@ -389,7 +395,7 @@ function buildPDF(doc, { isConcept, invoiceNumber, invoiceDate, monthLabel, from
   const payRows = [
     ['Account Name', accountName || fromName, 'Currency',  currency],
     ['IBAN',         iban || 'Not provided',   'BIC/SWIFT', bic || 'Not provided'],
-    ['Reference',    invoiceNumber,             'VAT Note',  '0% Reversed Charge — VAT shifted to recipient'],
+    ['Reference',    invoiceNumber,             '',          ''],
   ];
   payRows.forEach(([l1, v1, l2, v2]) => {
     doc.fillColor(MGREY).font('Helvetica-Bold').fontSize(7).text(l1, M, y);
