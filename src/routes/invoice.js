@@ -41,7 +41,7 @@ async function fetchCarerixInvoiceData(carerixJobId, agencyId) {
     // 2. Employee (fetch in parallel with office attempts)
     const empId = job.toEmployee?._id;
     const empData = empId ? await safeQ(
-      'query E($id:ID!){ crEmployee(_id:$id){ _id firstName lastName name paymentIbanCode paymentBicCode paymentAccountName homeFullAddress homePostalCode homeCity toHomeCountryNode{value} } }',
+      'query E($id:ID!){ crEmployee(_id:$id){ _id firstName lastName name paymentIbanCode paymentBicCode paymentAccountName homeFullAddress homePostalCode homeCity toHomeCountryNode{value} visitFullAddress visitCity visitPostalCode toVisitCountryNode{value} } }',
       { id: String(empId) }
     ) : null;
     const emp = empData?.crEmployee;
