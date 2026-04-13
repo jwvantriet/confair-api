@@ -98,7 +98,7 @@ async function carerixGQL(query, variables = {}) {
       'Content-Type':  'application/json',
       'User-Agent':    'confair-platform/1.0',
     },
-    timeout: 15_000,
+    timeout: 6_000,
   });
   if (res.data.errors?.length) {
     logger.warn('Carerix GraphQL errors', { errors: res.data.errors });
