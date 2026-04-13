@@ -272,4 +272,68 @@ router.get('/job-finances/:jobId', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+
+// ── GET /carerix/job-detail/:jobId — full job data for invoice ────────────────
+router.get('/job-detail/:jobId', async (req, res, next) => {
+  try {
+    const { queryGraphQL } = await import('../services/carerix.js');
+    const jobId = req.params.jobId;
+    const result = await queryGraphQL(`
+      query JobDetail($id: ID!) {
+        crJob(id: $id) {
+          _id
+          jobID
+          name
+          additionalInfo
+          toOffice {
+            _id
+            name
+            toAddress { line1 line2 city postalCode }
+            toCountryNode { value }
+          }
+          toEmployee {
+            _id
+            employeeID
+            toUser {
+              visitAddress { line1 line2 }
+              visitCity
+              visitPostalCode
+              toVisitCountryNode { value }
+              homeAddress { line1 line2 }
+              homeCity
+              homePostalCode
+              toHomeCountryNode { value }
+              paymentIbanCode
+              paymentBicCode
+              paymentAccountName
+            }
+          }
+        }
+      }
+    `, { id: String(jobId) });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+// ── GET /carerix/office/:officeId — office details ────────────────────────────
+router.get('/office/:officeId', async (req, res, next) => {
+  try {
+    const { queryGraphQL } = await import('../services/carerix.js');
+    const result = await queryGraphQL(`
+      query Office($id: ID!) {
+        crOffice(id: $id) {
+          _id
+          name
+          toAddress { line1 line2 city postalCode }
+          toCountryNode { value }
+          email
+          phone
+          vatNumber
+        }
+      }
+    `, { id: String(req.params.officeId) });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
 export default router;
