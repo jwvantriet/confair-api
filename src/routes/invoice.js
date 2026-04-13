@@ -1,347 +1,425 @@
 /**
- * Carerix diagnostic routes — no auth required
+ * Invoice generation — PDFKit (pure Node.js, no Python required)
+ * GET  /invoice/pdf/:placementId/:periodId
+ * POST /invoice/assign-number/:placementId/:periodId  (status=definite only)
  */
-import { Router } from 'express';
-import axios from 'axios';
-import { XMLParser } from 'fast-xml-parser';
-import { config } from '../config.js';
+import { Router }        from 'express';
 import { adminSupabase } from '../services/supabase.js';
-import { fetchAndCacheFee, testCarerixConnection } from '../services/carerix.js';
-import { requireAuth, requireAgency } from '../middleware/auth.js';
-import { ApiError } from '../middleware/errorHandler.js';
+import { requireAuth }   from '../middleware/auth.js';
+import { ApiError }      from '../middleware/errorHandler.js';
+import { logger }        from '../utils/logger.js';
 
 const router = Router();
-const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
-const parseXml = (xml) => { try { return xmlParser.parse(xml); } catch { return null; } };
 
-// ── GET /carerix/test — connection test ───────────────────────────────────────
-router.get('/test', async (req, res) => {
-  const results = await testCarerixConnection();
-  res.json(results);
-});
-
-// ── GET /carerix/inspect-login — inspect raw login XML for a username ─────────
-// Usage: /carerix/inspect-login?u=testaccount@testing.dev&p=MD5_HASH_OF_PASSWORD
-// This shows exactly what Carerix returns so we can find the role field
-router.get('/inspect-login', async (req, res) => {
-  const { u, p } = req.query;
-  if (!u || !p) return res.status(400).json({ error: 'Pass ?u=username&p=md5password' });
-
-  const restBase = config.carerix.restUrl;
-  const restAuth = Buffer.from(`${config.carerix.restUsername}:${config.carerix.restPassword}`).toString('base64');
-  const headers  = { Authorization: `Basic ${restAuth}`, 'User-Agent': 'confair-platform/1.0' };
-
-  const results = {};
-
-  // Try login with various show params
-  const showVariants = [
-    '',
-    'userRoleID',
-    'userRoleID,toEmployee,toContact,toCompany,firstName,lastName',
-    'groups',
-    'toEmployee,toContact,toCompany,toUserRole',
-  ];
-
-  for (const show of showVariants) {
-    const params = { u, p };
-    if (show) params.show = show;
-    try {
-      const r = await axios.get(`${restBase}CRUser/login-with-encrypted-password`,
-        { params, headers, timeout: 10_000, responseType: 'text' });
-      const parsed = parseXml(r.data);
-      results[`show=${show || '(none)'}`] = {
-        raw:    r.data?.substring(0, 1000),
-        parsed: parsed,
-      };
-    } catch (e) {
-      results[`show=${show || '(none)'}`] = { error: e.message, status: e.response?.status, raw: e.response?.data?.substring(0, 300) };
+// ── GET /invoice/pdf/:placementId/:periodId ────────────────────────────────────
+router.get('/pdf/:placementId/:periodId', async (req, res, next) => {
+  // Allow placement users to generate their own invoice, or agency/company admins
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
+  try {
+    const { data: { user } } = await adminSupabase.auth.getUser(authHeader.slice(7));
+    if (!user) return res.status(401).json({ error: 'Invalid token' });
+    const { data: profile } = await adminSupabase.from('user_profiles')
+      .select('id, role, is_active').eq('id', user.id).single();
+    if (!profile?.is_active) return res.status(403).json({ error: 'Account inactive' });
+    // Placement users can only access their own invoice
+    if (profile.role === 'placement') {
+      const { data: p } = await adminSupabase.from('placements')
+        .select('id').eq('user_profile_id', user.id).maybeSingle();
+      if (!p || p.id !== req.params.placementId) return res.status(403).json({ error: 'Access denied' });
+    } else if (!['agency_admin','agency_operations','company_admin','company_user'].includes(profile.role)) {
+      return res.status(403).json({ error: 'Access denied' });
     }
-  }
+    req.user = { ...user, ...profile };
+  } catch (e) { return res.status(401).json({ error: 'Auth failed' }); }
+  try {
+    const { placementId, periodId } = req.params;
 
-  // Also fetch CRUser by ID without show= to see ALL fields
-  const crUserId = parseXml(
-    (await axios.get(`${restBase}CRUser/login-with-encrypted-password`,
-      { params: { u, p }, headers, timeout: 10_000, responseType: 'text' }).catch(() => ({ data: '' }))).data
-  )?.CRUser?.['@_id'];
+    // Fetch placement first (need carerix_job_id)
+    const { data: placement } = await adminSupabase
+      .from('placements').select('*, companies(*)').eq('id', placementId).single();
+    if (!placement) throw new ApiError('Placement not found', 404);
 
-  if (crUserId) {
-    // Try various show params on direct CRUser fetch
-    for (const show of ['', 'groups', 'toEmployee,toContact,toCompany,toUserRole,userRoleID']) {
-      const params = {};
-      if (show) params.show = show;
+    const [
+      { data: period },
+      { data: chargeItems },
+      { data: invoiceRec },
+    ] = await Promise.all([
+      adminSupabase.from('payroll_periods').select('*').eq('id', periodId).single(),
+      adminSupabase.from('charge_items')
+        .select('*, charge_types(code, label, sort_order)')
+        .eq('placement_id', placementId).eq('period_id', periodId).order('charge_date'),
+      adminSupabase.from('roster_invoices').select('*')
+        .eq('placement_id', placementId).eq('period_id', periodId).maybeSingle(),
+    ]);
+
+    if (!period) throw new ApiError('Period not found', 404);
+
+    const isConcept     = !invoiceRec?.invoice_number;
+    const invoiceNumber = invoiceRec?.invoice_number || 'CONCEPT';
+    const invoiceDate   = invoiceRec?.invoice_date
+      ? new Date(invoiceRec.invoice_date).toLocaleDateString('en-GB')
+      : new Date().toLocaleDateString('en-GB');
+
+    // ── Fetch live Carerix data for FROM / BILL TO ────────────────────────────
+    let carerixData = null;
+    if (placement.carerix_job_id) {
       try {
-        const r = await axios.get(`${restBase}CRUser/${crUserId}`,
-          { params, headers, timeout: 8_000, responseType: 'text' });
-        results[`CRUser/${crUserId} show=${show || '(none)'}`] = {
-          raw: r.data?.substring(0, 1000),
-          parsed: parseXml(r.data),
-        };
-      } catch (e) {
-        results[`CRUser/${crUserId} show=${show || '(none)'}`] = { error: e.message };
+        const { queryGraphQL } = await import('../services/carerix.js');
+
+        // Step 1: Job → get employee ID + company
+        const jobRes = await queryGraphQL(`
+          query JobDetail($id: ID!) {
+            crJob(_id: $id) {
+              _id jobID name additionalInfo additionalInfoList
+              toCompany { _id companyID name }
+              toEmployee { _id employeeID }
+            }
+          }
+        `, { id: String(placement.carerix_job_id) });
+
+        const job = jobRes?.data?.crJob;
+
+        // Step 2: Employee → address + banking
+        let employee = null;
+        if (job?.toEmployee?._id) {
+          const empRes = await queryGraphQL(`
+            query EmpDetail($id: ID!) {
+              crEmployee(_id: $id) {
+                _id employeeID firstName lastName name
+                paymentIbanCode paymentBicCode paymentAccountName
+                homeFullAddress homeStreet homeNumber homeNumberSuffix
+                homePostalCode homeCity
+                toHomeCountryNode { value }
+              }
+            }
+          `, { id: String(job.toEmployee._id) });
+          employee = empRes?.data?.crEmployee;
+        }
+
+        // Step 3: Company → Bill To address
+        let cxCompany = null;
+        if (job?.toCompany?._id) {
+          const compRes = await queryGraphQL(`
+            query CompDetail($id: ID!) {
+              crCompany(_id: $id) {
+                _id companyID name
+                visitCity visitPostalCode visitStreet visitNumber
+                toVisitCountryNode { value }
+                emailAddress vatNumber
+              }
+            }
+          `, { id: String(job.toCompany._id) });
+          cxCompany = compRes?.data?.crCompany;
+        }
+
+        // Parse additionalInfo — Carerix returns as {_10278: "value"} or {10278: "value"}
+        const ai = {};
+        const rawAI = job?.additionalInfo || {};
+        if (typeof rawAI === 'object') {
+          for (const [k, v] of Object.entries(rawAI)) {
+            if (v) ai[k.replace(/^_/, '')] = v;
+          }
+        }
+        // additionalInfoList is an array [{id, value}]
+        for (const item of job?.additionalInfoList || []) {
+          if (item?.id && item?.value) ai[String(item.id)] = item.value;
+        }
+
+        carerixData = { job, employee, cxCompany, ai };
+        logger.info('Invoice: Carerix data fetched', {
+          jobId: placement.carerix_job_id,
+          hasEmployee: !!employee,
+          hasCompany: !!cxCompany,
+          aiKeys: Object.keys(ai),
+        });
+      } catch (cxErr) {
+        logger.warn('Invoice: Carerix fetch failed, using DB fallback', { error: cxErr.message });
       }
     }
 
-    // Try CREmployee with qualifier show=groups
-    try {
-      const r = await axios.get(`${restBase}CREmployee`,
-        { params: { qualifier: `toUser._id = ${crUserId}`, show: 'groups', limit: 1 }, headers, timeout: 8_000, responseType: 'text' });
-      results[`CREmployee qualifier toUser._id show=groups`] = { raw: r.data?.substring(0, 500) };
-    } catch (e) {
-      results[`CREmployee qualifier toUser._id`] = { error: e.message, status: e.response?.status };
+    // ── FROM: contractor details (reversed billing) ───────────────────────────
+    const emp = carerixData?.employee;
+    const ai  = carerixData?.ai || {};
+    const legalName = ai['10278'] || ai['_10278'] || null;
+    const vatNumber = ai['10978'] || ai['_10978'] || null;
+
+    let fromName, fromAddr, fromVat;
+    if (legalName) {
+      // LTD entity — use legal name + visit/home address
+      fromName = legalName;
+      fromVat  = vatNumber ? `VAT: ${vatNumber}` : '';
+      fromAddr = [
+        emp?.homeFullAddress || emp?.homeStreet ? `${emp.homeStreet || ''} ${emp.homeNumber || ''}`.trim() : '',
+        emp?.homePostalCode || '',
+        emp?.homeCity || '',
+        emp?.toHomeCountryNode?.value || '',
+      ].filter(Boolean).join(', ');
+    } else {
+      // Personal — use full name + home address
+      fromName = emp ? `${emp.firstName || ''} ${emp.lastName || ''}`.trim() || emp.name || placement.full_name : placement.full_name;
+      fromVat  = '';
+      fromAddr = [
+        emp?.homeFullAddress || emp?.homeStreet ? `${emp.homeStreet || ''} ${emp.homeNumber || ''}`.trim() : '',
+        emp?.homePostalCode || '',
+        emp?.homeCity || '',
+        emp?.toHomeCountryNode?.value || '',
+      ].filter(Boolean).join(', ');
     }
+
+    // Banking details from Carerix
+    const iban          = emp?.paymentIbanCode || '';
+    const bic           = emp?.paymentBicCode  || '';
+    const accountName   = emp?.paymentAccountName || fromName;
+
+    // ── BILL TO: company connected to job ────────────────────────────────────
+    const cxCo = carerixData?.cxCompany;
+    const companyName = cxCo?.name || placement.companies?.name || 'Client';
+    const companyAddr = cxCo ? [
+      cxCo.visitStreet ? `${cxCo.visitStreet} ${cxCo.visitNumber || ''}`.trim() : '',
+      cxCo.visitPostalCode || '',
+      cxCo.visitCity || '',
+      cxCo.toVisitCountryNode?.value || '',
+    ].filter(Boolean).join(', ') : (placement.companies?.address || '');
+    const companyVat = cxCo?.vatNumber ? `VAT: ${cxCo.vatNumber}` : '';
+
+    // ── Aggregate charges ─────────────────────────────────────────────────────
+    const chargeMap = {};
+    for (const ci of chargeItems || []) {
+      const code = ci.charge_types?.code;
+      if (!code) continue;
+      if (!chargeMap[code]) chargeMap[code] = { label: ci.charge_types?.label || code, quantity: 0, rate: ci.rate_per_unit ? Number(ci.rate_per_unit) : null, currency: ci.currency || 'EUR', total: 0 };
+      chargeMap[code].quantity += Number(ci.quantity || 0);
+      if (ci.total_amount) chargeMap[code].total += Number(ci.total_amount);
+    }
+
+    const ORDER = ['DailyAllowance','AvailabilityPremium','YearsWithClient','PerDiem','SoldOffDay','BODDays'];
+    const lines = ORDER.map(c => chargeMap[c]).filter(l => l && l.quantity > 0);
+
+    const currency   = lines.find(l => l.currency)?.currency || 'EUR';
+    const symbol     = currency === 'USD' ? '$' : '\u20ac';
+    const subtotal   = lines.reduce((s, l) => s + (l.total || 0), 0);
+    const vatRate    = 0; // 0% VAT — reversed charge
+    const vatAmount  = subtotal * vatRate;
+    const grandTotal = subtotal + vatAmount;
+
+    const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+    const monthLabel = `${MONTHS[period.month - 1]} ${period.year}`;
+
+    const crewId   = placement.crew_id || '';
+    const crewName = fromName;
+
+    // Generate PDF with PDFKit
+    const PDFDocument = (await import('pdfkit')).default;
+    const doc = new PDFDocument({ size: 'A4', margin: 50, info: { Title: `Invoice ${invoiceNumber}`, Author: 'Confair' } });
+
+    const chunks = [];
+    doc.on('data', chunk => chunks.push(chunk));
+
+    await new Promise((resolve, reject) => {
+      doc.on('end', resolve);
+      doc.on('error', reject);
+      buildPDF(doc, { isConcept, invoiceNumber, invoiceDate, monthLabel,
+        fromName, fromAddr, fromVat,
+        companyName, companyAddr, companyVat,
+        iban, bic, accountName,
+        crewId, crewName,
+        lines, symbol, subtotal, vatRate, vatAmount, grandTotal, currency });
+      doc.end();
+    });
+
+    const pdfBuffer = Buffer.concat(chunks);
+    const safeName = (fromName || crewName).replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30);
+    const filename = isConcept
+      ? `CONCEPT_Invoice_${safeName}_${monthLabel.replace(' ', '_')}.pdf`
+      : `Invoice_${invoiceNumber}_${safeName}_${monthLabel.replace(' ', '_')}.pdf`;
+
+    res.set({ 'Content-Type': 'application/pdf', 'Content-Disposition': `attachment; filename="${filename}"`, 'Content-Length': pdfBuffer.length });
+    res.send(pdfBuffer);
+
+  } catch (err) { next(err); }
+});
+
+// ── PDF builder ────────────────────────────────────────────────────────────────
+function buildPDF(doc, { isConcept, invoiceNumber, invoiceDate, monthLabel,
+  fromName, fromAddr, fromVat,
+  companyName, companyAddr, companyVat,
+  iban, bic, accountName,
+  crewId, crewName,
+  lines, symbol, subtotal, vatRate, vatAmount, grandTotal, currency }) {
+  const NAVY    = '#1e2d4a';
+  const GREY    = '#f4f5f7';
+  const LGREY   = '#e8eaed';
+  const MGREY   = '#8a9bb0';
+  const RED     = '#cc4444';
+  const W       = doc.page.width;
+  const M       = 50;
+  const CW      = W - 2 * M;
+
+  // ── Header ─────────────────────────────────────────────────────────────────
+  doc.fillColor(NAVY).font('Helvetica-Bold').fontSize(26).text('INVOICE', M, M);
+  if (isConcept) {
+    doc.fillColor(RED).font('Helvetica-Bold').fontSize(11)
+       .text('CONCEPT', M, M + 8, { width: CW, align: 'right' });
   }
 
-  res.json({ crUserId, results });
-});
+  // Divider
+  const divY = M + 40;
+  doc.moveTo(M, divY).lineTo(M + CW, divY).lineWidth(2).strokeColor(NAVY).stroke();
 
+  // ── FROM / BILL TO ──────────────────────────────────────────────────────────
+  const col2X = M + CW / 2;
+  let y = divY + 14;
 
-// ── GET /carerix/invoice-data/:jobId — all data needed for invoice generation ─
-// Uses _id param (correct Carerix convention), fetches job + employee + company
-router.get('/invoice-data/:jobId', async (req, res, next) => {
-  try {
-    const { queryGraphQL } = await import('../services/carerix.js');
+  doc.fillColor(MGREY).font('Helvetica-Bold').fontSize(7).text('FROM', M, y);
+  doc.fillColor(MGREY).font('Helvetica-Bold').fontSize(7).text('BILL TO', col2X, y);
+  y += 11;
 
-    // Step 1: fetch job to get employee ID and company
-    const jobResult = await queryGraphQL(`
-      query JobDetail($id: ID!) {
-        crJob(_id: $id) {
-          _id jobID name
-          additionalInfo
-          additionalInfoList
-          toCompany { _id companyID name }
-          toEmployee { _id employeeID }
-        }
-      }
-    `, { id: String(req.params.jobId) });
+  doc.fillColor(NAVY).font('Helvetica-Bold').fontSize(9).text(fromName || 'Contractor', M, y);
+  doc.fillColor(NAVY).font('Helvetica-Bold').fontSize(9).text(companyName, col2X, y);
+  y += 13;
 
-    const job = jobResult?.data?.crJob;
-    if (!job) return res.json({ error: 'Job not found', raw: jobResult });
+  doc.fillColor('#333').font('Helvetica').fontSize(8.5).text(fromAddr || '', M, y, { width: CW/2 - 10 });
+  doc.fillColor('#333').font('Helvetica').fontSize(8.5).text(companyAddr || '', col2X, y, { width: CW/2 - 10 });
+  y += 12;
+  if (fromVat) { doc.font('Helvetica').fontSize(8).fillColor(MGREY).text(fromVat, M, y); }
+  if (companyVat) { doc.font('Helvetica').fontSize(8).fillColor(MGREY).text(companyVat, col2X, y); }
+  y += 18;
 
-    // Step 2: fetch employee detail with address + banking
-    const empId = job.toEmployee?._id;
-    let employee = null;
-    if (empId) {
-      const empResult = await queryGraphQL(`
-        query EmpDetail($id: ID!) {
-          crEmployee(_id: $id) {
-            _id employeeID firstName lastName name
-            paymentIbanCode paymentBicCode paymentAccountName
-            homeFullAddress homeStreet homeNumber homeNumberSuffix
-            homePostalCode homeCity
-            toHomeCountryNode { value }
-          }
-        }
-      `, { id: String(empId) });
-      employee = empResult?.data?.crEmployee;
+  // ── Meta box ────────────────────────────────────────────────────────────────
+  const metaH = 52;
+  doc.fillColor(GREY).rect(M, y, CW, metaH).fill();
+  doc.fillColor(LGREY).rect(M, y, CW, metaH).stroke();
+
+  const mc = [M + 6, M + CW * 0.5 + 6];
+  const ml = 100; // label column width
+
+  const metaRows = [
+    [['Invoice Number', invoiceNumber], ['Invoice Date', invoiceDate]],
+    [['Contractor',     crewName],      ['Period',       monthLabel]],
+    [['Crew ID',        crewId],        ['Currency',     currency]],
+  ];
+  let my = y + 6;
+  for (const row of metaRows) {
+    let mx = M + 6;
+    for (const [label, val] of row) {
+      doc.fillColor(MGREY).font('Helvetica-Bold').fontSize(7).text(label, mx, my);
+      doc.fillColor(NAVY).font('Helvetica').fontSize(8.5).text(val || '', mx + ml, my, { width: CW * 0.5 - ml - 6 });
+      mx += CW / 2;
     }
+    my += 15;
+  }
+  y += metaH + 14;
 
-    // Step 3: fetch company details
-    const compId = job.toCompany?._id;
-    let company = null;
-    if (compId) {
-      const compResult = await queryGraphQL(`
-        query CompDetail($id: ID!) {
-          crCompany(_id: $id) {
-            _id companyID name
-            visitCity visitPostalCode visitStreet visitNumber
-            toVisitCountryNode { value }
-            emailAddress phone vatNumber
-          }
-        }
-      `, { id: String(compId) });
-      company = compResult?.data?.crCompany;
-    }
+  // ── Line items table ────────────────────────────────────────────────────────
+  const cols = { desc: M, qty: M + CW * 0.46, rate: M + CW * 0.64, amt: M + CW * 0.82 };
+  const rowH = 22;
 
-    // Parse additionalInfo for legal name (10278) and VAT (10978)
-    const ai = {};
-    const rawAI = job.additionalInfo || job.additionalInfoList || {};
-    if (typeof rawAI === 'object') {
-      for (const [k, v] of Object.entries(rawAI)) {
-        ai[k.replace(/^_/, '')] = v;
-      }
-    }
+  // Header row
+  doc.fillColor(NAVY).rect(M, y, CW, rowH).fill();
+  doc.fillColor('white').font('Helvetica-Bold').fontSize(8.5);
+  doc.text('Description', cols.desc + 6, y + 7);
+  doc.text('Quantity',    cols.qty,       y + 7);
+  doc.text('Rate',        cols.rate,      y + 7);
+  doc.text('Amount',      cols.amt,       y + 7, { width: CW * 0.18, align: 'right' });
+  y += rowH;
 
-    res.json({ job, employee, company, additionalInfo: ai });
-  } catch (err) { next(err); }
-});
+  // Data rows
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    const bg = i % 2 === 0 ? 'white' : GREY;
+    doc.fillColor(bg).rect(M, y, CW, rowH).fill();
 
+    const qtyStr  = `${l.quantity} day${l.quantity !== 1 ? 's' : ''}`;
+    const rateStr = l.rate != null ? `${symbol}${Number(l.rate).toFixed(2)}` : '—';
+    const totStr  = l.total ? `${symbol}${l.total.toFixed(2)}` : '—';
 
-// ── GET /carerix/employee-finances/:employeeId — fetch finances via service token ──
-// Uses Carerix service credentials directly, no user auth needed
-router.get('/employee-finances/:employeeId', async (req, res, next) => {
+    doc.fillColor('#1a1a1a').font('Helvetica').fontSize(8.5);
+    doc.text(l.label,  cols.desc + 6, y + 7);
+    doc.text(qtyStr,   cols.qty,      y + 7);
+    doc.text(rateStr,  cols.rate,     y + 7);
+    doc.text(totStr,   cols.amt,      y + 7, { width: CW * 0.18, align: 'right' });
+    y += rowH;
+  }
+
+  // Overtime row
+  const otBg = GREY;
+  doc.fillColor(otBg).rect(M, y, CW, rowH).fill();
+  doc.fillColor('#1a1a1a').font('Helvetica').fontSize(8.5);
+  doc.text('Overtime',                cols.desc + 6, y + 7);
+  doc.text('See rotation detail',     cols.qty,      y + 7);
+  doc.text('—',                       cols.rate,     y + 7);
+  doc.text(`${symbol}0.00`,           cols.amt,      y + 7, { width: CW * 0.18, align: 'right' });
+  y += rowH;
+
+  // Bottom border of items
+  doc.moveTo(M, y).lineTo(M + CW, y).lineWidth(1).strokeColor(NAVY).stroke();
+  y += 6;
+
+  // ── Total row ────────────────────────────────────────────────────────────────
+  const totalH = 28;
+  doc.fillColor(NAVY).rect(M, y, CW, totalH).fill();
+  doc.fillColor('white').font('Helvetica-Bold').fontSize(10);
+  doc.text('TOTAL DUE', cols.desc + 6, y + 9);
+  doc.text(`${symbol}${grandTotal.toFixed(2)}`, cols.amt, y + 9, { width: CW * 0.18, align: 'right' });
+  y += totalH + 20;
+
+  // ── Payment information ──────────────────────────────────────────────────────
+  doc.fillColor(NAVY).font('Helvetica-Bold').fontSize(9).text('PAYMENT INFORMATION', M, y);
+  y += 12;
+  doc.moveTo(M, y).lineTo(M + CW, y).lineWidth(0.5).strokeColor(LGREY).stroke();
+  y += 8;
+
+  const payRows = [
+    ['Account Name', accountName || fromName || '',  'Currency',  currency],
+    ['IBAN',         iban || 'Not provided',          'BIC/SWIFT', bic || 'Not provided'],
+    ['Reference',    invoiceNumber,                   'VAT',       vatRate === 0 ? '0% (Reversed Charge)' : `${vatRate * 100}%`],
+  ];
+  for (const [l1, v1, l2, v2] of payRows) {
+    doc.fillColor(MGREY).font('Helvetica-Bold').fontSize(7).text(l1, M, y);
+    doc.fillColor('#333').font('Helvetica').fontSize(8.5).text(v1, M + 70, y);
+    doc.fillColor(MGREY).font('Helvetica-Bold').fontSize(7).text(l2, col2X, y);
+    doc.fillColor('#333').font('Helvetica').fontSize(8.5).text(v2, col2X + 70, y);
+    y += 14;
+  }
+  y += 10;
+
+  // ── Footer note ──────────────────────────────────────────────────────────────
+  doc.moveTo(M, y).lineTo(M + CW, y).lineWidth(0.5).strokeColor(LGREY).stroke();
+  y += 8;
+  const note = isConcept
+    ? 'CONCEPT INVOICE — This document is a draft and does not constitute a formal invoice. The invoice number will be assigned upon finalization.'
+    : `Payment is due within 30 days of invoice date. Please reference ${invoiceNumber} in your payment. Thank you for your business.`;
+  doc.fillColor(MGREY).font('Helvetica').fontSize(7.5).text(note, M, y, { width: CW });
+}
+
+// ── POST /invoice/assign-number/:placementId/:periodId ────────────────────────
+router.post('/assign-number/:placementId/:periodId', requireAuth, async (req, res, next) => {
   try {
-    const { queryGraphQL } = await import('../services/carerix.js');
-    const { employeeId } = req.params;
-    const result = await queryGraphQL(`
-      query EmployeeFinancePage($qualifier: String, $pageable: Pageable) {
-        crEmployeeFinancePage(qualifier: $qualifier, pageable: $pageable) {
-          items {
-            _id
-            toFinance {
-              _id
-              startDate
-              endDate
-              amount
-              cost
-              info
-              toKindNode { dataNodeID value }
-              toCurrencyNode { dataNodeID value }
-              toTypeNode { typeID identifier }
-            }
-          }
-        }
-      }
-    `, {
-      qualifier: 'toEmployee.employeeID == ' + empId,
-      pageable: { page: 0, size: 100 }
-    });
-    res.json(result);
+    const { placementId, periodId } = req.params;
+
+    const { data: status } = await adminSupabase
+      .from('roster_period_status').select('status')
+      .eq('placement_id', placementId).eq('period_id', periodId).single();
+
+    if (status?.status !== 'definite')
+      throw new ApiError('Invoice number can only be assigned when status is definite', 400);
+
+    const year = new Date().getFullYear();
+    const { data: seqNum } = await adminSupabase.rpc('next_invoice_number', { p_year: year });
+    const invNumber = `INV-${year}-${String(seqNum).padStart(4, '0')}`;
+
+    await adminSupabase.from('roster_invoices').upsert({
+      placement_id:   placementId,
+      period_id:      periodId,
+      invoice_number: invNumber,
+      invoice_date:   new Date().toISOString().split('T')[0],
+      due_date:       new Date(Date.now() + 30 * 86400000).toISOString().split('T')[0],
+      is_concept:     false,
+    }, { onConflict: 'placement_id,period_id' });
+
+    res.json({ invoice_number: invNumber });
   } catch (err) { next(err); }
 });
-
-// ── GET /carerix/job-finances/:jobId — fetch job-level finances ────────────────
-router.get('/job-finances/:jobId', async (req, res, next) => {
-  try {
-    const { queryGraphQL } = await import('../services/carerix.js');
-    const { jobId } = req.params;
-    const result = await queryGraphQL(`
-      query JobFinancePage($qualifier: String, $pageable: Pageable) {
-        crJobFinancePage(qualifier: $qualifier, pageable: $pageable) {
-          items {
-            _id
-            toJob { _id jobID name }
-            toFinance {
-              _id
-              startDate
-              endDate
-              amount
-              cost
-              info
-              toKindNode { dataNodeID value }
-              toCurrencyNode { dataNodeID value }
-              toTypeNode { typeID identifier }
-            }
-          }
-        }
-      }
-    `, {
-      qualifier: 'toJob.jobID == ' + jobId,
-      pageable: { page: 0, size: 100 }
-    });
-    res.json(result);
-  } catch (err) { next(err); }
-});
-
-// ── Protected routes ──────────────────────────────────────────────────────────
-router.use(requireAuth, requireAgency);
-
-router.post('/sync/fees/:periodId', async (req, res, next) => {
-  try {
-    const { data: entries } = await adminSupabase
-      .from('declaration_entries')
-      .select('id, entry_date, imported_amount, fee_retrieval_status, declaration_types(code), placements(placement_ref), companies(company_ref)')
-      .eq('payroll_period_id', req.params.periodId)
-      .eq('fee_retrieval_status', 'pending');
-
-    if (!entries?.length) return res.json({ message: 'No pending fee retrievals', count: 0 });
-
-    let retrieved = 0, failed = 0;
-    for (const entry of entries) {
-      const result = await fetchAndCacheFee(
-        entry.placements.placement_ref, entry.companies.company_ref,
-        entry.declaration_types.code, entry.entry_date
-      );
-      if (result?.retrieval_status === 'retrieved') {
-        await adminSupabase.from('declaration_entries').update({
-          fee_cache_id: result.id, fee_amount: result.fee_amount,
-          fee_retrieval_status: 'retrieved',
-          calculated_value: entry.imported_amount * result.fee_amount,
-          status: 'fee_retrieved',
-        }).eq('id', entry.id);
-        retrieved++;
-      } else {
-        await adminSupabase.from('declaration_entries').update({
-          fee_retrieval_status: 'failed', status: 'fee_retrieval_failed',
-        }).eq('id', entry.id);
-        failed++;
-      }
-    }
-    res.json({ message: 'Fee sync complete', retrieved, failed, total: entries.length });
-  } catch (err) { next(err); }
-});
-
-router.get('/fees/status/:periodId', async (req, res, next) => {
-  try {
-    const { data, error } = await adminSupabase
-      .from('declaration_entries').select('fee_retrieval_status')
-      .eq('payroll_period_id', req.params.periodId);
-    if (error) throw new ApiError(error.message);
-    const summary = data.reduce((acc, row) => {
-      acc[row.fee_retrieval_status] = (acc[row.fee_retrieval_status] || 0) + 1;
-      return acc;
-    }, {});
-    res.json(summary);
-  } catch (err) { next(err); }
-});
-
-
-
-// ── POST /carerix/gql-explore — explore Carerix GraphQL (agency only) ─────────
-router.post('/gql-explore', requireAuth, requireAgency, async (req, res, next) => {
-  try {
-    const { query, variables } = req.body;
-    if (!query) return res.status(400).json({ error: 'query required' });
-    const { queryGraphQL } = await import('../services/carerix.js');
-    const result = await queryGraphQL(query, variables || {});
-    res.json(result);
-  } catch (err) { next(err); }
-});
-
-// ── GET /carerix/rate-table/:id — fetch a specific Carerix rate table ─────────
-router.get('/rate-table/:id', requireAuth, requireAgency, async (req, res, next) => {
-  try {
-    const { queryGraphQL } = await import('../services/carerix.js');
-    const result = await queryGraphQL(`
-      query RateTable($id: ID!) {
-        crRateTable(id: $id) {
-          _id
-          name
-          description
-          crRateTableLines {
-            _id
-            amount
-            validFrom
-            validUntil
-            description
-          }
-        }
-      }
-    `, { id: req.params.id });
-    res.json(result);
-  } catch (err) { next(err); }
-});
-
-// ── GET /carerix/placement-rates/:carerixPlacementId — rates for a placement ──
-router.get('/placement-rates/:carerixPlacementId', requireAuth, requireAgency, async (req, res, next) => {
-  try {
-    const { queryGraphQL } = await import('../services/carerix.js');
-    const result = await queryGraphQL(`
-      query PlacementRates($id: ID!) {
-        crMatch(id: $id) {
-          _id
-          toPublication { _id salary salaryMax }
-          toCRRateTable { _id name crRateTableLines { _id amount validFrom validUntil description } }
-          crMatchConditions {
-            _id
-            amount
-            toCRRateTable { _id name crRateTableLines { _id amount validFrom validUntil description } }
-          }
-        }
-      }
-    `, { id: req.params.carerixPlacementId });
-    res.json(result);
-  } catch (err) { next(err); }
-});
-
 
 export default router;
