@@ -92,10 +92,10 @@ function buildInvoiceFromData(cx, placementFallback) {
 
     // BILL TO — crAgency, visitFullAddress is confirmed working field
     officeName:    office?.name || '',
-    officeAddress: office?.visitFullAddress || [
+    officeAddress: (office?.visitFullAddress || [
       office?.visitCity || office?.visitCityCode || '',
       office?.visitPostalCode || '',
-    ].filter(Boolean).join(', '),
+    ].filter(Boolean).join(', ')).replace(/\n/g, ', '),
     officeVat: office?.vatNumber || '',
   };
 }
@@ -116,33 +116,38 @@ router.post('/sync-carerix/:placementId', requireAuth, async (req, res, next) =>
 
     const f = buildInvoiceFromData(cx, placement.full_name);
 
-    // Save to placements
-    await adminSupabase.from('placements').update({
-      inv_from_name:       f.fromName,
-      inv_from_legal_name: f.fromLegal,
-      inv_from_vat:        f.fromVat,
-      inv_from_address:    f.fromAddress,
-      inv_iban:            f.iban,
-      inv_bic:             f.bic,
-      inv_account_name:    f.accountName,
-      inv_carerix_synced_at: new Date().toISOString(),
-    }).eq('id', placementId);
+    // Save via RPC (security definer — bypasses RLS)
+    const { error: pErr } = await adminSupabase.rpc('sync_placement_invoice_cache', {
+      p_placement_id:    placementId,
+      p_from_name:       f.fromName,
+      p_from_legal_name: f.fromLegal,
+      p_from_vat:        f.fromVat,
+      p_from_address:    f.fromAddress,
+      p_iban:            f.iban,
+      p_bic:             f.bic,
+      p_account_name:    f.accountName,
+    });
 
-    // Save office to company ONLY if we got real agency data (never overwrite with blank)
+    if (pErr) {
+      logger.error('Invoice sync: placement RPC FAILED', { error: pErr.message, code: pErr.code });
+      throw new ApiError('DB update failed: ' + pErr.message, 500);
+    }
+    logger.info('Invoice sync: placement updated OK', { placementId, fromName: f.fromName, legal: f.fromLegal });
+
+    // Save office via RPC
     if (f.officeName && f.officeAddress && placement.company_id) {
-      await adminSupabase.from('companies').update({
-        inv_office_name:    f.officeName,
-        inv_office_address: f.officeAddress,
-        inv_office_vat:     f.officeVat || null,
-        inv_office_synced_at: new Date().toISOString(),
-      }).eq('id', placement.company_id);
-      logger.info('Invoice sync: office updated', { officeName: f.officeName, officeAddress: f.officeAddress });
-    } else {
-      logger.info('Invoice sync: office skipped (no data)', { officeName: f.officeName, officeAddress: f.officeAddress });
+      const { error: cErr } = await adminSupabase.rpc('sync_company_invoice_cache', {
+        p_company_id:     placement.company_id,
+        p_office_name:    f.officeName,
+        p_office_address: f.officeAddress.replace(/\n/g, ', '),
+        p_office_vat:     f.officeVat || null,
+      });
+      if (cErr) logger.error('Invoice sync: company RPC FAILED', { error: cErr.message });
+      else logger.info('Invoice sync: company updated OK', { officeName: f.officeName });
     }
 
-    logger.info('Invoice Carerix sync complete', { placementId, fromName: f.fromName, iban: f.iban, officeId: cx.office?._id });
-    res.json({ ok: true, from: f });
+    logger.info('Invoice Carerix sync complete', { placementId, fromName: f.fromName, legal: f.fromLegal, iban: !!f.iban });
+    res.json({ ok: true, from: f, db: { placementUpdated: true } });
   } catch(err) { next(err); }
 });
 
