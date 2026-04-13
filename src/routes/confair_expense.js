@@ -1,114 +1,129 @@
 /**
- * Minggo Expense API integration (via api.confair.eu/minggo/api/v1)
- * OAuth2 Password grant — client_id=minggo, Auth/login endpoint
+ * Confair HR Portal expense proxy
+ * Authenticates to hrportal.confair.eu via session cookie (ASP.NET MVC)
+ * then proxies /Expenses/GetGridData — no Minggo API needed
  */
 import { Router } from 'express';
 import { logger } from '../utils/logger.js';
 const router = Router();
 
-// Minggo API bases — OrgID=5 confirmed from hrportal.confair.eu AppData
-const MINGGO_BASES = [
-  'https://api-test.confair.eu/minggo/api/v1',
-  'https://api.confair.eu/minggo/api/v1',
-];
-const ORG_ID = 5; // Wizz Air Group / Confair OrgID from hrportal
+const PORTAL = 'https://hrportal.confair.eu';
+let sessionCache = { cookie: null, expiresAt: 0 };
 
-let tokenCache = { token: null, expiresAt: 0, base: null };
-
-async function getMinggoToken() {
-  if (tokenCache.token && Date.now() < tokenCache.expiresAt) return { token: tokenCache.token, base: tokenCache.base };
+async function getPortalSession() {
+  if (sessionCache.cookie && Date.now() < sessionCache.expiresAt) return sessionCache.cookie;
 
   const username = process.env.CONFAIR_API_CLIENT_ID;
   const password = process.env.CONFAIR_API_CLIENT_SECRET;
+  if (!username || !password) throw new Error('CONFAIR_API_CLIENT_ID / SECRET not set');
 
-  if (!username || !password) throw new Error('CONFAIR_API_CLIENT_ID or CONFAIR_API_CLIENT_SECRET not set in Railway env');
+  // Step 1: GET login page to get verification token + initial cookies
+  const loginPageRes = await fetch(`${PORTAL}/Account/Login`, {
+    headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'text/html' },
+    redirect: 'follow',
+  });
 
-  for (const base of MINGGO_BASES) {
-    // Try JSON body first
-    for (const [contentType, body] of [
-      ['application/json', JSON.stringify({ username, password, client_id: 'minggo' })],
-      ['application/json', JSON.stringify({ username, password })],
-      ['application/x-www-form-urlencoded', new URLSearchParams({ grant_type: 'password', client_id: 'minggo', client_secret: 'minggo', username, password }).toString()],
-      ['application/x-www-form-urlencoded', new URLSearchParams({ grant_type: 'password', username, password }).toString()],
-    ]) {
-      try {
-        const r = await fetch(`${base}/Auth/login`, {
-          method: 'POST',
-          headers: { 'Content-Type': contentType, 'Accept': 'application/json' },
-          body,
-        });
-        const text = await r.text();
-        let data;
-        try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  const setCookieHeader = loginPageRes.headers.get('set-cookie') || '';
+  const initialCookie  = setCookieHeader.split(';')[0]; // grab first cookie value
+  const html           = await loginPageRes.text();
 
-        logger.info('Minggo auth attempt', { base, contentType, status: r.status, keys: Object.keys(data) });
+  // Extract CSRF token
+  const tokenMatch = html.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/);
+  const csrfToken  = tokenMatch?.[1] || '';
+  logger.info('Portal login page', { status: loginPageRes.status, hasCsrf: !!csrfToken, cookieLen: initialCookie.length });
 
-        if (r.ok) {
-          const token = data.access_token || data.token || data.accessToken || data.userToken || data.UserToken || data.jwt;
-          if (token) {
-            tokenCache = { token, base, expiresAt: Date.now() + 55 * 60 * 1000 };
-            logger.info('Minggo token obtained!', { base, contentType, tokenPreview: token.substring(0, 20) });
-            return { token, base };
-          }
-          // 200 but no token — log full response
-          logger.info('Minggo auth 200 but no token key', { base, contentType, data: JSON.stringify(data).substring(0, 300) });
-          return { token: null, base, rawResponse: data };
-        }
-        if (r.status !== 401 && r.status !== 400) {
-          logger.warn('Minggo unexpected status', { base, contentType, status: r.status, data: JSON.stringify(data).substring(0, 200) });
-        }
-      } catch (e) {
-        logger.error('Minggo auth fetch error', { base, contentType, error: e.message });
-      }
-    }
+  // Step 2: POST login form
+  const formBody = new URLSearchParams({
+    Username:                    username,
+    Password:                    password,
+    __RequestVerificationToken:  csrfToken,
+    ReturnUrl:                   '',
+  });
+
+  const loginRes = await fetch(`${PORTAL}/`, {
+    method:   'POST',
+    headers:  {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent':   'Mozilla/5.0',
+      Cookie:         initialCookie,
+      Referer:        `${PORTAL}/Account/Login`,
+    },
+    body:     formBody.toString(),
+    redirect: 'manual', // capture redirect without following
+  });
+
+  const authCookies = loginRes.headers.get('set-cookie') || '';
+  // Extract all meaningful cookies
+  const cookies = [
+    ...setCookieHeader.split(',').map(c => c.split(';')[0].trim()),
+    ...authCookies.split(',').map(c => c.split(';')[0].trim()),
+  ].filter(Boolean).join('; ');
+
+  logger.info('Portal login response', { status: loginRes.status, location: loginRes.headers.get('location'), cookieCount: cookies.split(';').length });
+
+  if (loginRes.status === 302 || loginRes.status === 200) {
+    sessionCache = { cookie: cookies, expiresAt: Date.now() + 20 * 60 * 1000 };
+    return cookies;
   }
-  throw new Error('All Minggo auth attempts failed');
+
+  throw new Error(`Portal login failed: ${loginRes.status}`);
 }
 
 // ── GET /confair-expense/test ──────────────────────────────────────────────────
 router.get('/test', async (req, res) => {
   const username = process.env.CONFAIR_API_CLIENT_ID;
   const password = process.env.CONFAIR_API_CLIENT_SECRET;
-  const results  = [];
+  const result   = { envSet: { clientId: !!username, masked: username?.substring(0,3)+'***', secret: !!password }, steps: [] };
 
-  for (const base of MINGGO_BASES) {
-    for (const [label, contentType, body] of [
-      // companyID=5 (OrgID from hrportal AppData = Wizz Air Group)
-      ['JSON+companyID5',    'application/json', JSON.stringify({ username, password, companyID: 5 })],
-      ['JSON+client+org5',   'application/json', JSON.stringify({ username, password, client_id: 'minggo', companyID: 5 })],
-      ['FORM+org5',          'application/x-www-form-urlencoded', new URLSearchParams({ grant_type: 'password', client_id: 'minggo', client_secret: 'minggo', username, password, companyID: '5' }).toString()],
-      // Also try without companyID  
-      ['JSON+client_id',     'application/json', JSON.stringify({ username, password, client_id: 'minggo' })],
-      ['JSON only',          'application/json', JSON.stringify({ username, password })],
-      ['FORM OAuth2',        'application/x-www-form-urlencoded', new URLSearchParams({ grant_type: 'password', client_id: 'minggo', client_secret: 'minggo', username, password }).toString()],
-    ]) {
-      try {
-        const r    = await fetch(`${base}/Auth/login`, {
-          method: 'POST',
-          headers: { 'Content-Type': contentType, Accept: 'application/json' },
-          body,
-        });
-        const text = await r.text();
-        let data; try { data = JSON.parse(text); } catch { data = { raw: text.substring(0, 200) }; }
-        results.push({ base, label, status: r.status, keys: Object.keys(data), data });
-      } catch (e) {
-        results.push({ base, label, error: e.message });
-      }
+  try {
+    // Step 1: get login page
+    const loginPageRes = await fetch(`${PORTAL}/Account/Login`, {
+      headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'text/html' },
+    });
+    const html = await loginPageRes.text();
+    const csrfToken = html.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/)?.[1] || '';
+    const setCookie = loginPageRes.headers.get('set-cookie') || '';
+    const initCookie = setCookie.split(';')[0];
+    result.steps.push({ step: 'GET /Account/Login', status: loginPageRes.status, hasCsrf: !!csrfToken, cookie: initCookie.substring(0,50) });
+
+    // Step 2: POST login
+    const formBody = new URLSearchParams({ Username: username, Password: password, __RequestVerificationToken: csrfToken, ReturnUrl: '' });
+    const loginRes = await fetch(`${PORTAL}/`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0', Cookie: initCookie, Referer: `${PORTAL}/Account/Login` },
+      body: formBody.toString(),
+      redirect: 'manual',
+    });
+    const authCookie = loginRes.headers.get('set-cookie') || '';
+    const location   = loginRes.headers.get('location') || '';
+    result.steps.push({ step: 'POST /', status: loginRes.status, location, authCookieLen: authCookie.length, success: loginRes.status === 302 && !location.includes('Login') });
+
+    if (loginRes.status === 302 && !location.includes('Login')) {
+      // Step 3: try GetGridData
+      const allCookies = [initCookie, ...authCookie.split(',').map(c => c.split(';')[0].trim())].filter(Boolean).join('; ');
+      const gridRes = await fetch(`${PORTAL}/Expenses/GetGridData?page=1&pageSize=10&sort=&group=&filter=`, {
+        headers: { 'User-Agent': 'Mozilla/5.0', Cookie: allCookies, 'X-Requested-With': 'XMLHttpRequest' },
+      });
+      const gridText = await gridRes.text();
+      let gridData; try { gridData = JSON.parse(gridText); } catch { gridData = { raw: gridText.substring(0, 300) }; }
+      result.steps.push({ step: 'GET /Expenses/GetGridData', status: gridRes.status, dataKeys: Object.keys(gridData), sample: JSON.stringify(gridData).substring(0, 500) });
     }
+  } catch (e) {
+    result.error = e.message;
   }
 
-  res.json({
-    envSet: { clientId: !!username, clientIdMasked: username ? username.substring(0,3) + '***' : null, secret: !!password },
-    results,
-  });
+  res.json(result);
 });
 
-// ── GET /confair-expense/expenses — proxy list ─────────────────────────────────
+// ── GET /confair-expense/expenses — fetch expenses via portal session ───────────
 router.get('/expenses', async (req, res, next) => {
   try {
-    const { token, base } = await getMinggoToken();
-    const r = await fetch(`${base}/expenses`, { headers: { Authorization: `Bearer ${token}` } });
-    res.json(await r.json());
+    const cookie  = await getPortalSession();
+    const gridRes = await fetch(`${PORTAL}/Expenses/GetGridData?page=1&pageSize=50`, {
+      headers: { 'User-Agent': 'Mozilla/5.0', Cookie: cookie, 'X-Requested-With': 'XMLHttpRequest' },
+    });
+    const data = await gridRes.json();
+    res.json(data);
   } catch (err) { next(err); }
 });
 
