@@ -22,15 +22,18 @@ router.get('/pdf/:placementId/:periodId', requireAuth, async (req, res, next) =>
   try {
     const { placementId, periodId } = req.params;
 
-    // 1. Fetch all data needed
+    // 1. Fetch placement first (need company_id), then rest in parallel
+    const { data: placement } = await adminSupabase
+      .from('placements').select('*, companies(*)').eq('id', placementId).single();
+
+    if (!placement) throw new ApiError('Placement not found', 404);
+
     const [
-      { data: placement },
       { data: period },
       { data: chargeItems },
       { data: status },
       { data: company },
     ] = await Promise.all([
-      adminSupabase.from('placements').select('*, companies(*)').eq('id', placementId).single(),
       adminSupabase.from('payroll_periods').select('*').eq('id', periodId).single(),
       adminSupabase.from('charge_items')
         .select('*, charge_types(code, label, sort_order)')
@@ -44,11 +47,11 @@ router.get('/pdf/:placementId/:periodId', requireAuth, async (req, res, next) =>
         .single(),
       adminSupabase.from('companies')
         .select('*')
-        .eq('id', placement?.company_id)
+        .eq('id', placement.company_id)
         .single(),
     ]);
 
-    if (!placement || !period) throw new ApiError('Placement or period not found', 404);
+    if (!period) throw new ApiError('Period not found', 404);
 
     const isConcept = !status?.roster_invoices?.invoice_number;
     const invoiceNumber = status?.roster_invoices?.invoice_number || 'CONCEPT';
@@ -205,21 +208,20 @@ W, H = A4
 M = 18*mm  # margin
 
 # ── Styles ────────────────────────────────────────────────────────────────────
-def sty(name, **kw):
-    base = ParagraphStyle(name, fontName='Helvetica', fontSize=9, textColor=BLACK, leading=13, **kw)
-    return base
+def sty(name, font='Helvetica', size=9, color=BLACK, **kw):
+    return ParagraphStyle(name, fontName=font, fontSize=size, textColor=color, leading=size*1.4, **kw)
 
-S_TITLE     = sty('title',   fontName='Helvetica-Bold', fontSize=22, textColor=NAVY)
-S_LABEL     = sty('label',   fontName='Helvetica-Bold', fontSize=7.5, textColor=MGREY, spaceAfter=1)
-S_BODY      = sty('body',    fontSize=8.5, textColor=BLACK)
-S_BODY_B    = sty('bodyb',   fontName='Helvetica-Bold', fontSize=8.5, textColor=BLACK)
-S_R         = sty('right',   fontSize=8.5, textColor=BLACK, alignment=TA_RIGHT)
-S_R_B       = sty('rightb',  fontName='Helvetica-Bold', fontSize=8.5, textColor=BLACK, alignment=TA_RIGHT)
-S_CONCEPT   = sty('concept', fontName='Helvetica-Bold', fontSize=10, textColor=colors.HexColor('#cc4444'), alignment=TA_RIGHT)
-S_TOTAL_L   = sty('totl',    fontName='Helvetica-Bold', fontSize=10, textColor=WHITE)
-S_TOTAL_R   = sty('totr',    fontName='Helvetica-Bold', fontSize=10, textColor=WHITE, alignment=TA_RIGHT)
-S_SECTION   = sty('sect',    fontName='Helvetica-Bold', fontSize=8.5, textColor=NAVY, spaceBefore=6)
-S_NOTE      = sty('note',    fontSize=8, textColor=MGREY)
+S_TITLE     = sty('title',   font='Helvetica-Bold', size=22, color=NAVY)
+S_LABEL     = sty('label',   font='Helvetica-Bold', size=7.5, color=MGREY, spaceAfter=1)
+S_BODY      = sty('body',    size=8.5)
+S_BODY_B    = sty('bodyb',   font='Helvetica-Bold', size=8.5)
+S_R         = sty('right',   size=8.5, alignment=TA_RIGHT)
+S_R_B       = sty('rightb',  font='Helvetica-Bold', size=8.5, alignment=TA_RIGHT)
+S_CONCEPT   = sty('concept', font='Helvetica-Bold', size=10, color=colors.HexColor('#cc4444'), alignment=TA_RIGHT)
+S_TOTAL_L   = sty('totl',    font='Helvetica-Bold', size=10, color=WHITE)
+S_TOTAL_R   = sty('totr',    font='Helvetica-Bold', size=10, color=WHITE, alignment=TA_RIGHT)
+S_SECTION   = sty('sect',    font='Helvetica-Bold', size=8.5, color=NAVY, spaceBefore=6)
+S_NOTE      = sty('note',    size=8, color=MGREY)
 
 # ── Document ──────────────────────────────────────────────────────────────────
 doc = SimpleDocTemplate(
