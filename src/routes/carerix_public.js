@@ -15,7 +15,7 @@ router.get('/probe', async (req, res) => {
   };
 
   await q('health',    '{ __typename }');
-  await q('job',       'query J($id:ID!){ crJob(_id:$id){ _id jobID name additionalInfo additionalInfoList toCompany{_id name companyID} toEmployee{_id employeeID} toOffice{_id name} toVacancy{ _id toCompany{_id name} } } }', { id: '5319' });
+  await q('job',       'query J($id:ID!){ crJob(_id:$id){ _id jobID name additionalInfo toCompany{_id name companyID} toEmployee{_id employeeID} toOffice{_id name} toVacancy{ _id toCompany{_id name} } } }', { id: '5319' });
 
   // Employee 23593 — the contractor on this job
   await q('emp23593',  'query E($id:ID!){ crEmployee(_id:$id){ _id employeeID firstName lastName name paymentIbanCode paymentBicCode paymentAccountName homeFullAddress homeStreet homeNumber homeNumberSuffix homePostalCode homeCity toHomeCountryNode{value} } }', { id: '23593' });
@@ -52,7 +52,7 @@ router.get('/invoice-data/:jobId', async (req, res) => {
 
   // 1. Job
   const jd = await safe('job',
-    'query J($id:ID!){ crJob(_id:$id){ _id jobID name additionalInfo additionalInfoList toCompany{_id name companyID} toEmployee{_id employeeID} toOffice{_id name} toVacancy{_id toCompany{_id name}} } }',
+    'query J($id:ID!){ crJob(_id:$id){ _id jobID name additionalInfo toCompany{_id name companyID} toEmployee{_id employeeID} toOffice{_id name} toVacancy{_id toCompany{_id name}} } }',
     { id: String(req.params.jobId) });
   out.job = jd?.crJob;
   if (!out.job) return res.json({ error: 'Job not found', raw: jd });
