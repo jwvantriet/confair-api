@@ -16,7 +16,7 @@ const router = Router();
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function fetchCarerixInvoiceData(carerixJobId) {
+async function fetchCarerixInvoiceData(carerixJobId, agencyId) {
   /** Fetch all invoice-relevant data from Carerix for a job. Returns null on failure. */
   try {
     const { queryGraphQL } = await import('../services/carerix.js');
@@ -46,29 +46,16 @@ async function fetchCarerixInvoiceData(carerixJobId) {
     ) : null;
     const emp = empData?.crEmployee;
 
-    // 3. Office — try multiple query paths
-    let officeId = null;
-    for (const [path, q] of [
-      ['direct',  'query J($id:ID!){ crJob(_id:$id){ toOffice{_id name} } }'],
-      ['vacancy', 'query J($id:ID!){ crJob(_id:$id){ toVacancy{ toOffice{_id name} } } }'],
-    ]) {
-      const r = await safeQ(q, { id: String(carerixJobId) });
-      officeId = r?.crJob?.toOffice?._id || r?.crJob?.toVacancy?.toOffice?._id;
-      if (officeId) { logger.info('Found office via ' + path, { officeId }); break; }
-    }
-
-    // 4. Office address — visitCityCode is the confirmed field name
-    let office = officeId ? { _id: officeId } : null;
-    if (officeId) {
-      for (const q of [
-        'query O($id:ID!){ crOffice(_id:$id){ _id name visitCityCode visitPostalCode visitStreet visitNumber toVisitCountryNode{value} vatNumber emailAddress } }',
-        'query O($id:ID!){ crOffice(_id:$id){ _id name visitCity visitPostalCode visitStreet visitNumber toVisitCountryNode{value} vatNumber } }',
-        'query O($id:ID!){ crOffice(_id:$id){ _id name city postalCode street number toCountryNode{value} } }',
-        'query O($id:ID!){ crOffice(_id:$id){ _id name homeCity homePostalCode homeStreet toHomeCountryNode{value} } }',
-      ]) {
-        const r = await safeQ(q, { id: String(officeId) });
-        if (r?.crOffice) { office = { ...office, ...r.crOffice }; break; }
-      }
+    // 3. Agency (Bill To) — fetch by carerix_agency_id stored on placement
+    //    crJob→agency link not queryable via GraphQL; agency ID stored in DB
+    let office = null;
+    if (agencyId) {
+      const agencyData = await safeQ(
+        'query A($id:ID!){ crAgency(_id:$id){ _id name visitFullAddress visitCity visitCityCode visitPostalCode } }',
+        { id: String(agencyId) }
+      );
+      office = agencyData?.crAgency || null;
+      logger.info('Agency fetched', { agencyId, name: office?.name, hasAddress: !!office?.visitFullAddress });
     }
 
     return { job, emp, office, ai };
@@ -103,13 +90,11 @@ function buildInvoiceFromData(cx, placementFallback) {
     bic:         emp?.paymentBicCode    || '',
     accountName: emp?.paymentAccountName || legalName || empName,
 
-    // BILL TO — office (visitCityCode is the confirmed field name for city)
+    // BILL TO — crAgency, visitFullAddress is confirmed working field
     officeName:    office?.name || '',
-    officeAddress: [
-      office?.visitStreet   ? `${office.visitStreet} ${office.visitNumber || ''}`.trim() : (office?.street ? `${office.street} ${office.number || ''}`.trim() : (office?.homeStreet || '')),
-      office?.visitPostalCode || office?.postalCode || office?.homePostalCode || '',
-      office?.visitCityCode || office?.visitCity   || office?.city || office?.homeCity || '',
-      (office?.toVisitCountryNode || office?.toCountryNode || office?.toHomeCountryNode)?.value || '',
+    officeAddress: office?.visitFullAddress || [
+      office?.visitCity || office?.visitCityCode || '',
+      office?.visitPostalCode || '',
     ].filter(Boolean).join(', '),
     officeVat: office?.vatNumber || '',
   };
@@ -122,11 +107,11 @@ router.post('/sync-carerix/:placementId', requireAuth, async (req, res, next) =>
   try {
     const { placementId } = req.params;
     const { data: placement } = await adminSupabase
-      .from('placements').select('id, full_name, carerix_job_id, company_id').eq('id', placementId).single();
+      .from('placements').select('id, full_name, carerix_job_id, carerix_agency_id, company_id').eq('id', placementId).single();
     if (!placement) throw new ApiError('Placement not found', 404);
     if (!placement.carerix_job_id) throw new ApiError('No Carerix job ID on placement', 400);
 
-    const cx = await fetchCarerixInvoiceData(placement.carerix_job_id);
+    const cx = await fetchCarerixInvoiceData(placement.carerix_job_id, placement.carerix_agency_id);
     if (!cx) throw new ApiError('Carerix data unavailable', 502);
 
     const f = buildInvoiceFromData(cx, placement.full_name);
@@ -300,7 +285,7 @@ function buildPDF(doc, { isConcept, invoiceNumber, invoiceDate, monthLabel, from
 
   // Addresses
   const fromAddrLines = fromAddr ? fromAddr.split(', ') : [];
-  const compAddrLines = companyAddr ? companyAddr.split(', ') : [];
+  const compAddrLines = companyAddr ? companyAddr.split(/,\s*|\n/).filter(Boolean) : [];
   const maxLines = Math.max(fromAddrLines.length, compAddrLines.length, 1);
   doc.fillColor('#333').font('Helvetica').fontSize(8.5);
   for (let i = 0; i < maxLines; i++) {
