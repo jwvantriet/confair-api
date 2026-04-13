@@ -144,7 +144,7 @@ router.get('/periods', async (req, res, next) => {
 
     // For placement role, only show contractor_check and beyond
     const filtered = (statuses || []).filter(s => {
-      if (user.role === 'placement') return ['contractor_check', 'contractor_correction', 'contractor_approved', 'definite'].includes(s.status);
+      if (user.role === 'placement') return ['contractor_check', 'contractor_correction', 'contractor_approved', 'definite', 'invoiced', 'paid'].includes(s.status);
       if (user.role === 'company_admin' || user.role === 'company_user') return ['client_check', 'contractor_check', 'contractor_correction', 'contractor_approved', 'definite'].includes(s.status);
       return true; // agency sees all
     });
@@ -173,12 +173,21 @@ router.get('/periods', async (req, res, next) => {
         .eq('placement_id', s.placement_id)
         .eq('period_id', s.period_id);
 
+      // Fetch invoice record if exists
+      const { data: invoice } = await adminSupabase
+        .from('roster_invoices')
+        .select('invoice_number, invoice_date, due_date, is_concept, status')
+        .eq('placement_id', s.placement_id)
+        .eq('period_id', s.period_id)
+        .maybeSingle();
+
       return {
         ...s,
         chargeSummary: Object.values(summary),
         totalValue,
         currency: charges?.[0]?.currency || 'EUR',
         corrections: corrections || [],
+        invoice: invoice || null,
       };
     }));
 
