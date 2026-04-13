@@ -526,7 +526,7 @@ router.get('/my-summary/:periodId', async (req, res, next) => {
     ]);
 
     const rosterMap = Object.fromEntries((rosterDays || []).map(d => [d.roster_date, d]));
-    return res.json({ status: rosterStatus, chargeItems: chargeItems || [], rosterDays: rosterMap, corrections: corrections || [] });
+    return res.json({ placement_id: placement.id, status: rosterStatus, chargeItems: chargeItems || [], rosterDays: rosterMap, corrections: corrections || [] });
   } catch (err) { next(err); }
 });
 
