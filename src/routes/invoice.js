@@ -74,7 +74,7 @@ router.get('/pdf/:placementId/:periodId', async (req, res, next) => {
 
           // 1. Job + office in one query
           const jobData = await safeQ(
-            'query J($id:ID!){ crJob(_id:$id){ _id jobID name additionalInfo additionalInfoList toCompany{_id companyID name} toEmployee{_id employeeID} toOffice{_id name} } }',
+            'query J($id:ID!){ crJob(_id:$id){ _id jobID name additionalInfo additionalInfoList toCompany{_id companyID name} toEmployee{_id employeeID} } }',
             { id: String(placement.carerix_job_id) }
           );
           const job = jobData?.crJob;
@@ -82,7 +82,15 @@ router.get('/pdf/:placementId/:periodId', async (req, res, next) => {
 
           // 2. Employee — address + banking (parallel with office)
           const empId = job.toEmployee?._id;
-          const officeId = job.toOffice?._id;
+
+          // Office via separate query (toOffice on crJob causes 400 when combined)
+          let officeId = null;
+          const offQ = await safeQ('query J($id:ID!){ crJob(_id:$id){ toOffice{_id name} } }', { id: String(placement.carerix_job_id) });
+          officeId = offQ?.crJob?.toOffice?._id;
+          if (!officeId) {
+            const vacQ = await safeQ('query J($id:ID!){ crJob(_id:$id){ toVacancy{ toOffice{_id name} } } }', { id: String(placement.carerix_job_id) });
+            officeId = vacQ?.crJob?.toVacancy?.toOffice?._id;
+          }
 
           const [empData, officeData] = await Promise.all([
             empId ? safeQ(
@@ -140,26 +148,19 @@ router.get('/pdf/:placementId/:periodId', async (req, res, next) => {
     const vatNumber = ai['10978'] || ai['_10978'] || null;
 
     let fromName, fromAddr, fromVat;
+    // Build address lines — homeFullAddress is the primary street line in Carerix
+    const addrLine1 = emp?.homeFullAddress || (emp?.homeStreet ? `${emp.homeStreet} ${emp.homeNumber || ''}`.trim() : '');
+    const addrParts = [addrLine1, emp?.homePostalCode || '', emp?.homeCity || '', emp?.toHomeCountryNode?.value || ''].filter(Boolean);
+    const empAddr   = addrParts.join(', ');
+
     if (legalName) {
-      // LTD entity — use legal name + visit/home address
       fromName = legalName;
       fromVat  = vatNumber ? `VAT: ${vatNumber}` : '';
-      fromAddr = [
-        emp?.homeFullAddress || emp?.homeStreet ? `${emp.homeStreet || ''} ${emp.homeNumber || ''}`.trim() : '',
-        emp?.homePostalCode || '',
-        emp?.homeCity || '',
-        emp?.toHomeCountryNode?.value || '',
-      ].filter(Boolean).join(', ');
+      fromAddr = empAddr;
     } else {
-      // Personal — use full name + home address
-      fromName = emp ? `${emp.firstName || ''} ${emp.lastName || ''}`.trim() || emp.name || placement.full_name : placement.full_name;
+      fromName = emp ? (`${emp.firstName || ''} ${emp.lastName || ''}`.trim() || emp?.name || placement.full_name) : placement.full_name;
       fromVat  = '';
-      fromAddr = [
-        emp?.homeFullAddress || emp?.homeStreet ? `${emp.homeStreet || ''} ${emp.homeNumber || ''}`.trim() : '',
-        emp?.homePostalCode || '',
-        emp?.homeCity || '',
-        emp?.toHomeCountryNode?.value || '',
-      ].filter(Boolean).join(', ');
+      fromAddr = empAddr;
     }
 
     // Banking details from Carerix
@@ -169,7 +170,6 @@ router.get('/pdf/:placementId/:periodId', async (req, res, next) => {
 
     // ── BILL TO: company connected to job ────────────────────────────────────
     const cxCo = carerixData?.cxCompany;
-    // companyName set below in BILL TO block
     // BILL TO — office linked to vacancy (reversed billing)
     const office = carerixData?.office;
     const companyName = office?.name || placement.companies?.name || 'Client';
