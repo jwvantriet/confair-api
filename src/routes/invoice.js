@@ -176,16 +176,14 @@ router.get('/pdf/:placementId/:periodId', async (req, res, next) => {
   try {
     const { placementId, periodId } = req.params;
 
-    // 1. Load all data from Supabase (fast — no Carerix calls)
-    const { data: placement } = await adminSupabase
-      .from('placements').select('*, companies(*)').eq('id', placementId).single();
-    if (!placement) throw new ApiError('Placement not found', 404);
-
+    // 1. Load all data — use RPC to bypass RLS on placements+companies join
     const [
+      { data: invData },
       { data: period },
       { data: chargeItems },
       { data: invoiceRec },
     ] = await Promise.all([
+      adminSupabase.rpc('get_placement_invoice_data', { p_placement_id: placementId }),
       adminSupabase.from('payroll_periods').select('*').eq('id', periodId).single(),
       adminSupabase.from('charge_items')
         .select('*, charge_types(code, label, sort_order)')
@@ -193,7 +191,10 @@ router.get('/pdf/:placementId/:periodId', async (req, res, next) => {
       adminSupabase.from('roster_invoices').select('*')
         .eq('placement_id', placementId).eq('period_id', periodId).maybeSingle(),
     ]);
-    if (!period) throw new ApiError('Period not found', 404);
+
+    const placement = invData?.placement;
+    if (!placement) throw new ApiError('Placement not found', 404);
+    if (!period)    throw new ApiError('Period not found', 404);
 
     // 2. Invoice number / concept flag
     const isConcept     = !invoiceRec?.invoice_number;
@@ -202,7 +203,7 @@ router.get('/pdf/:placementId/:periodId', async (req, res, next) => {
       ? new Date(invoiceRec.invoice_date).toLocaleDateString('en-GB')
       : new Date().toLocaleDateString('en-GB');
 
-    // 3. FROM — use cached Carerix data from Supabase
+    // 3. FROM — use cached Carerix data from Supabase (set by sync-carerix)
     const fromName    = placement.inv_from_legal_name || placement.inv_from_name || placement.full_name;
     const fromAddr    = placement.inv_from_address    || '';
     const fromVat     = placement.inv_from_vat        ? `VAT: ${placement.inv_from_vat}` : '';
@@ -210,11 +211,11 @@ router.get('/pdf/:placementId/:periodId', async (req, res, next) => {
     const bic         = placement.inv_bic             || '';
     const accountName = placement.inv_account_name    || fromName;
 
-    // 4. BILL TO — cached office/company data from Supabase
-    const co          = placement.companies || {};
-    const companyName = co.inv_office_name || co.name || 'Client';
-    const companyAddr = co.inv_office_address || '';  // populated by sync-carerix
-    const companyVat  = co.inv_office_vat ? `VAT: ${co.inv_office_vat}` : '';
+    // 4. BILL TO — office cached by sync-carerix (bypasses RLS via RPC)
+    const co          = invData?.company || {};
+    const companyName = co.inv_office_name    || co.name || 'Client';
+    const companyAddr = co.inv_office_address || '';
+    const companyVat  = co.inv_office_vat     ? `VAT: ${co.inv_office_vat}` : '';
 
     // 5. Aggregate charges
     const chargeMap = {};
