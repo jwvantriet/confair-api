@@ -65,48 +65,71 @@ router.get('/pdf/:placementId/:periodId', async (req, res, next) => {
     let carerixData = null;
     if (placement.carerix_job_id) {
       try {
-        const { queryGraphQL } = await import('../services/carerix.js');
-        // Safe query — never throws
-        const safeQ = async (q, vars) => {
-          try { const r = await queryGraphQL(q, vars); return r?.data || null; }
-          catch(e) { logger.warn('Carerix safeQ failed', { error: e.message }); return null; }
+        const cxFetch = async () => {
+          const { queryGraphQL } = await import('../services/carerix.js');
+          const safeQ = async (q, vars) => {
+            try { const r = await queryGraphQL(q, vars); return r?.data || null; }
+            catch(e) { return null; }
+          };
+
+          // 1. Job + office in one query
+          const jobData = await safeQ(
+            'query J($id:ID!){ crJob(_id:$id){ _id jobID name additionalInfo additionalInfoList toCompany{_id companyID name} toEmployee{_id employeeID} toOffice{_id name} } }',
+            { id: String(placement.carerix_job_id) }
+          );
+          const job = jobData?.crJob;
+          if (!job) return null;
+
+          // 2. Employee — address + banking (parallel with office)
+          const empId = job.toEmployee?._id;
+          const officeId = job.toOffice?._id;
+
+          const [empData, officeData] = await Promise.all([
+            empId ? safeQ(
+              'query E($id:ID!){ crEmployee(_id:$id){ _id employeeID firstName lastName name paymentIbanCode paymentBicCode paymentAccountName homeFullAddress homeStreet homeNumber homeNumberSuffix homePostalCode homeCity toHomeCountryNode{value} } }',
+              { id: String(empId) }
+            ) : Promise.resolve(null),
+            officeId ? safeQ('query O($id:ID!){ crOffice(_id:$id){ _id name } }', { id: String(officeId) })
+              .then(async r => {
+                const off = r?.crOffice;
+                if (!off) return null;
+                // Try address fields
+                for (const q of [
+                  'query O($id:ID!){ crOffice(_id:$id){ city postalCode street number toCountryNode{value} emailAddress vatNumber } }',
+                  'query O($id:ID!){ crOffice(_id:$id){ visitCity visitPostalCode visitStreet visitNumber toVisitCountryNode{value} } }',
+                  'query O($id:ID!){ crOffice(_id:$id){ homeCity homePostalCode homeStreet homeNumber toHomeCountryNode{value} } }',
+                ]) {
+                  const a = await safeQ(q, { id: String(officeId) });
+                  if (a?.crOffice) { Object.assign(off, a.crOffice); break; }
+                }
+                return off;
+              })
+              : Promise.resolve(null),
+          ]);
+
+          // 3. Parse additionalInfo
+          const ai = {};
+          for (const [k, v] of Object.entries(job.additionalInfo || {}))
+            if (v != null && v !== '') ai[k.replace(/^_/, '')] = v;
+
+          return { job, employee: empData?.crEmployee || null, office: officeData, ai };
         };
 
-        // 1. Job basics (only fields we know work)
-        const jobData = await safeQ(
-          'query J($id:ID!){ crJob(_id:$id){ _id jobID name additionalInfo additionalInfoList toCompany{ _id companyID name } toEmployee{ _id employeeID } } }',
-          { id: String(placement.carerix_job_id) }
-        );
-        const job = jobData?.crJob;
+        // Race against 12s timeout
+        carerixData = await Promise.race([
+          cxFetch(),
+          new Promise(resolve => setTimeout(() => resolve(null), 12000)),
+        ]);
 
-        // 2. Employee — address + banking
-        let employee = null;
-        if (job?.toEmployee?._id) {
-          const empData = await safeQ(
-            'query E($id:ID!){ crEmployee(_id:$id){ _id employeeID firstName lastName name paymentIbanCode paymentBicCode paymentAccountName homeFullAddress homeStreet homeNumber homeNumberSuffix homePostalCode homeCity toHomeCountryNode{ value } } }',
-            { id: String(job.toEmployee._id) }
-          );
-          employee = empData?.crEmployee;
-        }
-
-        // 3. Company name only — address from Supabase companies table as fallback
-        let cxCompany = job?.toCompany ? { ...job.toCompany } : null;
-
-        // 4. Parse additionalInfo
-        const ai = {};
-        for (const [k, v] of Object.entries(job?.additionalInfo || {})) {
-          if (v != null && v !== '') ai[k.replace(/^_/, '')] = v;
-        }
-
-        carerixData = { job, employee, cxCompany, ai };
-        logger.info('Invoice: Carerix data fetched', {
+        logger.info('Invoice: Carerix data', {
           jobId: placement.carerix_job_id,
-          empId: job?.toEmployee?._id,
-          hasIban: !!employee?.paymentIbanCode,
-          aiKeys: Object.keys(ai),
+          empId: carerixData?.job?.toEmployee?._id,
+          officeId: carerixData?.job?.toOffice?._id,
+          hasIban: !!carerixData?.employee?.paymentIbanCode,
+          aiKeys: Object.keys(carerixData?.ai || {}),
         });
       } catch (cxErr) {
-        logger.warn('Invoice: Carerix fetch failed, using DB fallback', { error: cxErr.message });
+        logger.warn('Invoice: Carerix fetch failed', { error: cxErr.message });
       }
     }
 
@@ -146,11 +169,17 @@ router.get('/pdf/:placementId/:periodId', async (req, res, next) => {
 
     // ── BILL TO: company connected to job ────────────────────────────────────
     const cxCo = carerixData?.cxCompany;
-    const companyName = cxCo?.name || placement.companies?.name || 'Client';
-    // Bill To address — use Supabase companies table (more reliable than Carerix API for now)
-    const dbCompany = placement.companies || {};
-    const companyAddr = dbCompany.address || dbCompany.city || '';
-    const companyVat = '';
+    // companyName set below in BILL TO block
+    // BILL TO — office linked to vacancy (reversed billing)
+    const office = carerixData?.office;
+    const companyName = office?.name || placement.companies?.name || 'Client';
+    const companyAddr = [
+      office?.street  ? `${office.street} ${office.number || ''}`.trim() : (office?.visitStreet ? `${office.visitStreet} ${office.visitNumber || ''}`.trim() : (office?.homeStreet || '')),
+      office?.postalCode || office?.visitPostalCode || office?.homePostalCode || '',
+      office?.city || office?.visitCity || office?.homeCity || '',
+      office?.toCountryNode?.value || office?.toVisitCountryNode?.value || office?.toHomeCountryNode?.value || '',
+    ].filter(Boolean).join(', ');
+    const companyVat = office?.vatNumber ? `VAT: ${office.vatNumber}` : '';
 
     // ── Aggregate charges ─────────────────────────────────────────────────────
     const chargeMap = {};
