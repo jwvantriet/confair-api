@@ -57,12 +57,13 @@ async function fetchCarerixInvoiceData(carerixJobId) {
       if (officeId) { logger.info('Found office via ' + path, { officeId }); break; }
     }
 
-    // 4. Office address (try multiple field conventions)
+    // 4. Office address — visitCityCode is the confirmed field name
     let office = officeId ? { _id: officeId } : null;
     if (officeId) {
       for (const q of [
-        'query O($id:ID!){ crOffice(_id:$id){ _id name city postalCode street number toCountryNode{value} emailAddress vatNumber } }',
+        'query O($id:ID!){ crOffice(_id:$id){ _id name visitCityCode visitPostalCode visitStreet visitNumber toVisitCountryNode{value} vatNumber emailAddress } }',
         'query O($id:ID!){ crOffice(_id:$id){ _id name visitCity visitPostalCode visitStreet visitNumber toVisitCountryNode{value} vatNumber } }',
+        'query O($id:ID!){ crOffice(_id:$id){ _id name city postalCode street number toCountryNode{value} } }',
         'query O($id:ID!){ crOffice(_id:$id){ _id name homeCity homePostalCode homeStreet toHomeCountryNode{value} } }',
       ]) {
         const r = await safeQ(q, { id: String(officeId) });
@@ -102,13 +103,13 @@ function buildInvoiceFromData(cx, placementFallback) {
     bic:         emp?.paymentBicCode    || '',
     accountName: emp?.paymentAccountName || legalName || empName,
 
-    // BILL TO — office
+    // BILL TO — office (visitCityCode is the confirmed field name for city)
     officeName:    office?.name || '',
     officeAddress: [
-      office?.street     ? `${office.street} ${office.number || ''}`.trim() : (office?.visitStreet ? `${office.visitStreet} ${office.visitNumber || ''}`.trim() : (office?.homeStreet || '')),
-      office?.postalCode || office?.visitPostalCode || office?.homePostalCode || '',
-      office?.city       || office?.visitCity       || office?.homeCity       || '',
-      (office?.toCountryNode || office?.toVisitCountryNode || office?.toHomeCountryNode)?.value || '',
+      office?.visitStreet   ? `${office.visitStreet} ${office.visitNumber || ''}`.trim() : (office?.street ? `${office.street} ${office.number || ''}`.trim() : (office?.homeStreet || '')),
+      office?.visitPostalCode || office?.postalCode || office?.homePostalCode || '',
+      office?.visitCityCode || office?.visitCity   || office?.city || office?.homeCity || '',
+      (office?.toVisitCountryNode || office?.toCountryNode || office?.toHomeCountryNode)?.value || '',
     ].filter(Boolean).join(', '),
     officeVat: office?.vatNumber || '',
   };
