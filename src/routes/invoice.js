@@ -66,71 +66,43 @@ router.get('/pdf/:placementId/:periodId', async (req, res, next) => {
     if (placement.carerix_job_id) {
       try {
         const { queryGraphQL } = await import('../services/carerix.js');
+        // Safe query — never throws
+        const safeQ = async (q, vars) => {
+          try { const r = await queryGraphQL(q, vars); return r?.data || null; }
+          catch(e) { logger.warn('Carerix safeQ failed', { error: e.message }); return null; }
+        };
 
-        // Step 1: Job → get employee ID + company
-        const jobRes = await queryGraphQL(`
-          query JobDetail($id: ID!) {
-            crJob(_id: $id) {
-              _id jobID name additionalInfo additionalInfoList
-              toCompany { _id companyID name }
-              toEmployee { _id employeeID }
-            }
-          }
-        `, { id: String(placement.carerix_job_id) });
+        // 1. Job basics (only fields we know work)
+        const jobData = await safeQ(
+          'query J($id:ID!){ crJob(_id:$id){ _id jobID name additionalInfo additionalInfoList toCompany{ _id companyID name } toEmployee{ _id employeeID } } }',
+          { id: String(placement.carerix_job_id) }
+        );
+        const job = jobData?.crJob;
 
-        const job = jobRes?.data?.crJob;
-
-        // Step 2: Employee → address + banking
+        // 2. Employee — address + banking
         let employee = null;
         if (job?.toEmployee?._id) {
-          const empRes = await queryGraphQL(`
-            query EmpDetail($id: ID!) {
-              crEmployee(_id: $id) {
-                _id employeeID firstName lastName name
-                paymentIbanCode paymentBicCode paymentAccountName
-                homeFullAddress homeStreet homeNumber homeNumberSuffix
-                homePostalCode homeCity
-                toHomeCountryNode { value }
-              }
-            }
-          `, { id: String(job.toEmployee._id) });
-          employee = empRes?.data?.crEmployee;
+          const empData = await safeQ(
+            'query E($id:ID!){ crEmployee(_id:$id){ _id employeeID firstName lastName name paymentIbanCode paymentBicCode paymentAccountName homeFullAddress homeStreet homeNumber homeNumberSuffix homePostalCode homeCity toHomeCountryNode{ value } } }',
+            { id: String(job.toEmployee._id) }
+          );
+          employee = empData?.crEmployee;
         }
 
-        // Step 3: Company → Bill To address
-        let cxCompany = null;
-        if (job?.toCompany?._id) {
-          const compRes = await queryGraphQL(`
-            query CompDetail($id: ID!) {
-              crCompany(_id: $id) {
-                _id companyID name
-                visitCity visitPostalCode visitStreet visitNumber
-                toVisitCountryNode { value }
-                emailAddress vatNumber
-              }
-            }
-          `, { id: String(job.toCompany._id) });
-          cxCompany = compRes?.data?.crCompany;
-        }
+        // 3. Company name only — address from Supabase companies table as fallback
+        let cxCompany = job?.toCompany ? { ...job.toCompany } : null;
 
-        // Parse additionalInfo — Carerix returns as {_10278: "value"} or {10278: "value"}
+        // 4. Parse additionalInfo
         const ai = {};
-        const rawAI = job?.additionalInfo || {};
-        if (typeof rawAI === 'object') {
-          for (const [k, v] of Object.entries(rawAI)) {
-            if (v) ai[k.replace(/^_/, '')] = v;
-          }
-        }
-        // additionalInfoList is an array [{id, value}]
-        for (const item of job?.additionalInfoList || []) {
-          if (item?.id && item?.value) ai[String(item.id)] = item.value;
+        for (const [k, v] of Object.entries(job?.additionalInfo || {})) {
+          if (v != null && v !== '') ai[k.replace(/^_/, '')] = v;
         }
 
         carerixData = { job, employee, cxCompany, ai };
         logger.info('Invoice: Carerix data fetched', {
           jobId: placement.carerix_job_id,
-          hasEmployee: !!employee,
-          hasCompany: !!cxCompany,
+          empId: job?.toEmployee?._id,
+          hasIban: !!employee?.paymentIbanCode,
           aiKeys: Object.keys(ai),
         });
       } catch (cxErr) {
@@ -175,13 +147,10 @@ router.get('/pdf/:placementId/:periodId', async (req, res, next) => {
     // ── BILL TO: company connected to job ────────────────────────────────────
     const cxCo = carerixData?.cxCompany;
     const companyName = cxCo?.name || placement.companies?.name || 'Client';
-    const companyAddr = cxCo ? [
-      cxCo.visitStreet ? `${cxCo.visitStreet} ${cxCo.visitNumber || ''}`.trim() : '',
-      cxCo.visitPostalCode || '',
-      cxCo.visitCity || '',
-      cxCo.toVisitCountryNode?.value || '',
-    ].filter(Boolean).join(', ') : (placement.companies?.address || '');
-    const companyVat = cxCo?.vatNumber ? `VAT: ${cxCo.vatNumber}` : '';
+    // Bill To address — use Supabase companies table (more reliable than Carerix API for now)
+    const dbCompany = placement.companies || {};
+    const companyAddr = dbCompany.address || dbCompany.city || '';
+    const companyVat = '';
 
     // ── Aggregate charges ─────────────────────────────────────────────────────
     const chargeMap = {};
