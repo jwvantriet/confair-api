@@ -144,7 +144,7 @@ router.get('/periods', async (req, res, next) => {
 
     // For placement role, only show contractor_check and beyond
     const filtered = (statuses || []).filter(s => {
-      if (user.role === 'placement') return ['contractor_check', 'contractor_correction', 'contractor_approved', 'definite', 'invoiced', 'paid'].includes(s.status);
+      if (user.role === 'placement') return true; // all statuses — filter by charge data below
       if (user.role === 'company_admin' || user.role === 'company_user') return ['client_check', 'contractor_check', 'contractor_correction', 'contractor_approved', 'definite'].includes(s.status);
       return true; // agency sees all
     });
@@ -191,7 +191,11 @@ router.get('/periods', async (req, res, next) => {
       };
     }));
 
-    res.json(enriched);
+    // For placement users: include all statuses but exclude drafts with no charges
+    const final = user.role === 'placement'
+      ? enriched.filter(s => s.status !== 'draft' || s.totalValue > 0)
+      : enriched;
+    res.json(final);
   } catch (err) { next(err); }
 });
 
