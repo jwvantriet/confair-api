@@ -232,6 +232,53 @@ router.get('/job-finances/:jobId', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+
+// ── GET /carerix/probe — debug Carerix field availability (service token) ─────
+router.get('/probe', async (req, res, next) => {
+  try {
+    const { queryGraphQL } = await import('../services/carerix.js');
+    const results = {};
+
+    // Test 1: basic introspection
+    try {
+      const r = await queryGraphQL('{ __typename }', {});
+      results.introspection = r?.data || r?.errors?.[0]?.message || 'no data';
+    } catch(e) { results.introspection = 'ERROR: ' + e.message; }
+
+    // Test 2: crJob with _id
+    try {
+      const r = await queryGraphQL('query { crJob(_id: "5319") { _id jobID name } }', {});
+      results.crJob_id = r?.data?.crJob || r?.errors?.[0]?.message || 'null';
+    } catch(e) { results.crJob_id = 'ERROR: ' + e.message; }
+
+    // Test 3: crJob with variable
+    try {
+      const r = await queryGraphQL('query J($id: ID!) { crJob(_id: $id) { _id jobID name } }', { id: '5319' });
+      results.crJob_var = r?.data?.crJob || r?.errors?.[0]?.message || 'null';
+    } catch(e) { results.crJob_var = 'ERROR: ' + e.message; }
+
+    // Test 4: additionalInfo on job
+    try {
+      const r = await queryGraphQL('query { crJob(_id: "5319") { additionalInfo additionalInfoList } }', {});
+      results.additionalInfo = r?.data?.crJob || r?.errors?.[0]?.message || 'null';
+    } catch(e) { results.additionalInfo = 'ERROR: ' + e.message; }
+
+    // Test 5: employee directly
+    try {
+      const r = await queryGraphQL('query { crEmployee(_id: "14") { _id employeeID firstName lastName homeCity homePostalCode paymentIbanCode paymentBicCode paymentAccountName } }', {});
+      results.employee14 = r?.data?.crEmployee || r?.errors?.[0]?.message || 'null';
+    } catch(e) { results.employee14 = 'ERROR: ' + e.message; }
+
+    // Test 6: company
+    try {
+      const r = await queryGraphQL('query { crJob(_id: "5319") { toCompany { _id name companyID } toEmployee { _id employeeID } } }', {});
+      results.jobRelations = r?.data?.crJob || r?.errors?.[0]?.message || 'null';
+    } catch(e) { results.jobRelations = 'ERROR: ' + e.message; }
+
+    res.json(results);
+  } catch (err) { next(err); }
+});
+
 // ── Protected routes ──────────────────────────────────────────────────────────
 router.use(requireAuth, requireAgency);
 
