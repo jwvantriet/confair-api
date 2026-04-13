@@ -221,7 +221,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
     // Pre-fetch all placement rates from DB (fallback if Carerix unavailable)
     const { data: allRates } = await adminSupabase
       .from('placement_rates')
-      .select('placement_id, charge_type_id, rate_per_unit, currency');
+      .select('placement_id, charge_type_id, amount, currency');
     const ratesByKey = Object.fromEntries(
       (allRates || []).map(r => [`${r.placement_id}:${r.charge_type_id}`, r])
     );
@@ -248,15 +248,15 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
             await adminSupabase.from('placement_rates').upsert({
               placement_id:   placement.id,
               charge_type_id: ct.id,
-              rate_per_unit:  amount,
+              amount,
               currency,
-              updated_at:     new Date().toISOString(),
+              fetched_at:     new Date().toISOString(),
             }, { onConflict: 'placement_id,charge_type_id' });
             // Also update the in-memory ratesByKey
             ratesByKey[`${placement.id}:${ct.id}`] = {
               placement_id:   placement.id,
               charge_type_id: ct.id,
-              rate_per_unit:  amount,
+              amount,
               currency,
             };
           }
@@ -295,7 +295,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
             if (!ct) continue;
             const rateKey  = `${placement.id}:${ct.id}`;
             const rateRow  = ratesByKey[rateKey];
-            const rate     = rateRow?.rate_per_unit ?? null;
+            const rate     = rateRow?.amount ?? null;
             const currency = rateRow?.currency ?? 'EUR';
             const total    = rate != null ? Math.round(qty * Number(rate) * 100) / 100 : null;
             await adminSupabase.from('charge_items').upsert({
@@ -352,7 +352,7 @@ router.post('/refresh/:periodId/:placementId', requireCompanyOrAbove, async (req
     // Pre-fetch all placement rates from DB (fallback if Carerix unavailable)
     const { data: allRates } = await adminSupabase
       .from('placement_rates')
-      .select('placement_id, charge_type_id, rate_per_unit, currency');
+      .select('placement_id, charge_type_id, amount, currency');
     const ratesByKey = Object.fromEntries(
       (allRates || []).map(r => [`${r.placement_id}:${r.charge_type_id}`, r])
     );
