@@ -1,7 +1,7 @@
 /**
  * Confair HR Portal expense proxy
- * Authenticates to hrportal.confair.eu via session cookie (ASP.NET MVC)
- * then proxies /Expenses/GetGridData — no Minggo API needed
+ * Auth: POST to https://hrportal.confair.eu/ with Username + Password form fields
+ * Data: POST to /Expenses/GetGridData with filterData JSON + Kendo paging params
  */
 import { Router } from 'express';
 import { logger } from '../utils/logger.js';
@@ -10,130 +10,170 @@ const router = Router();
 const PORTAL = 'https://hrportal.confair.eu';
 let sessionCache = { cookie: null, expiresAt: 0 };
 
-async function getPortalSession() {
-  if (sessionCache.cookie && Date.now() < sessionCache.expiresAt) return sessionCache.cookie;
+async function getPortalSession(usernameOverride, passwordOverride) {
+  if (!usernameOverride && sessionCache.cookie && Date.now() < sessionCache.expiresAt) return sessionCache.cookie;
 
-  const username = process.env.CONFAIR_API_CLIENT_ID;
-  const password = process.env.CONFAIR_API_CLIENT_SECRET;
-  if (!username || !password) throw new Error('CONFAIR_API_CLIENT_ID / SECRET not set');
+  const username = usernameOverride || process.env.CONFAIR_API_CLIENT_ID;
+  const password = passwordOverride || process.env.CONFAIR_API_CLIENT_SECRET;
+  if (!username || !password) throw new Error('No credentials');
 
-  // Step 1: GET login page to get verification token + initial cookies
-  const loginPageRes = await fetch(`${PORTAL}/Account/Login`, {
-    headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'text/html' },
+  // Step 1: GET login page for session cookie
+  const step1 = await fetch(`${PORTAL}/Account/Login`, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', Accept: 'text/html,application/xhtml+xml' },
     redirect: 'follow',
   });
+  const rawCookie = step1.headers.get('set-cookie') || '';
+  const sessionCookie = rawCookie.split(';')[0].trim();
 
-  const setCookieHeader = loginPageRes.headers.get('set-cookie') || '';
-  const initialCookie  = setCookieHeader.split(';')[0]; // grab first cookie value
-  const html           = await loginPageRes.text();
+  logger.info('Portal step1', { status: step1.status, sessionCookie: sessionCookie.substring(0, 40) });
 
-  // Extract CSRF token
-  const tokenMatch = html.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/);
-  const csrfToken  = tokenMatch?.[1] || '';
-  logger.info('Portal login page', { status: loginPageRes.status, hasCsrf: !!csrfToken, cookieLen: initialCookie.length });
-
-  // Step 2: POST login form
+  // Step 2: POST login - exact same as the browser form
   const formBody = new URLSearchParams({
+    ReturnUrl: '/Expenses',
     Username:  username,
     Password:  password,
-    ReturnUrl: '/Expenses',
   });
 
-  const loginRes = await fetch(`${PORTAL}/`, {
-    method:   'POST',
-    headers:  {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent':   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      'Accept':       'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      Cookie:         initialCookie,
-      Referer:        `${PORTAL}/Account/Login?U=%2fExpenses`,
-      Origin:         PORTAL,
+  const step2 = await fetch(`${PORTAL}/`, {
+    method: 'POST',
+    headers: {
+      'Content-Type':    'application/x-www-form-urlencoded',
+      'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Origin':          PORTAL,
+      'Referer':         `${PORTAL}/Account/Login`,
+      'Cookie':          sessionCookie,
     },
     body:     formBody.toString(),
     redirect: 'manual',
   });
 
-  const authCookies = loginRes.headers.get('set-cookie') || '';
-  // Extract all meaningful cookies
-  const cookies = [
-    ...setCookieHeader.split(',').map(c => c.split(';')[0].trim()),
-    ...authCookies.split(',').map(c => c.split(';')[0].trim()),
-  ].filter(Boolean).join('; ');
+  const authSetCookie  = step2.headers.get('set-cookie') || '';
+  const location       = step2.headers.get('location') || '';
+  const loginFailed    = location.includes('Login');
 
-  logger.info('Portal login response', { status: loginRes.status, location: loginRes.headers.get('location'), cookieCount: cookies.split(';').length });
+  logger.info('Portal step2', { status: step2.status, location, authCookieLen: authSetCookie.length, loginFailed });
 
-  if (loginRes.status === 302 || loginRes.status === 200) {
-    sessionCache = { cookie: cookies, expiresAt: Date.now() + 20 * 60 * 1000 };
-    return cookies;
-  }
+  if (loginFailed) throw new Error(`Login failed — redirected to ${location}`);
 
-  throw new Error(`Portal login failed: ${loginRes.status}`);
+  // Combine all cookies
+  const allCookies = [sessionCookie, ...authSetCookie.split(',').map(c => c.split(';')[0].trim())].filter(Boolean).join('; ');
+  sessionCache = { cookie: allCookies, expiresAt: Date.now() + 20 * 60 * 1000 };
+  return allCookies;
+}
+
+async function fetchExpenses(cookie, filters = {}, page = 1, pageSize = 50) {
+  const filterData = JSON.stringify({
+    Status:   filters.status   || '',
+    HomeBase: filters.homeBase || '',
+    Employee: filters.employee || '',
+    Category: filters.category || '',
+    Month:    filters.month    || '',
+    ...filters.extra,
+  });
+
+  const body = new URLSearchParams({
+    sort:       '',
+    page:       String(page),
+    pageSize:   String(pageSize),
+    group:      '',
+    filter:     '',
+    filterData,
+  });
+
+  const r = await fetch(`${PORTAL}/Expenses/GetGridData`, {
+    method: 'POST',
+    headers: {
+      'Content-Type':      'application/x-www-form-urlencoded; charset=UTF-8',
+      'Accept':            '*/*',
+      'X-Requested-With':  'XMLHttpRequest',
+      'User-Agent':        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Referer':           `${PORTAL}/Expenses`,
+      'Cookie':            cookie,
+    },
+    body: body.toString(),
+  });
+
+  if (!r.ok) throw new Error(`GetGridData failed: ${r.status}`);
+  return r.json();
 }
 
 // ── GET /confair-expense/test ──────────────────────────────────────────────────
 router.get('/test', async (req, res) => {
-  // Allow credential override via query params for debugging (test endpoint only)
   const username = req.query.u || process.env.CONFAIR_API_CLIENT_ID;
   const password = req.query.p || process.env.CONFAIR_API_CLIENT_SECRET;
-  const result   = { envSet: { clientId: !!username, masked: username?.substring(0,3)+'***', secret: !!password }, steps: [] };
+  const result   = { env: { masked: username?.substring(0,3)+'***', secretSet: !!password }, steps: [] };
 
   try {
-    // Step 1: get login page
-    const loginPageRes = await fetch(`${PORTAL}/Account/Login`, {
+    // Step 1: get session cookie
+    const step1 = await fetch(`${PORTAL}/Account/Login`, {
       headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'text/html' },
     });
-    const html = await loginPageRes.text();
-    const csrfToken = html.match(/name="__RequestVerificationToken"[^>]+value="([^"]+)"/)?.[1] || '';
-    const setCookie = loginPageRes.headers.get('set-cookie') || '';
-    const initCookie = setCookie.split(';')[0];
-    result.steps.push({ step: 'GET /Account/Login', status: loginPageRes.status, hasCsrf: !!csrfToken, cookie: initCookie.substring(0,50) });
+    const rawCookie    = step1.headers.get('set-cookie') || '';
+    const sessionCookie = rawCookie.split(';')[0].trim();
+    result.steps.push({ step: '1. GET /Account/Login', status: step1.status, cookie: sessionCookie.substring(0,50) });
 
     // Step 2: POST login
-    const formBody = new URLSearchParams({ Username: username, Password: password, ReturnUrl: '/Expenses' });
-    const loginRes = await fetch(`${PORTAL}/`, {
+    const formBody = new URLSearchParams({ ReturnUrl: '/Expenses', Username: username, Password: password });
+    const step2 = await fetch(`${PORTAL}/`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         'User-Agent':   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept':       'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        Cookie:         initCookie,
-        Referer:        `${PORTAL}/Account/Login?U=%2fExpenses`,
-        Origin:         PORTAL,
+        'Origin':       PORTAL,
+        'Referer':      `${PORTAL}/Account/Login`,
+        'Cookie':       sessionCookie,
       },
-      body: formBody.toString(),
+      body:     formBody.toString(),
       redirect: 'manual',
     });
-    const authCookie = loginRes.headers.get('set-cookie') || '';
-    const location   = loginRes.headers.get('location') || '';
-    result.steps.push({ step: 'POST /', status: loginRes.status, location, authCookieLen: authCookie.length, success: loginRes.status === 302 && !location.includes('Login') });
+    const authCookie = step2.headers.get('set-cookie') || '';
+    const location   = step2.headers.get('location') || '';
+    const success    = step2.status === 302 && !location.includes('Login');
+    result.steps.push({ step: '2. POST / (login)', status: step2.status, location, authCookieLen: authCookie.length, success });
 
-    if (loginRes.status === 302 && !location.includes('Login')) {
-      // Step 3: try GetGridData
-      const allCookies = [initCookie, ...authCookie.split(',').map(c => c.split(';')[0].trim())].filter(Boolean).join('; ');
-      const gridRes = await fetch(`${PORTAL}/Expenses/GetGridData?page=1&pageSize=10&sort=&group=&filter=`, {
-        headers: { 'User-Agent': 'Mozilla/5.0', Cookie: allCookies, 'X-Requested-With': 'XMLHttpRequest' },
+    if (success) {
+      // Step 3: POST GetGridData
+      const allCookies = [sessionCookie, ...authCookie.split(',').map(c => c.split(';')[0].trim())].filter(Boolean).join('; ');
+      const filterData = JSON.stringify({ Status: '', HomeBase: '', Employee: '', Category: '', Month: '' });
+      const gridBody   = new URLSearchParams({ sort: '', page: '1', pageSize: '10', group: '', filter: '', filterData });
+
+      const step3 = await fetch(`${PORTAL}/Expenses/GetGridData`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          'Accept':       '*/*',
+          'X-Requested-With': 'XMLHttpRequest',
+          'User-Agent':   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Referer':      `${PORTAL}/Expenses`,
+          'Cookie':       allCookies,
+        },
+        body: gridBody.toString(),
       });
-      const gridText = await gridRes.text();
-      let gridData; try { gridData = JSON.parse(gridText); } catch { gridData = { raw: gridText.substring(0, 300) }; }
-      result.steps.push({ step: 'GET /Expenses/GetGridData', status: gridRes.status, dataKeys: Object.keys(gridData), sample: JSON.stringify(gridData).substring(0, 500) });
+      let data; try { data = await step3.json(); } catch { data = { raw: await step3.text().then(t => t.substring(0,200)) }; }
+      result.steps.push({ step: '3. POST /Expenses/GetGridData', status: step3.status, total: data.Total, count: data.Data?.length, sample: data.Data?.[0] });
     }
-  } catch (e) {
+  } catch(e) {
     result.error = e.message;
   }
 
   res.json(result);
 });
 
-// ── GET /confair-expense/expenses — fetch expenses via portal session ───────────
+// ── GET /confair-expense/expenses ─────────────────────────────────────────────
 router.get('/expenses', async (req, res, next) => {
   try {
-    const cookie  = await getPortalSession();
-    const gridRes = await fetch(`${PORTAL}/Expenses/GetGridData?page=1&pageSize=50`, {
-      headers: { 'User-Agent': 'Mozilla/5.0', Cookie: cookie, 'X-Requested-With': 'XMLHttpRequest' },
-    });
-    const data = await gridRes.json();
+    const cookie = await getPortalSession();
+    const data   = await fetchExpenses(cookie, {
+      status:   req.query.status,
+      homeBase: req.query.homeBase,
+      employee: req.query.employee,
+      month:    req.query.month,
+    }, Number(req.query.page || 1), Number(req.query.pageSize || 50));
     res.json(data);
-  } catch (err) { next(err); }
+  } catch(err) { next(err); }
 });
 
 export default router;
