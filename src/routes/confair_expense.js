@@ -113,7 +113,7 @@ router.get('/test', async (req, res) => {
 
     // Step 2: POST login
     // Exact body the browser sends: ReturnUrl empty, ! encoded as %21
-    const rawBody = `ReturnUrl=&Username=${encodeURIComponent(username)}&Password=${encodeURIComponent(password)}`;
+    const formBody = `ReturnUrl=&Username=${encodeURIComponent(username)}&Password=${encodeURIComponent(password)}`;
     const step2 = await fetch(`${PORTAL}/`, {
       method: 'POST',
       headers: {
@@ -124,7 +124,7 @@ router.get('/test', async (req, res) => {
         'Referer':      `${PORTAL}/Account/Login`,
         'Cookie':       sessionCookie,
       },
-      body:     formBody.toString(),
+      body: formBody,
       redirect: 'manual',
     });
     const authCookie = step2.headers.get('set-cookie') || '';
