@@ -29,7 +29,10 @@ async function getPortalSession(usernameOverride, passwordOverride) {
 
   // Step 2: POST login - exact same as the browser form
   // Exact body the browser sends (ReturnUrl empty, ! encoded as %21)
-  const formBody = `ReturnUrl=&Username=${encodeURIComponent(username)}&Password=${encodeURIComponent(password)}`;
+
+// HTML form encoding — stricter than encodeURIComponent (encodes ! ~ ' ( ) too)
+const formEncode = s => encodeURIComponent(s).replace(/!/g,'%21').replace(/~/g,'%7E').replace(/'/g,'%27').replace(/\(/g,'%28').replace(/\)/g,'%29');
+  const formBody = `ReturnUrl=&Username=${formEncode(username)}&Password=${formEncode(password)}`;
 
   const step2 = await fetch(`${PORTAL}/`, {
     method: 'POST',
@@ -113,7 +116,10 @@ router.get('/test', async (req, res) => {
 
     // Step 2: POST login
     // Exact body the browser sends: ReturnUrl empty, ! encoded as %21
-    const formBody = `ReturnUrl=&Username=${encodeURIComponent(username)}&Password=${encodeURIComponent(password)}`;
+  
+// HTML form encoding — stricter than encodeURIComponent (encodes ! ~ ' ( ) too)
+const formEncode = s => encodeURIComponent(s).replace(/!/g,'%21').replace(/~/g,'%7E').replace(/'/g,'%27').replace(/\(/g,'%28').replace(/\)/g,'%29');
+  const formBody = `ReturnUrl=&Username=${formEncode(username)}&Password=${formEncode(password)}`;
     const step2 = await fetch(`${PORTAL}/`, {
       method: 'POST',
       headers: {
