@@ -34,22 +34,23 @@ async function getPortalSession() {
 
   // Step 2: POST login form
   const formBody = new URLSearchParams({
-    Username:                    username,
-    Password:                    password,
-    __RequestVerificationToken:  csrfToken,
-    ReturnUrl:                   '',
+    Username:  username,
+    Password:  password,
+    ReturnUrl: '/Expenses',
   });
 
   const loginRes = await fetch(`${PORTAL}/`, {
     method:   'POST',
     headers:  {
       'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent':   'Mozilla/5.0',
+      'User-Agent':   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Accept':       'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       Cookie:         initialCookie,
-      Referer:        `${PORTAL}/Account/Login`,
+      Referer:        `${PORTAL}/Account/Login?U=%2fExpenses`,
+      Origin:         PORTAL,
     },
     body:     formBody.toString(),
-    redirect: 'manual', // capture redirect without following
+    redirect: 'manual',
   });
 
   const authCookies = loginRes.headers.get('set-cookie') || '';
@@ -71,8 +72,9 @@ async function getPortalSession() {
 
 // ── GET /confair-expense/test ──────────────────────────────────────────────────
 router.get('/test', async (req, res) => {
-  const username = process.env.CONFAIR_API_CLIENT_ID;
-  const password = process.env.CONFAIR_API_CLIENT_SECRET;
+  // Allow credential override via query params for debugging (test endpoint only)
+  const username = req.query.u || process.env.CONFAIR_API_CLIENT_ID;
+  const password = req.query.p || process.env.CONFAIR_API_CLIENT_SECRET;
   const result   = { envSet: { clientId: !!username, masked: username?.substring(0,3)+'***', secret: !!password }, steps: [] };
 
   try {
@@ -87,10 +89,17 @@ router.get('/test', async (req, res) => {
     result.steps.push({ step: 'GET /Account/Login', status: loginPageRes.status, hasCsrf: !!csrfToken, cookie: initCookie.substring(0,50) });
 
     // Step 2: POST login
-    const formBody = new URLSearchParams({ Username: username, Password: password, __RequestVerificationToken: csrfToken, ReturnUrl: '' });
+    const formBody = new URLSearchParams({ Username: username, Password: password, ReturnUrl: '/Expenses' });
     const loginRes = await fetch(`${PORTAL}/`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0', Cookie: initCookie, Referer: `${PORTAL}/Account/Login` },
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent':   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept':       'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        Cookie:         initCookie,
+        Referer:        `${PORTAL}/Account/Login?U=%2fExpenses`,
+        Origin:         PORTAL,
+      },
       body: formBody.toString(),
       redirect: 'manual',
     });
