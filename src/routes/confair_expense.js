@@ -28,11 +28,8 @@ async function getPortalSession(usernameOverride, passwordOverride) {
   logger.info('Portal step1', { status: step1.status, sessionCookie: sessionCookie.substring(0, 40) });
 
   // Step 2: POST login - exact same as the browser form
-  const formBody = new URLSearchParams({
-    ReturnUrl: '/Expenses',
-    Username:  username,
-    Password:  password,
-  });
+  // Exact body the browser sends (ReturnUrl empty, ! encoded as %21)
+  const formBody = `ReturnUrl=&Username=${encodeURIComponent(username)}&Password=${encodeURIComponent(password)}`;
 
   const step2 = await fetch(`${PORTAL}/`, {
     method: 'POST',
@@ -45,7 +42,7 @@ async function getPortalSession(usernameOverride, passwordOverride) {
       'Referer':         `${PORTAL}/Account/Login`,
       'Cookie':          sessionCookie,
     },
-    body:     formBody.toString(),
+    body:     formBody,
     redirect: 'manual',
   });
 
@@ -115,7 +112,8 @@ router.get('/test', async (req, res) => {
     result.steps.push({ step: '1. GET /Account/Login', status: step1.status, cookie: sessionCookie.substring(0,50) });
 
     // Step 2: POST login
-    const formBody = new URLSearchParams({ ReturnUrl: '/Expenses', Username: username, Password: password });
+    // Exact body the browser sends: ReturnUrl empty, ! encoded as %21
+    const rawBody = `ReturnUrl=&Username=${encodeURIComponent(username)}&Password=${encodeURIComponent(password)}`;
     const step2 = await fetch(`${PORTAL}/`, {
       method: 'POST',
       headers: {
