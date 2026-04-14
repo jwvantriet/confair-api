@@ -33,55 +33,7 @@ router.get('/', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-router.post('/', async (req, res, next) => {
-  try {
-    if (req.user.role !== 'placement') throw new ApiError('Only Placement users can create corrections', 403);
-    const { declaration_entry_id, payroll_period_id, declaration_type_id, correction_date, requested_amount, note } = req.body;
-    if (!payroll_period_id || !declaration_type_id || !correction_date || requested_amount === undefined) {
-      throw new ApiError('payroll_period_id, declaration_type_id, correction_date and requested_amount are required');
-    }
-
-    // Get placement_id and company_id from user's placement record
-    const { data: placement } = await adminSupabase
-      .from('placements')
-      .select('id, company_id')
-      .eq('user_profile_id', req.user.id)
-      .single();
-    if (!placement) throw new ApiError('No placement record found for this user', 404);
-
-    // Get original amount if linked to an entry
-    let originalAmount = null;
-    if (declaration_entry_id) {
-      const { data: entry } = await adminSupabase
-        .from('declaration_entries')
-        .select('imported_amount')
-        .eq('id', declaration_entry_id)
-        .single();
-      originalAmount = entry?.imported_amount ?? null;
-    }
-
-    const { data, error } = await adminSupabase
-      .from('correction_requests')
-      .insert({
-        declaration_entry_id,
-        payroll_period_id,
-        placement_id:       placement.id,
-        company_id:         placement.company_id,
-        declaration_type_id,
-        correction_date,
-        original_amount:    originalAmount,
-        requested_amount,
-        note,
-        created_by:         req.user.id,
-      })
-      .select()
-      .single();
-    if (error) throw new ApiError(error.message);
-
-    await writeAuditLog({ eventType: 'correction_created', actorUserId: req.user.id, actorRole: req.user.role, entityType: 'correction_request', entityId: data.id });
-    res.status(201).json(data);
-  } catch (err) { next(err); }
-});
+// Old correction_requests POST removed — replaced by charge_corrections below
 
 router.post('/:id/approve', requireCompanyOrAbove, async (req, res, next) => {
   try {
