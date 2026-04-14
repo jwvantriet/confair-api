@@ -204,25 +204,36 @@ Respond ONLY with valid JSON in this exact format:
   "notes": "any issues or observations"
 }`;
 
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${openaiKey}` },
-      body: JSON.stringify({
-        model: 'gpt-4o',
-        max_tokens: 500,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'text', text: prompt },
-            { type: 'image_url', image_url: { url: `data:${mimeType};base64,${imageBase64}`, detail: 'high' } },
-          ],
-        }],
-      }),
-    });
+    // 60s abort controller — well within Railway's limit
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60000);
+
+    let response;
+    try {
+      response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${openaiKey}` },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model: 'gpt-4o',
+          max_tokens: 400,
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'text', text: prompt },
+              { type: 'image_url', image_url: { url: `data:${mimeType};base64,${imageBase64}`, detail: 'auto' } },
+            ],
+          }],
+        }),
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
 
     if (!response.ok) {
       const err = await response.text();
-      throw new ApiError(`OpenAI error: ${err.substring(0,200)}`, 502);
+      logger.error('OpenAI error', { status: response.status, body: err.substring(0,200) });
+      throw new ApiError(`OpenAI error: ${response.status}`, 502);
     }
 
     const aiResult = await response.json();
