@@ -165,3 +165,104 @@ router.post('/:id/decline', requireCompanyOrAbove, async (req, res, next) => {
 });
 
 export default router;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW: Placement correction requests via charge_corrections table
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /corrections/placement/:periodId — corrections for a period
+router.get('/placement/:periodId', async (req, res, next) => {
+  try {
+    const { data, error } = await adminSupabase
+      .from('charge_corrections')
+      .select('*')
+      .eq('period_id', req.params.periodId)
+      .order('correction_date', { ascending: true });
+    if (error) throw new ApiError(error.message);
+    res.json(data || []);
+  } catch (err) { next(err); }
+});
+
+// POST /corrections — create new placement correction request
+router.post('/', async (req, res, next) => {
+  try {
+    const { user } = req;
+
+    // Get placement for this user
+    const { data: placement } = await adminSupabase
+      .from('placements')
+      .select('id')
+      .eq('user_profile_id', user.id)
+      .maybeSingle();
+    if (!placement) throw new ApiError('No placement found for user', 403);
+
+    const {
+      period_id, correction_date, correction_type, charge_codes,
+      reason, rotation_start, rotation_end,
+      overtime_hhmm, overtime_decimal,
+    } = req.body;
+
+    if (!period_id || !correction_date || !correction_type || !reason) {
+      throw new ApiError('period_id, correction_date, correction_type and reason are required', 400);
+    }
+
+    const VALID_TYPES = ['PAID', 'PAID_OFF_PD', 'SOLD_DAY', 'BOD_DAY', 'OVERTIME'];
+    if (!VALID_TYPES.includes(correction_type)) {
+      throw new ApiError(`Invalid correction_type. Must be one of: ${VALID_TYPES.join(', ')}`, 400);
+    }
+
+    if (correction_type === 'OVERTIME' && (!overtime_hhmm || overtime_decimal === undefined)) {
+      throw new ApiError('overtime_hhmm and overtime_decimal are required for OVERTIME corrections', 400);
+    }
+
+    const { data, error } = await adminSupabase
+      .from('charge_corrections')
+      .insert({
+        placement_id:     placement.id,
+        period_id,
+        correction_date,
+        correction_type,
+        charge_codes:     charge_codes || [],
+        reason,
+        rotation_start:   rotation_start || null,
+        rotation_end:     rotation_end   || null,
+        overtime_hhmm:    overtime_hhmm  || null,
+        overtime_decimal: overtime_decimal || null,
+        status:           'pending',
+        requested_by:     user.id,
+      })
+      .select()
+      .single();
+
+    if (error) throw new ApiError(error.message);
+    res.status(201).json(data);
+  } catch (err) { next(err); }
+});
+
+// PUT /corrections/:id/status — approve or decline
+router.put('/:id/status', requireCompanyOrAbove, async (req, res, next) => {
+  try {
+    const { status, review_note } = req.body;
+    if (!['approved', 'declined'].includes(status)) {
+      throw new ApiError('status must be approved or declined', 400);
+    }
+    if (status === 'declined' && !review_note) {
+      throw new ApiError('review_note is required when declining', 400);
+    }
+
+    const { data, error } = await adminSupabase
+      .from('charge_corrections')
+      .update({
+        status,
+        review_note:  review_note || null,
+        reviewed_by:  req.user.id,
+        updated_at:   new Date().toISOString(),
+      })
+      .eq('id', req.params.id)
+      .select()
+      .single();
+
+    if (error) throw new ApiError(error.message);
+    res.json(data);
+  } catch (err) { next(err); }
+});
