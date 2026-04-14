@@ -15,6 +15,28 @@ import { ApiError } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
 
 const router = Router();
+
+// ── GET /expenses/test-openai — public, no auth needed ────────────────────────
+router.get('/test-openai', async (req, res) => {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) return res.json({ ok: false, error: 'OPENAI_API_KEY not set in Railway', keySet: false });
+
+  try {
+    const r = await fetch('https://api.openai.com/v1/models', {
+      headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(10000),
+    });
+    const data = await r.json();
+    if (r.ok) {
+      const hasGpt4o = data.data?.some(m => m.id === 'gpt-4o');
+      return res.json({ ok: true, keySet: true, keyPreview: key.substring(0,7)+'***', status: r.status, hasGpt4o, modelCount: data.data?.length });
+    }
+    return res.json({ ok: false, keySet: true, keyPreview: key.substring(0,7)+'***', status: r.status, error: data.error?.message, errorType: data.error?.type });
+  } catch(e) {
+    return res.json({ ok: false, keySet: true, error: e.message });
+  }
+});
+
 router.use(requireAuth);
 
 // ── helpers ────────────────────────────────────────────────────────────────────
@@ -266,28 +288,6 @@ router.get('/fx-rate', async (req, res, next) => {
     if (!rate) throw new ApiError(`No rate found for ${from} → ${to}`, 404);
     res.json({ rate, from, to, date: data.date });
   } catch(err) { next(err); }
-});
-
-
-// ── GET /expenses/test-openai — verify OpenAI key works ───────────────────────
-router.get('/test-openai', async (req, res) => {
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) return res.json({ ok: false, error: 'OPENAI_API_KEY not set', keySet: false });
-
-  try {
-    const r = await fetch('https://api.openai.com/v1/models', {
-      headers: { Authorization: `Bearer ${key}` },
-      signal: AbortSignal.timeout(10000),
-    });
-    const data = await r.json();
-    if (r.ok) {
-      const hasGpt4o = data.data?.some(m => m.id === 'gpt-4o');
-      return res.json({ ok: true, keySet: true, keyPreview: key.substring(0,7)+'***', status: r.status, hasGpt4o, modelCount: data.data?.length });
-    }
-    return res.json({ ok: false, keySet: true, keyPreview: key.substring(0,7)+'***', status: r.status, error: data.error?.message });
-  } catch(e) {
-    return res.json({ ok: false, keySet: true, error: e.message });
-  }
 });
 
 export default router;
