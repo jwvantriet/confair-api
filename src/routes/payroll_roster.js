@@ -579,4 +579,23 @@ router.get('/summary/:placementId/:periodId', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+
+// GET /payroll-roster/placement-rates/:placementId — fetch rates for correction modal
+router.get('/placement-rates/:placementId', requireAuth, async (req, res, next) => {
+  try {
+    const { data, error } = await adminSupabase
+      .from('placement_rates')
+      .select('amount, currency, charge_types(code, label)')
+      .eq('placement_id', req.params.placementId);
+    if (error) throw error;
+    const rates = (data || []).map(r => ({
+      code:     r.charge_types?.code,
+      label:    r.charge_types?.label,
+      amount:   parseFloat(r.amount),
+      currency: r.currency,
+    }));
+    res.json(rates);
+  } catch (err) { next(err); }
+});
+
 export default router;
