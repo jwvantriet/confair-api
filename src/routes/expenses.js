@@ -268,4 +268,26 @@ router.get('/fx-rate', async (req, res, next) => {
   } catch(err) { next(err); }
 });
 
+
+// ── GET /expenses/test-openai — verify OpenAI key works ───────────────────────
+router.get('/test-openai', async (req, res) => {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) return res.json({ ok: false, error: 'OPENAI_API_KEY not set', keySet: false });
+
+  try {
+    const r = await fetch('https://api.openai.com/v1/models', {
+      headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(10000),
+    });
+    const data = await r.json();
+    if (r.ok) {
+      const hasGpt4o = data.data?.some(m => m.id === 'gpt-4o');
+      return res.json({ ok: true, keySet: true, keyPreview: key.substring(0,7)+'***', status: r.status, hasGpt4o, modelCount: data.data?.length });
+    }
+    return res.json({ ok: false, keySet: true, keyPreview: key.substring(0,7)+'***', status: r.status, error: data.error?.message });
+  } catch(e) {
+    return res.json({ ok: false, keySet: true, error: e.message });
+  }
+});
+
 export default router;
