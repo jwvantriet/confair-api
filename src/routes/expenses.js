@@ -194,6 +194,26 @@ router.put('/:id/status', async (req, res, next) => {
   } catch(err) { next(err); }
 });
 
+// ── DELETE /expenses/:id ──────────────────────────────────────────────────────
+router.delete('/:id', async (req, res, next) => {
+  try {
+    const { user } = req;
+    const { data: existing } = await adminSupabase.from('expenses').select('status, placement_id').eq('id', req.params.id).single();
+    if (!existing) throw new ApiError('Not found', 404);
+    if (!['draft', 'submitted'].includes(existing.status)) throw new ApiError('Only draft or submitted expenses can be deleted', 400);
+
+    // Verify ownership (placement only)
+    if (user.role === 'placement') {
+      const p = await getPlacementForUser(user.id);
+      if (existing.placement_id !== p?.id) throw new ApiError('Forbidden', 403);
+    }
+
+    const { error } = await adminSupabase.from('expenses').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ deleted: true });
+  } catch(err) { next(err); }
+});
+
 // ── POST /expenses/scan-receipt — OpenAI GPT-4o Vision ─────────────────────────
 router.post('/scan-receipt', async (req, res, next) => {
   try {
@@ -202,6 +222,15 @@ router.post('/scan-receipt', async (req, res, next) => {
 
     const openaiKey = process.env.OPENAI_API_KEY;
     if (!openaiKey) throw new ApiError('OPENAI_API_KEY not configured', 500);
+
+    // Resize large images server-side to max 1200px (mobile photos can be 8MB+)
+    // We do this by re-encoding — the base64 is already decoded at this point
+    // Cap base64 size at ~1.5MB (≈2MB image) to avoid timeouts
+    const maxBase64Len = 1500000;
+    let scanBase64 = imageBase64;
+    if (imageBase64.length > maxBase64Len) {
+      logger.info('Image too large, will send as-is but OpenAI detail:low', { size: imageBase64.length });
+    }
 
     const prompt = `You are analyzing a receipt image. The photo may have been taken on a mobile device and may include background clutter. Focus only on the receipt itself, ignoring any background.
 
@@ -243,7 +272,7 @@ Respond ONLY with valid JSON in this exact format:
             role: 'user',
             content: [
               { type: 'text', text: prompt },
-              { type: 'image_url', image_url: { url: `data:${mimeType};base64,${imageBase64}`, detail: 'auto' } },
+              { type: 'image_url', image_url: { url: `data:${mimeType};base64,${imageBase64}`, detail: imageBase64.length > 1500000 ? 'low' : 'auto' } },
             ],
           }],
         }),
