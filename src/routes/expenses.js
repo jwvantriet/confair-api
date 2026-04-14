@@ -10,7 +10,7 @@
  */
 import { Router } from 'express';
 import { adminSupabase } from '../services/supabase.js';
-import { requireAuth, requireAgency, requireCompany } from '../middleware/auth.js';
+import { requireAuth, requireAgency, requireCompanyOrAbove } from '../middleware/auth.js';
 import { ApiError } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
 
