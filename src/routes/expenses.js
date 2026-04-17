@@ -158,6 +158,35 @@ router.get('/', async (req, res, next) => {
   } catch(err) { next(err); }
 });
 
+
+// ── POST /expenses/upload-receipt — upload to Supabase Storage ───────────────
+router.post('/upload-receipt', async (req, res, next) => {
+  try {
+    const { fileBase64, fileName, mimeType, placementId } = req.body;
+    if (!fileBase64 || !fileName) throw new ApiError('fileBase64 and fileName required', 400);
+
+    const buffer = Buffer.from(fileBase64, 'base64');
+    const ext    = fileName.split('.').pop()?.toLowerCase() || 'jpg';
+    const path   = `${placementId}/${Date.now()}_${fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+
+    const { error } = await adminSupabase.storage
+      .from('receipts')
+      .upload(path, buffer, {
+        contentType: mimeType || 'image/jpeg',
+        upsert: false,
+      });
+
+    if (error) throw new ApiError(`Storage error: ${error.message}`, 500);
+
+    const { data: { publicUrl } } = adminSupabase.storage
+      .from('receipts')
+      .getPublicUrl(path);
+
+    logger.info('Receipt uploaded', { path, size: buffer.length });
+    res.json({ url: publicUrl, name: fileName, path });
+  } catch (err) { next(err); }
+});
+
 // ── GET /expenses/:id ─────────────────────────────────────────────────────────
 router.get('/:id', async (req, res, next) => {
   try {
