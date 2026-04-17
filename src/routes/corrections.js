@@ -116,6 +116,28 @@ router.post('/:id/decline', requireCompanyOrAbove, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+
+// POST /corrections/upload — upload proof attachment to Supabase Storage
+router.post('/upload', requireAuth, async (req, res, next) => {
+  try {
+    // Simple base64 upload via request body
+    const { fileBase64, fileName, mimeType, placementId, date } = req.body;
+    if (!fileBase64 || !fileName) throw new ApiError('fileBase64 and fileName required', 400);
+
+    const buffer = Buffer.from(fileBase64, 'base64');
+    const path   = `corrections/${placementId}/${date}/${Date.now()}_${fileName}`;
+
+    const { error } = await adminSupabase.storage
+      .from('attachments')
+      .upload(path, buffer, { contentType: mimeType || 'application/octet-stream', upsert: false });
+
+    if (error) throw new ApiError(error.message);
+
+    const { data: { publicUrl } } = adminSupabase.storage.from('attachments').getPublicUrl(path);
+    res.json({ url: publicUrl, name: fileName, path });
+  } catch (err) { next(err); }
+});
+
 export default router;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -158,7 +180,7 @@ router.post('/', async (req, res, next) => {
       throw new ApiError('period_id, correction_date, correction_type and reason are required', 400);
     }
 
-    const VALID_TYPES = ['PAID', 'PAID_OFF_PD', 'SOLD_DAY', 'BOD_DAY', 'OVERTIME'];
+    const VALID_TYPES = ['PAID', 'PAID_OFF_PD', 'SOLD_DAY', 'BOD_DAY', 'OVERTIME', 'INLINE'];
     if (!VALID_TYPES.includes(correction_type)) {
       throw new ApiError(`Invalid correction_type. Must be one of: ${VALID_TYPES.join(', ')}`, 400);
     }
@@ -176,12 +198,17 @@ router.post('/', async (req, res, next) => {
         correction_type,
         charge_codes:     charge_codes || [],
         reason,
-        rotation_start:   rotation_start || null,
-        rotation_end:     rotation_end   || null,
-        overtime_hhmm:    overtime_hhmm  || null,
-        overtime_decimal: overtime_decimal || null,
-        status:           'pending',
-        requested_by:     user.id,
+        rotation_start:               rotation_start                || null,
+        rotation_end:                 rotation_end                  || null,
+        overtime_hhmm:                overtime_hhmm                 || null,
+        overtime_decimal:             overtime_decimal              || null,
+        blh_hhmm:                     req.body.blh_hhmm             || null,
+        blh_decimal:                  req.body.blh_decimal          || null,
+        is_rotation_end_correction:   req.body.is_rotation_end_correction || false,
+        attachment_url:               req.body.attachment_url       || null,
+        attachment_name:              req.body.attachment_name      || null,
+        status:                       'pending',
+        requested_by:                 user.id,
       })
       .select()
       .single();
