@@ -282,9 +282,24 @@ Respond ONLY with valid JSON in this exact format:
     }
 
     if (!response.ok) {
-      const err = await response.text();
-      logger.error('OpenAI error', { status: response.status, body: err.substring(0,200) });
-      throw new ApiError(`OpenAI error: ${response.status}`, 502);
+      const errText = await response.text();
+      let errJson = {};
+      try { errJson = JSON.parse(errText); } catch {}
+      const errMsg = errJson?.error?.message || errText.substring(0, 200);
+      logger.error('OpenAI error', { status: response.status, body: errMsg, type: errJson?.error?.type });
+
+      if (response.status === 429) {
+        // Rate limit — return a graceful fallback instead of crashing
+        logger.warn('OpenAI rate limit hit — returning empty result');
+        return res.json({
+          found: false,
+          amount: null, currency: null, date: null, merchant: null, description: null,
+          confidence: 'low',
+          notes: 'AI scanning temporarily unavailable (rate limit). Please fill in details manually.',
+          rateLimited: true,
+        });
+      }
+      throw new ApiError(`OpenAI error: ${response.status} — ${errMsg.substring(0,100)}`, 502);
     }
 
     const aiResult = await response.json();
