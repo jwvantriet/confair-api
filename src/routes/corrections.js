@@ -138,6 +138,48 @@ router.post('/upload', requireAuth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+
+// DELETE /corrections/:id — placement can delete own pending corrections
+router.delete('/:id', async (req, res, next) => {
+  try {
+    const { user } = req;
+
+    // Fetch correction
+    const { data: correction, error: fetchErr } = await adminSupabase
+      .from('charge_corrections')
+      .select('id, status, placement_id, attachment_url')
+      .eq('id', req.params.id)
+      .single();
+
+    if (fetchErr || !correction) throw new ApiError('Correction not found', 404);
+
+    // Only pending corrections can be deleted
+    if (correction.status !== 'pending') {
+      throw new ApiError('Only pending corrections can be deleted', 400);
+    }
+
+    // Verify ownership (placement role)
+    if (user.role === 'placement') {
+      const { data: placement } = await adminSupabase
+        .from('placements').select('id').eq('user_profile_id', user.id).maybeSingle();
+      if (!placement || placement.id !== correction.placement_id) {
+        throw new ApiError('Forbidden', 403);
+      }
+    }
+
+    // Delete the correction
+    const { error } = await adminSupabase
+      .from('charge_corrections')
+      .delete()
+      .eq('id', req.params.id);
+
+    if (error) throw new ApiError(error.message);
+
+    logger.info('Correction deleted', { id: req.params.id, by: user.id });
+    res.json({ deleted: true, id: req.params.id });
+  } catch (err) { next(err); }
+});
+
 export default router;
 
 // ─────────────────────────────────────────────────────────────────────────────
