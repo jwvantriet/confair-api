@@ -1,289 +1,197 @@
-/**
- * Corrections routes
- *
- * GET  /corrections                    — List corrections visible to current user
- * POST /corrections                    — Placement creates a correction request
- * POST /corrections/:id/approve        — Company/Agency approves (auto-adds to run)
- * POST /corrections/:id/decline        — Company/Agency declines (reason mandatory)
- */
+'use client';
+import { useState, useRef } from 'react';
+import { api } from '@/lib/api';
 
-import { Router } from 'express';
-import { requireAuth, requireCompanyOrAbove } from '../middleware/auth.js';
-import { adminSupabase } from '../services/supabase.js';
-import { ApiError } from '../middleware/errorHandler.js';
-import { writeAuditLog } from '../utils/audit.js';
+const CHARGE_CODES = [
+  { code: 'DA',  label: 'DA',  full: 'Daily Allowance' },
+  { code: 'AP',  label: 'AP',  full: 'Availability Premium' },
+  { code: 'YWC', label: 'YWC', full: 'Years With Client' },
+  { code: 'PD',  label: 'PD',  full: 'Per Diem' },
+  { code: 'HD',  label: 'HD',  full: 'Hard Day' },
+  { code: 'BD',  label: 'BD',  full: 'BOD Day' },
+];
 
-const router = Router();
-router.use(requireAuth);
+function parseHHMM(val: string): number | null {
+  const m = val.match(/^(\d{1,3}):([0-5]\d)$/);
+  if (!m) return null;
+  return parseInt(m[1]) + parseInt(m[2]) / 60;
+}
 
-router.get('/', async (req, res, next) => {
-  try {
-    const { status } = req.query;
-    let query = req.supabase
-      .from('correction_requests')
-      .select(`
-        *, declaration_types(code,label), placements(full_name),
-        companies(name), payroll_periods(period_ref)
-      `)
-      .order('created_at', { ascending: false });
-    if (status) query = query.eq('status', status);
-    const { data, error } = await query;
-    if (error) throw new ApiError(error.message);
-    res.json(data);
-  } catch (err) { next(err); }
-});
+interface Props {
+  date:         string;
+  colSpan:      number;
+  periodId:     string;
+  placementId:  string;
+  isRotationEnd?: boolean;
+  onSuccess:    () => void;
+  onCancel:     () => void;
+}
 
-// Old correction_requests POST removed — replaced by charge_corrections below
+export default function InlineCorrectionRow({
+  date, colSpan, periodId, placementId, isRotationEnd, onSuccess, onCancel
+}: Props) {
+  const [selectedCodes, setSelectedCodes] = useState<Set<string>>(new Set());
+  const [blhHHMM,  setBlhHHMM]    = useState('');
+  const [rotEnd,   setRotEnd]      = useState(false);
+  const [comment,  setComment]     = useState('');
+  const [file,     setFile]        = useState<File | null>(null);
+  const [saving,   setSaving]      = useState(false);
+  const [error,    setError]       = useState('');
+  const [uploadError, setUploadError] = useState('');
+  const [uploading, setUploading]    = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
 
-router.post('/:id/approve', requireCompanyOrAbove, async (req, res, next) => {
-  try {
-    const { data: corr, error } = await adminSupabase
-      .from('correction_requests')
-      .select('*, payroll_periods(id)')
-      .eq('id', req.params.id)
-      .single();
-    if (error || !corr) throw new ApiError('Correction not found', 404);
-    if (corr.status !== 'requested') throw new ApiError('Correction is not in requested status');
+  const toggleCode = (code: string) =>
+    setSelectedCodes(prev => { const n = new Set(prev); n.has(code) ? n.delete(code) : n.add(code); return n; });
 
-    // Find or create the active run for this period
-    let { data: run } = await adminSupabase
-      .from('payroll_runs')
-      .select('id')
-      .eq('payroll_period_id', corr.payroll_period_id)
-      .not('status', 'eq', 'finalized')
-      .maybeSingle();
+  const blhDecimal = blhHHMM ? parseHHMM(blhHHMM) : null;
 
-    if (!run) {
-      const { data: newRun } = await adminSupabase
-        .from('payroll_runs')
-        .insert({ payroll_period_id: corr.payroll_period_id, status: 'in_progress' })
-        .select()
-        .single();
-      run = newRun;
+  const submit = async () => {
+    if (selectedCodes.size === 0 && !blhHHMM && !comment.trim()) {
+      setError('Select at least one charge, enter BLH, or add a comment'); return;
     }
+    setSaving(true); setError('');
+    try {
+      let attachmentUrl  = null;
+      let attachmentName = null;
 
-    // Add to run
-    await adminSupabase.from('payroll_run_entries').insert({
-      payroll_run_id:       run.id,
-      correction_request_id: corr.id,
-      amount:               corr.requested_amount,
-    });
-
-    // Update correction
-    await adminSupabase.from('correction_requests').update({
-      status:          'approved',
-      reviewed_by:     req.user.id,
-      reviewed_at:     new Date().toISOString(),
-      included_in_run: true,
-      payroll_run_id:  run.id,
-    }).eq('id', corr.id);
-
-    await adminSupabase.from('approval_actions').insert({
-      entity_type: 'correction_request', entity_id: corr.id,
-      stage: 'company_initial', action: 'approved',
-      actor_user_id: req.user.id, actor_role: req.user.role,
-    });
-
-    await writeAuditLog({ eventType: 'correction_approved', actorUserId: req.user.id, actorRole: req.user.role, entityType: 'correction_request', entityId: corr.id });
-    res.json({ message: 'Correction approved and added to run', runId: run.id });
-  } catch (err) { next(err); }
-});
-
-router.post('/:id/decline', requireCompanyOrAbove, async (req, res, next) => {
-  try {
-    const { declineReason } = req.body;
-    if (!declineReason?.trim()) throw new ApiError('declineReason is mandatory', 400);
-
-    const { data: corr, error } = await adminSupabase
-      .from('correction_requests').select('id, status').eq('id', req.params.id).single();
-    if (error || !corr) throw new ApiError('Correction not found', 404);
-    if (corr.status !== 'requested') throw new ApiError('Correction is not in requested status');
-
-    await adminSupabase.from('correction_requests').update({
-      status: 'declined', decline_reason: declineReason,
-      reviewed_by: req.user.id, reviewed_at: new Date().toISOString(),
-    }).eq('id', corr.id);
-
-    await adminSupabase.from('approval_actions').insert({
-      entity_type: 'correction_request', entity_id: corr.id,
-      stage: 'company_initial', action: 'declined',
-      actor_user_id: req.user.id, actor_role: req.user.role,
-      decline_reason: declineReason,
-    });
-
-    await writeAuditLog({ eventType: 'correction_declined', actorUserId: req.user.id, actorRole: req.user.role, entityType: 'correction_request', entityId: corr.id, payload: { declineReason } });
-    res.json({ message: 'Correction declined' });
-  } catch (err) { next(err); }
-});
-
-
-// POST /corrections/upload — upload proof attachment to Supabase Storage
-router.post('/upload', requireAuth, async (req, res, next) => {
-  try {
-    // Simple base64 upload via request body
-    const { fileBase64, fileName, mimeType, placementId, date } = req.body;
-    if (!fileBase64 || !fileName) throw new ApiError('fileBase64 and fileName required', 400);
-
-    const buffer = Buffer.from(fileBase64, 'base64');
-    const path   = `corrections/${placementId}/${date}/${Date.now()}_${fileName}`;
-
-    const { error } = await adminSupabase.storage
-      .from('attachments')
-      .upload(path, buffer, { contentType: mimeType || 'application/octet-stream', upsert: false });
-
-    if (error) throw new ApiError(error.message);
-
-    const { data: { publicUrl } } = adminSupabase.storage.from('attachments').getPublicUrl(path);
-    res.json({ url: publicUrl, name: fileName, path });
-  } catch (err) { next(err); }
-});
-
-
-// DELETE /corrections/:id — placement can delete own pending corrections
-router.delete('/:id', async (req, res, next) => {
-  try {
-    const { user } = req;
-
-    // Fetch correction
-    const { data: correction, error: fetchErr } = await adminSupabase
-      .from('charge_corrections')
-      .select('id, status, placement_id, attachment_url')
-      .eq('id', req.params.id)
-      .single();
-
-    if (fetchErr || !correction) throw new ApiError('Correction not found', 404);
-
-    // Only pending corrections can be deleted
-    if (correction.status !== 'pending') {
-      throw new ApiError('Only pending corrections can be deleted', 400);
-    }
-
-    // Verify ownership (placement role)
-    if (user.role === 'placement') {
-      const { data: placement } = await adminSupabase
-        .from('placements').select('id').eq('user_profile_id', user.id).maybeSingle();
-      if (!placement || placement.id !== correction.placement_id) {
-        throw new ApiError('Forbidden', 403);
+      // Upload attachment as base64
+      if (file) {
+        setUploading(true); setUploadError('');
+        try {
+          const base64 = await new Promise<string>((res, rej) => {
+            const r = new FileReader();
+            r.onload = () => res((r.result as string).split(',')[1]);
+            r.onerror = rej;
+            r.readAsDataURL(file);
+          });
+          const up = await api.post('/corrections/upload', {
+            fileBase64: base64, fileName: file.name,
+            mimeType: file.type, placementId, date,
+          });
+          attachmentUrl  = up.data.url;
+          attachmentName = up.data.name;
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : 'Upload failed';
+          setUploadError(msg.includes('mime') ? 'Unsupported file type (use JPG, PNG or PDF)' : 'Upload failed');
+        } finally { setUploading(false); }
       }
-    }
 
-    // Delete the correction
-    const { error } = await adminSupabase
-      .from('charge_corrections')
-      .delete()
-      .eq('id', req.params.id);
+      await api.post('/corrections', {
+        placement_id:               placementId,
+        period_id:                  periodId,
+        correction_date:            date,
+        correction_type:            'INLINE',
+        charge_codes:               Array.from(selectedCodes),
+        reason:                     comment.trim() || 'Inline correction',
+        blh_hhmm:                   blhHHMM || null,
+        blh_decimal:                blhDecimal,
+        is_rotation_end_correction: rotEnd,
+        attachment_url:             attachmentUrl,
+        attachment_name:            attachmentName,
+        status:                     'pending',
+      });
+      onSuccess();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Failed to submit');
+    } finally { setSaving(false); }
+  };
 
-    if (error) throw new ApiError(error.message);
+  return (
+    <tr className="bg-amber-50/60 border-t border-amber-200">
+      <td colSpan={colSpan} className="px-0 py-0">
+        <div className="px-4 py-3 space-y-3">
 
-    logger.info('Correction deleted', { id: req.params.id, by: user.id });
-    res.json({ deleted: true, id: req.params.id });
-  } catch (err) { next(err); }
-});
+          {/* Charge toggles */}
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-xs font-semibold text-amber-800 mr-1">Claim charges:</span>
+            {CHARGE_CODES.map(({ code, label, full }) => (
+              <button key={code} onClick={() => toggleCode(code)}
+                title={full}
+                className={`w-10 h-8 rounded-lg text-xs font-bold border-2 transition-all ${
+                  selectedCodes.has(code)
+                    ? 'bg-amber-500 border-amber-600 text-white shadow-sm scale-105'
+                    : 'bg-white border-navy-200 text-navy-400 hover:border-amber-400 hover:text-amber-600'
+                }`}>
+                {label}
+              </button>
+            ))}
+          </div>
 
-export default router;
+          {/* BLH override — only on rotation end days */}
+          {isRotationEnd && (
+            <div className="flex items-center gap-4 flex-wrap">
+              <div className="flex items-center gap-2">
+                <label className="text-xs font-semibold text-amber-800 whitespace-nowrap">BLH override:</label>
+                <input
+                  type="text"
+                  value={blhHHMM}
+                  onChange={e => setBlhHHMM(e.target.value)}
+                  placeholder="HH:MM"
+                  pattern="\d+:[0-5]\d"
+                  className="w-20 border border-amber-300 rounded-lg px-2 py-1 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-amber-400 bg-white"
+                />
+                {blhDecimal !== null && (
+                  <span className="text-xs text-amber-700 font-mono">= {blhDecimal.toFixed(2)}h</span>
+                )}
+              </div>
+              <label className="flex items-center gap-1.5 cursor-pointer">
+                <input type="checkbox" checked={rotEnd} onChange={e => setRotEnd(e.target.checked)}
+                  className="rounded border-amber-300 text-amber-500 focus:ring-amber-400" />
+                <span className="text-xs font-semibold text-amber-800">Correct rotation end</span>
+              </label>
+            </div>
+          )}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// NEW: Placement correction requests via charge_corrections table
-// ─────────────────────────────────────────────────────────────────────────────
+          {/* Comment */}
+          <textarea
+            value={comment}
+            onChange={e => setComment(e.target.value)}
+            rows={2}
+            placeholder="Add a comment or explain your claim..."
+            className="w-full border border-amber-300 rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-amber-400 resize-none bg-white"
+          />
 
-// GET /corrections/placement/:periodId — corrections for a period
-router.get('/placement/:periodId', async (req, res, next) => {
-  try {
-    const { data, error } = await adminSupabase
-      .from('charge_corrections')
-      .select('*')
-      .eq('period_id', req.params.periodId)
-      .order('correction_date', { ascending: true });
-    if (error) throw new ApiError(error.message);
-    res.json(data || []);
-  } catch (err) { next(err); }
-});
+          {/* Attachment — prominent separate row */}
+          <div>
+            <button onClick={() => fileRef.current?.click()}
+              className={`w-full flex items-center justify-center gap-2 py-2.5 rounded-xl border-2 border-dashed transition-all text-xs font-semibold ${
+                file
+                  ? 'border-amber-400 bg-amber-50 text-amber-800'
+                  : 'border-amber-200 text-amber-600 hover:border-amber-400 hover:bg-amber-50 bg-white'
+              }`}>
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
+              </svg>
+              {file ? `📎 ${file.name.substring(0,20)}${file.name.length > 20 ? '…' : ''}` : '📎 Attach proof (optional photo or PDF)'}
+            </button>
+            <input ref={fileRef} type="file" accept="image/*,application/pdf" className="hidden"
+              onChange={e => setFile(e.target.files?.[0] || null)} />
+            {file && !uploading && !uploadError && (
+              <button onClick={() => setFile(null)}
+                className="text-xs text-amber-600 underline mt-1 w-full text-center">
+                Remove attachment
+              </button>
+            )}
+            {uploading && <p className="text-xs text-amber-600 text-center mt-1">Uploading…</p>}
+            {uploadError && <p className="text-xs text-red-500 text-center mt-1">{uploadError} — will submit without attachment</p>}
+          </div>
 
-// POST /corrections — create new placement correction request
-router.post('/', async (req, res, next) => {
-  try {
-    const { user } = req;
+          {error && <p className="text-xs text-red-600">{error}</p>}
 
-    // Get placement for this user
-    const { data: placement } = await adminSupabase
-      .from('placements')
-      .select('id')
-      .eq('user_profile_id', user.id)
-      .maybeSingle();
-    if (!placement) throw new ApiError('No placement found for user', 403);
-
-    const {
-      period_id, correction_date, correction_type, charge_codes,
-      reason, rotation_start, rotation_end,
-      overtime_hhmm, overtime_decimal,
-    } = req.body;
-
-    if (!period_id || !correction_date || !correction_type || !reason) {
-      throw new ApiError('period_id, correction_date, correction_type and reason are required', 400);
-    }
-
-    const VALID_TYPES = ['PAID', 'PAID_OFF_PD', 'SOLD_DAY', 'BOD_DAY', 'OVERTIME', 'INLINE'];
-    if (!VALID_TYPES.includes(correction_type)) {
-      throw new ApiError(`Invalid correction_type. Must be one of: ${VALID_TYPES.join(', ')}`, 400);
-    }
-
-    if (correction_type === 'OVERTIME' && (!overtime_hhmm || overtime_decimal === undefined)) {
-      throw new ApiError('overtime_hhmm and overtime_decimal are required for OVERTIME corrections', 400);
-    }
-
-    const { data, error } = await adminSupabase
-      .from('charge_corrections')
-      .insert({
-        placement_id:     placement.id,
-        period_id,
-        correction_date,
-        correction_type,
-        charge_codes:     charge_codes || [],
-        reason,
-        rotation_start:               rotation_start                || null,
-        rotation_end:                 rotation_end                  || null,
-        overtime_hhmm:                overtime_hhmm                 || null,
-        overtime_decimal:             overtime_decimal              || null,
-        blh_hhmm:                     req.body.blh_hhmm             || null,
-        blh_decimal:                  req.body.blh_decimal          || null,
-        is_rotation_end_correction:   req.body.is_rotation_end_correction || false,
-        attachment_url:               req.body.attachment_url       || null,
-        attachment_name:              req.body.attachment_name      || null,
-        status:                       'pending',
-        requested_by:                 user.id,
-      })
-      .select()
-      .single();
-
-    if (error) throw new ApiError(error.message);
-    res.status(201).json(data);
-  } catch (err) { next(err); }
-});
-
-// PUT /corrections/:id/status — approve or decline
-router.put('/:id/status', requireCompanyOrAbove, async (req, res, next) => {
-  try {
-    const { status, review_note } = req.body;
-    if (!['approved', 'declined'].includes(status)) {
-      throw new ApiError('status must be approved or declined', 400);
-    }
-    if (status === 'declined' && !review_note) {
-      throw new ApiError('review_note is required when declining', 400);
-    }
-
-    const { data, error } = await adminSupabase
-      .from('charge_corrections')
-      .update({
-        status,
-        review_note:  review_note || null,
-        reviewed_by:  req.user.id,
-        updated_at:   new Date().toISOString(),
-      })
-      .eq('id', req.params.id)
-      .select()
-      .single();
-
-    if (error) throw new ApiError(error.message);
-    res.json(data);
-  } catch (err) { next(err); }
-});
+          {/* Actions */}
+          <div className="flex gap-2 justify-end">
+            <button onClick={onCancel}
+              className="px-4 py-1.5 text-xs text-navy-400 border border-navy-200 rounded-lg hover:bg-navy/5 bg-white">
+              Cancel
+            </button>
+            <button onClick={submit} disabled={saving}
+              className="px-4 py-1.5 text-xs font-semibold text-white bg-amber-500 hover:bg-amber-600 rounded-lg disabled:opacity-50 transition-colors">
+              {saving ? 'Submitting…' : 'Submit Correction →'}
+            </button>
+          </div>
+        </div>
+      </td>
+    </tr>
+  );
+}
