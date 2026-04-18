@@ -169,7 +169,7 @@ router.get('/periods', async (req, res, next) => {
 
       const { data: corrections } = await adminSupabase
         .from('charge_corrections')
-        .select('id, status, correction_date, reason, contractor_note, review_note, declined_reason, charge_types(code, label)')
+        .select('id, status, correction_date, correction_type, reason, contractor_note, review_note, declined_reason, charge_codes, blh_hhmm, blh_decimal, attachment_url, attachment_name, is_rotation_end_correction, charge_types(code, label)')
         .eq('placement_id', s.placement_id)
         .eq('period_id', s.period_id);
 
