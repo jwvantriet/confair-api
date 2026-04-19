@@ -265,4 +265,37 @@ router.post('/approve-correction/:id', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── POST /payroll-approval/decline-correction/:id ─────────────────────────
+router.post('/decline-correction/:id', async (req, res, next) => {
+  try {
+    const { user } = req;
+    const { reason } = req.body;
+
+    const { data: correction, error: fetchErr } = await adminSupabase
+      .from('charge_corrections')
+      .select('id, status, correction_type, placement_id, period_id')
+      .eq('id', req.params.id)
+      .single();
+    if (fetchErr || !correction) throw new ApiError('Correction not found', 404);
+    if (correction.correction_type === 'COMPANY') throw new ApiError('Cannot decline company corrections', 400);
+    if (correction.status !== 'pending') throw new ApiError('Only pending corrections can be declined', 400);
+
+    // Verify placement belongs to this company
+    const { data: company } = await adminSupabase
+      .from('companies').select('id').eq('carerix_company_id', user.carerix_company_id).maybeSingle();
+    if (!company) throw new ApiError('Company not found', 404);
+    const { data: placement } = await adminSupabase
+      .from('placements').select('id').eq('id', correction.placement_id).eq('company_id', company.id).maybeSingle();
+    if (!placement) throw new ApiError('Forbidden', 403);
+
+    const { error } = await adminSupabase
+      .from('charge_corrections')
+      .update({ status: 'declined', reviewed_by: user.id, declined_reason: reason || null })
+      .eq('id', req.params.id);
+    if (error) throw new ApiError(error.message);
+
+    res.json({ declined: true, id: req.params.id });
+  } catch (err) { next(err); }
+});
+
 export default router;
