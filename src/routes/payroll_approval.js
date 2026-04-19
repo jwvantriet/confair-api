@@ -118,10 +118,10 @@ router.get('/roster/:placementId/:periodId', async (req, res, next) => {
       .eq('placement_id', placementId)
       .eq('period_id', periodId);
 
-    // Company corrections for this placement/period
+    // All corrections for this placement/period (crew + company)
     const { data: corrections } = await adminSupabase
       .from('charge_corrections')
-      .select('id, correction_date, status, charge_codes, blh_hhmm, reason, created_at')
+      .select('id, correction_date, status, correction_type, charge_codes, blh_hhmm, reason, created_at')
       .eq('placement_id', placementId)
       .eq('period_id', periodId)
       .order('correction_date');
