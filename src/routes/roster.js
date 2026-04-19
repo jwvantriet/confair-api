@@ -151,20 +151,33 @@ router.get('/summary/:periodId', async (req, res, next) => {
     logger.info('Summary query', { periodId, role: user.role, placementIds, count: items?.length, error: error?.message });
     if (error) throw new ApiError(error.message);
 
-    // Get placement names
-    const pids = [...new Set((items || []).map(i => i.placement_id))];
-    let placementMap = {};
-    if (pids.length) {
-      const { data: ps } = await adminSupabase.from('placements').select('id, full_name').in('id', pids);
-      placementMap = Object.fromEntries((ps || []).map(p => [p.id, p.full_name]));
+    // Fetch all placements in scope (even those with no charges yet)
+    let allPlacements = [];
+    if (placementIds) {
+      const { data: ps } = await adminSupabase.from('placements').select('id, full_name, crew_id').in('id', placementIds);
+      allPlacements = ps || [];
+    } else {
+      // Agency: get all placements that have charge items this period
+      const pids = [...new Set((items || []).map(i => i.placement_id))];
+      if (pids.length) {
+        const { data: ps } = await adminSupabase.from('placements').select('id, full_name, crew_id').in('id', pids);
+        allPlacements = ps || [];
+      }
+    }
+    const placementMap = Object.fromEntries(allPlacements.map(p => [p.id, p]));
+
+    // Seed byPlacement with all placements (so zero-charge placements still appear)
+    const byPlacement = new Map();
+    for (const pl of allPlacements) {
+      byPlacement.set(pl.id, { placementId: pl.id, displayName: pl.full_name || '', crewId: pl.crew_id || null, chargeTypes: new Map(), totalValue: 0, currency: 'USD' });
     }
 
-    // Group by placement
-    const byPlacement = new Map();
+    // Fill in charge items
     for (const item of items || []) {
       const pid = item.placement_id;
       if (!byPlacement.has(pid)) {
-        byPlacement.set(pid, { placementId: pid, displayName: placementMap[pid] || 'Unknown', chargeTypes: new Map(), totalValue: 0, currency: item.currency });
+        const pl = placementMap[pid];
+        byPlacement.set(pid, { placementId: pid, displayName: pl?.full_name || 'Unknown', crewId: pl?.crew_id || null, chargeTypes: new Map(), totalValue: 0, currency: item.currency });
       }
       const p = byPlacement.get(pid);
       const code = item.charge_types?.code;
