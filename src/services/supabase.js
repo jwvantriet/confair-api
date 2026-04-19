@@ -61,13 +61,12 @@ export async function provisionCarerixSession(identity) {
 
   if (existing) {
     supabaseUserId = existing.id;
+    // Only update non-role fields — don't overwrite manually assigned roles
     await adminSupabase.from('user_profiles').update({
       display_name:           identity.fullName,
       email:                  identity.email,
       carerix_company_id:     identity.carerixCompanyId,
-      carerix_contact_id:     identity.carerixContactId,
       carerix_last_synced_at: new Date().toISOString(),
-      role:                   identity.platformRole,
     }).eq('id', supabaseUserId);
   } else {
     const { data: newUser, error } = await adminSupabase.auth.admin.createUser({
@@ -78,9 +77,16 @@ export async function provisionCarerixSession(identity) {
 
     if (error?.message?.includes('already been registered')) {
       // User exists in auth but not in user_profiles — find and link them
-      const { data: authUsers } = await adminSupabase.auth.admin.listUsers();
-      const authUser = authUsers?.users?.find(u => u.email === identity.email);
-      if (!authUser) throw new Error(`User exists but could not be found: ${error.message}`);
+      // listUsers is paginated; loop to find the user across all pages
+      let authUser = null;
+      let page = 1;
+      while (!authUser) {
+        const { data: authUsers } = await adminSupabase.auth.admin.listUsers({ page, perPage: 1000 });
+        authUser = authUsers?.users?.find(u => u.email === identity.email) || null;
+        if (!authUser && (!authUsers?.users?.length || authUsers.users.length < 1000)) break;
+        page++;
+      }
+      if (!authUser) throw new Error(`User exists in auth but could not be located: ${identity.email}`);
       supabaseUserId = authUser.id;
     } else if (error) {
       throw new Error(`Failed to create Supabase user: ${error.message}`);
@@ -88,7 +94,7 @@ export async function provisionCarerixSession(identity) {
       supabaseUserId = newUser.user.id;
     }
 
-    await adminSupabase.from('user_profiles').upsert({
+    const { error: upsertErr } = await adminSupabase.from('user_profiles').upsert({
       id:                     supabaseUserId,
       auth_source:            'carerix',
       role:                   identity.platformRole,
@@ -100,6 +106,7 @@ export async function provisionCarerixSession(identity) {
       carerix_last_synced_at: new Date().toISOString(),
       is_active:              true,
     }, { onConflict: 'id' });
+    if (upsertErr) throw new Error(`Failed to create user profile: ${upsertErr.message}`);
   }
 
   // createSession was removed in Supabase JS v2.
