@@ -46,6 +46,15 @@ router.get('/summary/:periodId', async (req, res, next) => {
       .eq('period_id', periodId)
       .in('placement_id', placementIds);
 
+    // Also fetch approved company corrections — these add to charge totals
+    const { data: approvedCorrections } = await adminSupabase
+      .from('charge_corrections')
+      .select('placement_id, charge_codes')
+      .eq('period_id', periodId)
+      .eq('correction_type', 'COMPANY')
+      .eq('status', 'approved')
+      .in('placement_id', placementIds);
+
     // Build charge map: placementId → chargeCode → total quantity
     const chargeMap = {};
     for (const c of charges || []) {
@@ -53,6 +62,14 @@ router.get('/summary/:periodId', async (req, res, next) => {
       if (!code) continue;
       if (!chargeMap[c.placement_id]) chargeMap[c.placement_id] = {};
       chargeMap[c.placement_id][code] = (chargeMap[c.placement_id][code] || 0) + Number(c.quantity);
+    }
+
+    // Add company correction charges to totals (each entry counts as 1 day)
+    for (const corr of approvedCorrections || []) {
+      if (!chargeMap[corr.placement_id]) chargeMap[corr.placement_id] = {};
+      for (const code of corr.charge_codes || []) {
+        chargeMap[corr.placement_id][code] = (chargeMap[corr.placement_id][code] || 0) + 1;
+      }
     }
 
     // Build status map
