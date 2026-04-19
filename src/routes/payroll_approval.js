@@ -46,14 +46,19 @@ router.get('/summary/:periodId', async (req, res, next) => {
       .eq('period_id', periodId)
       .in('placement_id', placementIds);
 
-    // Also fetch approved company corrections — these add to charge totals
+    // Fetch all approved corrections (both company and crew) — add to charge totals
     const { data: approvedCorrections } = await adminSupabase
       .from('charge_corrections')
-      .select('placement_id, charge_codes')
+      .select('placement_id, charge_codes, correction_type')
       .eq('period_id', periodId)
-      .eq('correction_type', 'COMPANY')
       .eq('status', 'approved')
       .in('placement_id', placementIds);
+
+    // Crew corrections store labels (DA/AP/PD), company corrections store codes
+    const LABEL_TO_CODE = {
+      DA: 'DailyAllowance', AP: 'AvailabilityPremium', YWC: 'YearsWithClient',
+      PD: 'PerDiem', HD: 'SoldOffDay', BD: 'BODDays',
+    };
 
     // Build charge map: placementId → chargeCode → total quantity
     const chargeMap = {};
@@ -64,10 +69,11 @@ router.get('/summary/:periodId', async (req, res, next) => {
       chargeMap[c.placement_id][code] = (chargeMap[c.placement_id][code] || 0) + Number(c.quantity);
     }
 
-    // Add company correction charges to totals (each entry counts as 1 day)
+    // Add approved correction charges to totals (map labels → codes for crew corrections)
     for (const corr of approvedCorrections || []) {
       if (!chargeMap[corr.placement_id]) chargeMap[corr.placement_id] = {};
-      for (const code of corr.charge_codes || []) {
+      for (const entry of corr.charge_codes || []) {
+        const code = LABEL_TO_CODE[entry] || entry; // handles both 'DA' and 'DailyAllowance'
         chargeMap[corr.placement_id][code] = (chargeMap[corr.placement_id][code] || 0) + 1;
       }
     }
@@ -213,6 +219,49 @@ router.post('/correction', async (req, res, next) => {
       }, { onConflict: 'placement_id,period_id' });
 
     res.json({ correction });
+  } catch (err) { next(err); }
+});
+
+// ── POST /payroll-approval/approve-correction/:id ─────────────────────────
+// Company approves a pending crew correction → sets status approved, locks sync
+router.post('/approve-correction/:id', async (req, res, next) => {
+  try {
+    const { user } = req;
+
+    const { data: correction, error: fetchErr } = await adminSupabase
+      .from('charge_corrections')
+      .select('id, status, correction_type, placement_id, period_id')
+      .eq('id', req.params.id)
+      .single();
+    if (fetchErr || !correction) throw new ApiError('Correction not found', 404);
+    if (correction.correction_type === 'COMPANY') throw new ApiError('Cannot approve company corrections this way', 400);
+
+    // Verify placement belongs to this company
+    const { data: company } = await adminSupabase
+      .from('companies').select('id').eq('carerix_company_id', user.carerix_company_id).maybeSingle();
+    if (!company) throw new ApiError('Company not found', 404);
+    const { data: placement } = await adminSupabase
+      .from('placements').select('id').eq('id', correction.placement_id).eq('company_id', company.id).maybeSingle();
+    if (!placement) throw new ApiError('Forbidden', 403);
+
+    // Approve
+    const { error } = await adminSupabase
+      .from('charge_corrections')
+      .update({ status: 'approved', reviewed_by: user.id })
+      .eq('id', req.params.id);
+    if (error) throw new ApiError(error.message);
+
+    // Lock sync
+    await adminSupabase.from('roster_period_status').upsert({
+      placement_id: correction.placement_id,
+      period_id: correction.period_id,
+      sync_locked: true,
+      sync_locked_at: new Date().toISOString(),
+      sync_locked_by: user.id,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'placement_id,period_id' });
+
+    res.json({ approved: true, id: req.params.id });
   } catch (err) { next(err); }
 });
 
