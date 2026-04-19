@@ -95,18 +95,18 @@ export async function provisionCarerixSession(identity) {
       supabaseUserId = newUser.user.id;
     }
 
-    const { error: upsertErr } = await adminSupabase.from('user_profiles').upsert({
-      id:                     supabaseUserId,
-      auth_source:            'carerix',
-      role:                   identity.platformRole,
-      display_name:           identity.fullName,
-      email:                  identity.email,
-      carerix_user_id:        identity.carerixUserId || '',
-      carerix_company_id:     identity.carerixCompanyId,
-      carerix_contact_id:     identity.carerixContactId,
-      carerix_last_synced_at: new Date().toISOString(),
-      is_active:              true,
-    }, { onConflict: 'id' });
+    // Use SECURITY DEFINER RPC to bypass RLS entirely
+    const { error: upsertErr } = await adminSupabase.rpc('upsert_user_profile', {
+      p_id:                 supabaseUserId,
+      p_auth_source:        'carerix',
+      p_role:               identity.platformRole,
+      p_display_name:       identity.fullName,
+      p_email:              identity.email,
+      p_carerix_user_id:    identity.carerixUserId || null,
+      p_carerix_company_id: identity.carerixCompanyId || null,
+      p_carerix_contact_id: identity.carerixContactId || null,
+      p_is_active:          true,
+    });
     if (upsertErr) throw new Error(`Failed to create user profile: ${upsertErr.message}`);
   }
 
