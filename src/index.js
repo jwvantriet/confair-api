@@ -21,6 +21,7 @@ import payrollRosterRoutes from './routes/payroll_roster.js';
 import diagnosticsRoutes     from './routes/diagnostics.js';
 import confairExpenseRoutes  from './routes/confair_expense.js';
 import expenseRoutes         from './routes/expenses.js';
+import payrollApprovalRoutes from './routes/payroll_approval.js';
 
 const app = express();
 
@@ -65,6 +66,7 @@ app.use('/carerix',     carerixRoutes);
 app.use('/cx-pub',       carerixPublicRoutes);
 app.use('/confair-expense', confairExpenseRoutes);
 app.use('/expenses',         expenseRoutes);
+app.use('/payroll-approval', payrollApprovalRoutes);
 app.use('/invoice',      invoiceRoutes);
 app.use('/roster',      rosterRoutes);
 app.use('/payroll-roster', payrollRosterRoutes);
