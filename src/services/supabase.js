@@ -46,13 +46,12 @@ export async function provisionCarerixSession(identity) {
     existing = data;
   }
 
-  // Fallback: look up by email (handles case where carerixUserId was empty on first login)
+  // Fallback: look up by email case-insensitively (handles case where carerixUserId was empty on first login)
   if (!existing && identity.email) {
     const { data } = await adminSupabase
       .from('user_profiles')
       .select('id')
-      .eq('email', identity.email)
-      .eq('auth_source', 'carerix')
+      .ilike('email', identity.email.trim())
       .maybeSingle();
     existing = data;
   }
@@ -61,10 +60,12 @@ export async function provisionCarerixSession(identity) {
 
   if (existing) {
     supabaseUserId = existing.id;
-    // Only update non-role fields — don't overwrite manually assigned roles
+    // Update non-role fields — don't overwrite manually assigned roles
+    // Also populate carerix_user_id if it was missing (fixes future lookups)
     await adminSupabase.from('user_profiles').update({
       display_name:           identity.fullName,
       email:                  identity.email,
+      carerix_user_id:        identity.carerixUserId || undefined,
       carerix_company_id:     identity.carerixCompanyId,
       carerix_last_synced_at: new Date().toISOString(),
     }).eq('id', supabaseUserId);
