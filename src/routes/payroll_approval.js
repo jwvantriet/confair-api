@@ -1,8 +1,4 @@
 // payroll_approval.js — Company "Payroll Approval" view
-// GET /payroll-approval/summary/:periodId   → all placements for the company with charge totals
-// GET /payroll-approval/roster/:placementId/:periodId → day-by-day roster for one placement
-// POST /payroll-approval/correction         → company adds a correction (auto-approved, locks sync)
-
 import { Router } from 'express';
 import { requireAuth, requireCompanyOrAbove } from '../middleware/auth.js';
 import { adminSupabase } from '../services/supabase.js';
@@ -11,7 +7,7 @@ import { ApiError } from '../middleware/errorHandler.js';
 const router = Router();
 router.use(requireAuth, requireCompanyOrAbove);
 
-// ── GET /payroll-approval/summary/:periodId ────────────────────────────────────
+// ── GET /payroll-approval/summary/:periodId ────────────────────────────────
 router.get('/summary/:periodId', async (req, res, next) => {
   try {
     const { user } = req;
@@ -19,7 +15,9 @@ router.get('/summary/:periodId', async (req, res, next) => {
 
     // Resolve company
     const { data: company } = await adminSupabase
-      .from('companies').select('id').eq('carerix_company_id', user.carerix_company_id).maybeSingle();
+      .from('companies').select('id')
+      .eq('carerix_company_id', user.carerix_company_id)
+      .maybeSingle();
     if (!company) throw new ApiError('Company not found', 404);
 
     // All active placements for this company
@@ -41,69 +39,36 @@ router.get('/summary/:periodId', async (req, res, next) => {
       .eq('period_id', periodId)
       .in('placement_id', placementIds);
 
-    // Roster period status (sync_locked, rotation dates)
+    // Roster period status (sync lock)
     const { data: statuses } = await adminSupabase
       .from('roster_period_status')
       .select('placement_id, sync_locked, sync_locked_at, status')
       .eq('period_id', periodId)
       .in('placement_id', placementIds);
 
-    // Rotation start/end from roster_days
-    const { data: rotationBounds } = await adminSupabase.rpc('get_rotation_bounds', {
-      p_period_id:     periodId,
-      p_placement_ids: placementIds,
-    }).catch(() => ({ data: null }));
-
-    // Total BLH from roster_days activities
-    const { data: rosterDays } = await adminSupabase
-      .from('roster_days')
-      .select('placement_id, activities')
-      .eq('period_id', periodId)
-      .in('placement_id', placementIds);
-
-    // Build lookup maps
-    const chargeMap  = {};
-    const statusMap  = {};
-    const boundsMap  = {};
-    const blhMap     = {};
-
+    // Build charge map: placementId → chargeCode → total quantity
+    const chargeMap = {};
     for (const c of charges || []) {
-      if (!chargeMap[c.placement_id]) chargeMap[c.placement_id] = {};
       const code = c.charge_types?.code;
-      if (code) chargeMap[c.placement_id][code] = (chargeMap[c.placement_id][code] || 0) + Number(c.quantity);
+      if (!code) continue;
+      if (!chargeMap[c.placement_id]) chargeMap[c.placement_id] = {};
+      chargeMap[c.placement_id][code] = (chargeMap[c.placement_id][code] || 0) + Number(c.quantity);
     }
+
+    // Build status map
+    const statusMap = {};
     for (const s of statuses || []) statusMap[s.placement_id] = s;
 
-    if (Array.isArray(rotationBounds)) {
-      for (const b of rotationBounds) boundsMap[b.placement_id] = b;
-    }
-
-    // Compute total BLH per placement from activities JSON
-    for (const day of rosterDays || []) {
-      const acts = day.activities || [];
-      let blh = 0;
-      for (const a of acts) {
-        if (a?.ActivityType?.toUpperCase() === 'FLIGHT' && a.aBLH) {
-          const parts = String(a.aBLH).split(':');
-          if (parts.length === 2) blh += parseInt(parts[0]) + parseInt(parts[1]) / 60;
-        }
-      }
-      blhMap[day.placement_id] = (blhMap[day.placement_id] || 0) + blh;
-    }
-
+    // Build response — field names match the frontend interface
     const result = placements.map(p => ({
-      id:           p.id,
-      crew_id:      p.crew_id,
-      full_name:    p.full_name,
+      placementId:   p.id,
+      crewId:        p.crew_id,
+      displayName:   p.full_name,
       qualification: p.qualification,
       active_roles:  p.active_roles,
       crew_group:    p.crew_group,
       sync_locked:   statusMap[p.id]?.sync_locked || false,
       sync_locked_at: statusMap[p.id]?.sync_locked_at || null,
-      status:        statusMap[p.id]?.status || null,
-      total_blh:     Math.round((blhMap[p.id] || 0) * 100) / 100,
-      start_period:  boundsMap[p.id]?.start_period || null,
-      end_period:    boundsMap[p.id]?.end_period   || null,
       charges: {
         DailyAllowance:      chargeMap[p.id]?.DailyAllowance      || 0,
         AvailabilityPremium: chargeMap[p.id]?.AvailabilityPremium || 0,
@@ -118,7 +83,7 @@ router.get('/summary/:periodId', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ── GET /payroll-approval/roster/:placementId/:periodId ───────────────────────
+// ── GET /payroll-approval/roster/:placementId/:periodId ────────────────────
 router.get('/roster/:placementId/:periodId', async (req, res, next) => {
   try {
     const { user } = req;
@@ -126,12 +91,16 @@ router.get('/roster/:placementId/:periodId', async (req, res, next) => {
 
     // Verify this placement belongs to the user's company
     const { data: company } = await adminSupabase
-      .from('companies').select('id').eq('carerix_company_id', user.carerix_company_id).maybeSingle();
+      .from('companies').select('id')
+      .eq('carerix_company_id', user.carerix_company_id)
+      .maybeSingle();
     if (!company) throw new ApiError('Company not found', 404);
 
     const { data: placement } = await adminSupabase
-      .from('placements').select('id, crew_id, full_name, crew_nia')
-      .eq('id', placementId).eq('company_id', company.id).maybeSingle();
+      .from('placements').select('id')
+      .eq('id', placementId)
+      .eq('company_id', company.id)
+      .maybeSingle();
     if (!placement) throw new ApiError('Placement not found or access denied', 404);
 
     // Roster days with activities
@@ -152,36 +121,50 @@ router.get('/roster/:placementId/:periodId', async (req, res, next) => {
     // Company corrections for this placement/period
     const { data: corrections } = await adminSupabase
       .from('charge_corrections')
-      .select('id, correction_date, status, charge_codes, blh_hhmm, reason, attachment_url, created_at')
+      .select('id, correction_date, status, charge_codes, blh_hhmm, reason, created_at')
       .eq('placement_id', placementId)
       .eq('period_id', periodId)
       .order('correction_date');
 
-    res.json({ rosterDays: rosterDays || [], chargeItems: chargeItems || [], corrections: corrections || [] });
+    res.json({
+      rosterDays:  rosterDays  || [],
+      chargeItems: chargeItems || [],
+      corrections: corrections || [],
+    });
   } catch (err) { next(err); }
 });
 
-// ── POST /payroll-approval/correction ─────────────────────────────────────────
-// Company submits a correction → immediately 'approved', locks sync for this placement/period
+// ── POST /payroll-approval/correction ─────────────────────────────────────
 router.post('/correction', async (req, res, next) => {
   try {
     const { user } = req;
-    const { placement_id, period_id, correction_date, charge_codes, blh_hhmm, reason, attachment_url, attachment_name } = req.body;
+    const { placement_id, period_id, correction_date, charge_codes, blh_hhmm, reason } = req.body;
 
-    if (!placement_id || !period_id || !correction_date) {
+    if (!placement_id || !period_id || !correction_date)
       throw new ApiError('placement_id, period_id and correction_date are required', 400);
-    }
 
     // Verify ownership
     const { data: company } = await adminSupabase
-      .from('companies').select('id').eq('carerix_company_id', user.carerix_company_id).maybeSingle();
+      .from('companies').select('id')
+      .eq('carerix_company_id', user.carerix_company_id)
+      .maybeSingle();
     if (!company) throw new ApiError('Company not found', 404);
 
     const { data: placement } = await adminSupabase
-      .from('placements').select('id').eq('id', placement_id).eq('company_id', company.id).maybeSingle();
+      .from('placements').select('id')
+      .eq('id', placement_id)
+      .eq('company_id', company.id)
+      .maybeSingle();
     if (!placement) throw new ApiError('Placement not found or access denied', 404);
 
-    // Insert correction — status is immediately 'approved'
+    // BLH decimal conversion
+    let blh_decimal = null;
+    if (blh_hhmm) {
+      const parts = blh_hhmm.split(':');
+      if (parts.length === 2) blh_decimal = Math.round((parseInt(parts[0]) + parseInt(parts[1]) / 60) * 100) / 100;
+    }
+
+    // Insert correction — immediately approved
     const { data: correction, error } = await adminSupabase
       .from('charge_corrections')
       .insert({
@@ -191,11 +174,9 @@ router.post('/correction', async (req, res, next) => {
         correction_type: 'COMPANY',
         charge_codes:    charge_codes || [],
         blh_hhmm:        blh_hhmm || null,
-        blh_decimal:     blh_hhmm ? (() => { const p = blh_hhmm.split(':'); return Math.round((parseInt(p[0]) + parseInt(p[1]||0)/60)*100)/100; })() : null,
+        blh_decimal,
         reason:          reason || 'Company correction',
         status:          'approved',
-        attachment_url:  attachment_url || null,
-        attachment_name: attachment_name || null,
         is_rotation_end_correction: false,
       })
       .select()
@@ -206,7 +187,8 @@ router.post('/correction', async (req, res, next) => {
     await adminSupabase
       .from('roster_period_status')
       .upsert({
-        placement_id, period_id,
+        placement_id,
+        period_id,
         sync_locked:    true,
         sync_locked_at: new Date().toISOString(),
         sync_locked_by: user.id,
