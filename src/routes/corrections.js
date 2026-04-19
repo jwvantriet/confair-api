@@ -139,7 +139,7 @@ router.post('/upload', requireAuth, async (req, res, next) => {
 });
 
 
-// DELETE /corrections/:id — placement can delete own pending corrections
+// DELETE /corrections/:id — placement (own pending) or company_admin (own approved company corrections)
 router.delete('/:id', async (req, res, next) => {
   try {
     const { user } = req;
@@ -147,24 +147,36 @@ router.delete('/:id', async (req, res, next) => {
     // Fetch correction
     const { data: correction, error: fetchErr } = await adminSupabase
       .from('charge_corrections')
-      .select('id, status, placement_id, attachment_url')
+      .select('id, status, correction_type, placement_id, period_id, attachment_url')
       .eq('id', req.params.id)
       .single();
 
     if (fetchErr || !correction) throw new ApiError('Correction not found', 404);
 
-    // Only pending corrections can be deleted
-    if (correction.status !== 'pending') {
-      throw new ApiError('Only pending corrections can be deleted', 400);
-    }
-
-    // Verify ownership (placement role)
     if (user.role === 'placement') {
+      // Placement: can only delete their own pending corrections
+      if (correction.status !== 'pending') {
+        throw new ApiError('Only pending corrections can be deleted', 400);
+      }
       const { data: placement } = await adminSupabase
         .from('placements').select('id').eq('user_profile_id', user.id).maybeSingle();
       if (!placement || placement.id !== correction.placement_id) {
         throw new ApiError('Forbidden', 403);
       }
+    } else if (user.role === 'company_admin' || user.role === 'company_user') {
+      // Company: can only delete their own COMPANY-type corrections
+      if (correction.correction_type !== 'COMPANY') {
+        throw new ApiError('Company users can only delete company corrections', 403);
+      }
+      // Verify placement belongs to this company
+      const { data: company } = await adminSupabase
+        .from('companies').select('id').eq('carerix_company_id', user.carerix_company_id).maybeSingle();
+      if (!company) throw new ApiError('Company not found', 404);
+      const { data: placement } = await adminSupabase
+        .from('placements').select('id').eq('id', correction.placement_id).eq('company_id', company.id).maybeSingle();
+      if (!placement) throw new ApiError('Forbidden', 403);
+    } else if (!user.role?.startsWith('agency_')) {
+      throw new ApiError('Forbidden', 403);
     }
 
     // Delete the correction
@@ -174,6 +186,26 @@ router.delete('/:id', async (req, res, next) => {
       .eq('id', req.params.id);
 
     if (error) throw new ApiError(error.message);
+
+    // If a company correction was deleted, check if sync should be unlocked
+    // Unlock only if no remaining COMPANY corrections exist for this placement/period
+    if (correction.correction_type === 'COMPANY' && correction.period_id) {
+      const { data: remaining } = await adminSupabase
+        .from('charge_corrections')
+        .select('id')
+        .eq('placement_id', correction.placement_id)
+        .eq('period_id', correction.period_id)
+        .eq('correction_type', 'COMPANY')
+        .limit(1);
+
+      if (!remaining?.length) {
+        await adminSupabase
+          .from('roster_period_status')
+          .update({ sync_locked: false, sync_locked_at: null, sync_locked_by: null })
+          .eq('placement_id', correction.placement_id)
+          .eq('period_id', correction.period_id);
+      }
+    }
 
     logger.info('Correction deleted', { id: req.params.id, by: user.id });
     res.json({ deleted: true, id: req.params.id });
