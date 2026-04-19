@@ -57,6 +57,20 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
 
     for (const placement of placements) {
       try {
+        // Check if sync is locked for this placement/period (company has approved corrections)
+        const { data: lockStatus } = await adminSupabase
+          .from('roster_period_status')
+          .select('sync_locked')
+          .eq('placement_id', placement.id)
+          .eq('period_id', periodId)
+          .maybeSingle();
+
+        if (lockStatus?.sync_locked) {
+          results.push({ placement: placement.full_name, days: 0, items: 0, skipped: true, reason: 'sync locked by company approval' });
+          synced++;
+          continue;
+        }
+
         const rosters      = await fetchRostersForCrew(periodFrom, periodTo, placement.crew_id);
         const items        = rosterItemsList(rosters);
         const rows         = mapRosterToRows(items, placement.crew_id, placement.crew_nia);
