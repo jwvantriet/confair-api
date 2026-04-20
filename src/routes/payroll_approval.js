@@ -43,10 +43,10 @@ router.get('/summary/:periodId', async (req, res, next) => {
       .eq('period_id', periodId)
       .in('placement_id', placementIds);
 
-    // Roster period status (sync lock)
+    // Roster period status (sync lock + workflow status)
     const { data: statuses } = await adminSupabase
       .from('roster_period_status')
-      .select('placement_id, sync_locked, sync_locked_at, status')
+      .select('placement_id, sync_locked, sync_locked_at, status, approved_by_company_at')
       .eq('period_id', periodId)
       .in('placement_id', placementIds);
 
@@ -121,6 +121,42 @@ router.get('/summary/:periodId', async (req, res, next) => {
       }
     }
 
+    // Compute OT per placement (sum of overtime per rotation, > 65h threshold)
+    const otMap = {};
+    for (const [pid, days] of Object.entries(daysByPlacement)) {
+      const hhmmToDec2 = (h) => { const p=(h||'').split(':'); return p.length===2?parseInt(p[0])+parseInt(p[1])/60:0; };
+      let totalOT = 0;
+      let rotBLH2 = 0;
+      let inRot = false;
+      for (const d of days) {
+        if (d.is_payable) {
+          inRot = true;
+          const acts = Array.isArray(d.activities) ? d.activities : [];
+          for (const a of acts) {
+            if (a?.aBLH && a.ActivityType?.toUpperCase() === 'FLIGHT') rotBLH2 += hhmmToDec2(a.aBLH);
+          }
+        } else if (inRot) {
+          if (rotBLH2 > 65) totalOT += Math.round((rotBLH2 - 65) * 100) / 100;
+          rotBLH2 = 0; inRot = false;
+        }
+      }
+      if (inRot && rotBLH2 > 65) totalOT += Math.round((rotBLH2 - 65) * 100) / 100;
+      otMap[pid] = Math.round(totalOT * 100) / 100;
+    }
+
+    // Count pending crew corrections per placement
+    const { data: pendingCorrs } = await adminSupabase
+      .from('charge_corrections')
+      .select('placement_id')
+      .eq('period_id', periodId)
+      .eq('status', 'pending')
+      .neq('correction_type', 'COMPANY')
+      .in('placement_id', placementIds);
+    const pendingCorrMap = {};
+    for (const pc of pendingCorrs || []) {
+      pendingCorrMap[pc.placement_id] = (pendingCorrMap[pc.placement_id] || 0) + 1;
+    }
+
     // Build status map
     const statusMap = {};
     for (const s of statuses || []) statusMap[s.placement_id] = s;
@@ -135,7 +171,10 @@ router.get('/summary/:periodId', async (req, res, next) => {
       crew_group:    p.crew_group,
       sync_locked:   statusMap[p.id]?.sync_locked || false,
       sync_locked_at: statusMap[p.id]?.sync_locked_at || null,
+      status:        statusMap[p.id]?.status || 'draft',
       rotation:      rotationMap[p.id] || null,
+      ot:            otMap[p.id] || 0,
+      pendingCorrections: pendingCorrMap[p.id] || 0,
       charges: {
         DailyAllowance:      chargeMap[p.id]?.DailyAllowance      || 0,
         AvailabilityPremium: chargeMap[p.id]?.AvailabilityPremium || 0,
@@ -267,6 +306,51 @@ router.post('/correction', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── POST /payroll-approval/approve-line/:placementId/:periodId ────────────────
+// Company approves a placement line: client_check → contractor_check
+router.post('/approve-line/:placementId/:periodId', async (req, res, next) => {
+  try {
+    const { user } = req;
+    const { placementId, periodId } = req.params;
+
+    // Verify placement belongs to this company (or agency can approve any)
+    if (!user.role?.startsWith('agency_')) {
+      const { data: company } = await adminSupabase
+        .from('companies').select('id').eq('carerix_company_id', user.carerix_company_id).maybeSingle();
+      if (!company) throw new ApiError('Company not found', 404);
+      const { data: placement } = await adminSupabase
+        .from('placements').select('id').eq('id', placementId).eq('company_id', company.id).maybeSingle();
+      if (!placement) throw new ApiError('Forbidden', 403);
+    }
+
+    const { data: existing } = await adminSupabase
+      .from('roster_period_status')
+      .select('status')
+      .eq('placement_id', placementId)
+      .eq('period_id', periodId)
+      .maybeSingle();
+
+    if (!existing) {
+      // Create the status record as contractor_check
+      await adminSupabase.from('roster_period_status').insert({
+        placement_id: placementId, period_id: periodId,
+        status: 'contractor_check',
+        approved_by_company_at: new Date().toISOString(),
+      });
+    } else if (existing.status === 'client_check' || existing.status === 'draft') {
+      await adminSupabase.from('roster_period_status').update({
+        status: 'contractor_check',
+        approved_by_company_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }).eq('placement_id', placementId).eq('period_id', periodId);
+    } else {
+      throw new ApiError(`Cannot approve from status: ${existing.status}`, 400);
+    }
+
+    res.json({ approved: true, placementId, periodId, newStatus: 'contractor_check' });
+  } catch (err) { next(err); }
+});
+
 // ── POST /payroll-approval/approve-correction/:id ─────────────────────────
 // Company approves a pending crew correction → sets status approved, locks sync
 router.post('/approve-correction/:id', async (req, res, next) => {
@@ -306,6 +390,18 @@ router.post('/approve-correction/:id', async (req, res, next) => {
       updated_at: new Date().toISOString(),
     }, { onConflict: 'placement_id,period_id' });
 
+    // Auto-transition to definite if no more pending crew corrections remain
+    const { data: stillPending } = await adminSupabase
+      .from('charge_corrections').select('id')
+      .eq('placement_id', correction.placement_id).eq('period_id', correction.period_id)
+      .eq('status', 'pending').neq('correction_type', 'COMPANY').limit(1);
+    if (!stillPending?.length) {
+      await adminSupabase.from('roster_period_status')
+        .update({ status: 'definite', finalized_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+        .eq('placement_id', correction.placement_id).eq('period_id', correction.period_id)
+        .in('status', ['contractor_correction']);
+    }
+
     res.json({ approved: true, id: req.params.id });
   } catch (err) { next(err); }
 });
@@ -338,6 +434,18 @@ router.post('/decline-correction/:id', async (req, res, next) => {
       .update({ status: 'declined', reviewed_by: user.id, declined_reason: reason || null })
       .eq('id', req.params.id);
     if (error) throw new ApiError(error.message);
+
+    // Auto-transition to definite if no more pending crew corrections remain
+    const { data: stillPendingD } = await adminSupabase
+      .from('charge_corrections').select('id')
+      .eq('placement_id', correction.placement_id).eq('period_id', correction.period_id)
+      .eq('status', 'pending').neq('correction_type', 'COMPANY').limit(1);
+    if (!stillPendingD?.length) {
+      await adminSupabase.from('roster_period_status')
+        .update({ status: 'definite', finalized_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+        .eq('placement_id', correction.placement_id).eq('period_id', correction.period_id)
+        .in('status', ['contractor_correction']);
+    }
 
     res.json({ declined: true, id: req.params.id });
   } catch (err) { next(err); }
