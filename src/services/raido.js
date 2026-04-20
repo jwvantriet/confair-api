@@ -202,6 +202,8 @@ export function buildDailySummary(rows) {
     if (!perCrew.has(crewId)) {
       perCrew.set(crewId, {
         crewId, crewName, crewNia,
+        qualification: info.activities[0]?.qualification || null,
+        activeRoles: info.activities[0]?.active_roles || null,
         days: new Map(),
         totals: {
           DailyAllowance: 0, AvailabilityPremium: 0, YearsWithClient: 0,
@@ -329,6 +331,15 @@ export function mapRosterToRows(rosterItems, crewId, crewNia) {
     const lastName    = crewObj.Lastname  || crewObj.LastName  || '';
     const itemCrewName = `${firstName} ${lastName}`.trim();
     const itemCrewNia  = string(crewObj.Base || crewNia || '').trim().toUpperCase();
+    // Qualification and active role — try common RAIDO field names
+    const itemQualification = string(
+      crewObj.Qualification || crewObj.qualification ||
+      crewObj.Rank || crewObj.rank || ''
+    ).trim() || null;
+    const itemActiveRoles = string(
+      crewObj.ActiveRole || crewObj.ActiveRoles || crewObj.activeRoles ||
+      crewObj.Role || crewObj.Roles || ''
+    ).trim() || null;
 
     // Filter to only the requested crew when crewId is provided
     if (crewId && itemCrewId && itemCrewId.toUpperCase() !== crewId.toUpperCase()) continue;
@@ -422,6 +433,8 @@ export function mapRosterToRows(rosterItems, crewId, crewNia) {
           crew_id:         itemCrewId || crewId || '',
           crew_nia:        itemCrewNia || crewNia || '',
           crew_name:       itemCrewName,
+          qualification:   itemQualification,
+          active_roles:    itemActiveRoles,
           ActivityCode:    string(act.ActivityCode || act.Code || ''),
           ActivityType:    activityType,
           ActivitySubType: string(act.ActivitySubType || act.SubType || ''),
