@@ -13,20 +13,24 @@ router.get('/summary/:periodId', async (req, res, next) => {
     const { user } = req;
     const { periodId } = req.params;
 
-    // Resolve company
-    const { data: company } = await adminSupabase
-      .from('companies').select('id')
-      .eq('carerix_company_id', user.carerix_company_id)
-      .maybeSingle();
-    if (!company) throw new ApiError('Company not found', 404);
-
-    // All active placements for this company
-    const { data: placements, error: pErr } = await adminSupabase
+    // Agency sees all placements; company sees only their own
+    const isAgency = user.role?.startsWith('agency_');
+    let placementsQuery = adminSupabase
       .from('placements')
       .select('id, crew_id, full_name, qualification, active_roles, crew_group')
-      .eq('company_id', company.id)
       .eq('is_active', true)
       .order('full_name');
+
+    if (!isAgency) {
+      const { data: company } = await adminSupabase
+        .from('companies').select('id')
+        .eq('carerix_company_id', user.carerix_company_id)
+        .maybeSingle();
+      if (!company) throw new ApiError('Company not found', 404);
+      placementsQuery = placementsQuery.eq('company_id', company.id);
+    }
+
+    const { data: placements, error: pErr } = await placementsQuery;
     if (pErr) throw new ApiError(pErr.message);
     if (!placements?.length) return res.json({ placements: [] });
 
@@ -152,19 +156,20 @@ router.get('/roster/:placementId/:periodId', async (req, res, next) => {
     const { user } = req;
     const { placementId, periodId } = req.params;
 
-    // Verify this placement belongs to the user's company
-    const { data: company } = await adminSupabase
-      .from('companies').select('id')
-      .eq('carerix_company_id', user.carerix_company_id)
-      .maybeSingle();
-    if (!company) throw new ApiError('Company not found', 404);
-
-    const { data: placement } = await adminSupabase
-      .from('placements').select('id')
-      .eq('id', placementId)
-      .eq('company_id', company.id)
-      .maybeSingle();
-    if (!placement) throw new ApiError('Placement not found or access denied', 404);
+    // Agency can access any placement; company can only access their own
+    if (!user.role?.startsWith('agency_')) {
+      const { data: company } = await adminSupabase
+        .from('companies').select('id')
+        .eq('carerix_company_id', user.carerix_company_id)
+        .maybeSingle();
+      if (!company) throw new ApiError('Company not found', 404);
+      const { data: placement } = await adminSupabase
+        .from('placements').select('id')
+        .eq('id', placementId)
+        .eq('company_id', company.id)
+        .maybeSingle();
+      if (!placement) throw new ApiError('Placement not found or access denied', 404);
+    }
 
     // Roster days with activities
     const { data: rosterDays } = await adminSupabase
