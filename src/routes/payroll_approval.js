@@ -46,19 +46,58 @@ router.get('/summary/:periodId', async (req, res, next) => {
       .eq('period_id', periodId)
       .in('placement_id', placementIds);
 
-    // Fetch all approved corrections (both company and crew) — add to charge totals
-    const { data: approvedCorrections } = await adminSupabase
-      .from('charge_corrections')
-      .select('placement_id, charge_codes, correction_type')
-      .eq('period_id', periodId)
-      .eq('status', 'approved')
-      .in('placement_id', placementIds);
+    // Fetch approved corrections + roster_days in parallel
+    const [{ data: approvedCorrections }, { data: allRosterDays }] = await Promise.all([
+      adminSupabase
+        .from('charge_corrections')
+        .select('placement_id, charge_codes, correction_type')
+        .eq('period_id', periodId)
+        .eq('status', 'approved')
+        .in('placement_id', placementIds),
+      adminSupabase
+        .from('roster_days')
+        .select('placement_id, roster_date, is_payable, activities')
+        .eq('period_id', periodId)
+        .in('placement_id', placementIds)
+        .order('roster_date'),
+    ]);
 
     // Crew corrections store labels (DA/AP/PD), company corrections store codes
     const LABEL_TO_CODE = {
       DA: 'DailyAllowance', AP: 'AvailabilityPremium', YWC: 'YearsWithClient',
       PD: 'PerDiem', HD: 'SoldOffDay', BD: 'BODDays',
     };
+
+    // Compute rotation BLH per placement — find the highest-BLH rotation in the period
+    const rotationMap = {};
+    const daysByPlacement = {};
+    for (const rd of allRosterDays || []) {
+      if (!daysByPlacement[rd.placement_id]) daysByPlacement[rd.placement_id] = [];
+      daysByPlacement[rd.placement_id].push(rd);
+    }
+    for (const [pid, days] of Object.entries(daysByPlacement)) {
+      let rotStart = null, rotBLH = 0, bestRot = null;
+      const hhmmToDec = (h) => { const p = (h||'').split(':'); return p.length===2 ? parseInt(p[0]) + parseInt(p[1])/60 : 0; };
+      for (let i = 0; i < days.length; i++) {
+        const d = days[i];
+        if (d.is_payable) {
+          if (!rotStart) rotStart = d.roster_date;
+          const acts = Array.isArray(d.activities) ? d.activities : [];
+          for (const a of acts) {
+            if (a?.aBLH && a.ActivityType?.toUpperCase() === 'FLIGHT') rotBLH += hhmmToDec(a.aBLH);
+          }
+        } else if (rotStart) {
+          const endDate = days[i - 1]?.roster_date || rotStart;
+          if (!bestRot || rotBLH > bestRot.blh) bestRot = { blh: Math.round(rotBLH*100)/100, start: rotStart, end: endDate };
+          rotStart = null; rotBLH = 0;
+        }
+      }
+      if (rotStart) {
+        const endDate = days[days.length-1]?.roster_date || rotStart;
+        if (!bestRot || rotBLH > bestRot.blh) bestRot = { blh: Math.round(rotBLH*100)/100, start: rotStart, end: endDate };
+      }
+      rotationMap[pid] = bestRot;
+    }
 
     // Build charge map: placementId → chargeCode → total quantity
     const chargeMap = {};
@@ -73,7 +112,7 @@ router.get('/summary/:periodId', async (req, res, next) => {
     for (const corr of approvedCorrections || []) {
       if (!chargeMap[corr.placement_id]) chargeMap[corr.placement_id] = {};
       for (const entry of corr.charge_codes || []) {
-        const code = LABEL_TO_CODE[entry] || entry; // handles both 'DA' and 'DailyAllowance'
+        const code = LABEL_TO_CODE[entry] || entry;
         chargeMap[corr.placement_id][code] = (chargeMap[corr.placement_id][code] || 0) + 1;
       }
     }
@@ -92,6 +131,7 @@ router.get('/summary/:periodId', async (req, res, next) => {
       crew_group:    p.crew_group,
       sync_locked:   statusMap[p.id]?.sync_locked || false,
       sync_locked_at: statusMap[p.id]?.sync_locked_at || null,
+      rotation:      rotationMap[p.id] || null,
       charges: {
         DailyAllowance:      chargeMap[p.id]?.DailyAllowance      || 0,
         AvailabilityPremium: chargeMap[p.id]?.AvailabilityPremium || 0,
