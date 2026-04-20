@@ -452,4 +452,35 @@ router.post('/decline-correction/:id', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── POST /payroll-approval/reset-status/:placementId/:periodId ────────────
+// Agency only: move a placement to any status without touching sync_locked
+router.post('/reset-status/:placementId/:periodId', async (req, res, next) => {
+  try {
+    const { user } = req;
+    if (!user.role?.startsWith('agency_')) throw new ApiError('Agency only', 403);
+
+    const { placementId, periodId } = req.params;
+    const { status } = req.body;
+    const VALID = ['draft','client_check','contractor_check','contractor_correction','definite','contractor_approved'];
+    if (!VALID.includes(status)) throw new ApiError('Invalid status', 400);
+
+    // Check if record exists
+    const { data: existing } = await adminSupabase
+      .from('roster_period_status').select('id')
+      .eq('placement_id', placementId).eq('period_id', periodId).maybeSingle();
+
+    if (existing) {
+      // Update ONLY status — leave sync_locked, sync_locked_at, sync_locked_by untouched
+      await adminSupabase.from('roster_period_status')
+        .update({ status, updated_at: new Date().toISOString() })
+        .eq('placement_id', placementId).eq('period_id', periodId);
+    } else {
+      await adminSupabase.from('roster_period_status')
+        .insert({ placement_id: placementId, period_id: periodId, status });
+    }
+
+    res.json({ reset: true, status, placementId, periodId });
+  } catch (err) { next(err); }
+});
+
 export default router;
