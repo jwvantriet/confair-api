@@ -80,6 +80,16 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
 
         if (!crewSummary?.days?.length) { results.push({ placement: placement.full_name, days: 0, items: 0 }); synced++; continue; }
 
+        // Write back qualification/active_roles from RAIDO if available
+        const qual = crewSummary.qualification;
+        const roles = crewSummary.activeRoles;
+        if (qual || roles) {
+          await adminSupabase.from('placements').update({
+            ...(qual  ? { qualification: qual }  : {}),
+            ...(roles ? { active_roles: roles }  : {}),
+          }).eq('id', placement.id);
+        }
+
         let itemsCreated = 0;
 
         for (const day of crewSummary.days) {
