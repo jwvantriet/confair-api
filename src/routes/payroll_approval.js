@@ -182,6 +182,7 @@ router.get('/summary/:periodId', async (req, res, next) => {
         PerDiem:             chargeMap[p.id]?.PerDiem             || 0,
         SoldOffDay:          chargeMap[p.id]?.SoldOffDay          || 0,
         BODDays:             chargeMap[p.id]?.BODDays             || 0,
+        Overtime:            chargeMap[p.id]?.Overtime            || 0,
       },
     }));
 
