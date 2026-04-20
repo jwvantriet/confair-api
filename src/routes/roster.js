@@ -127,6 +127,38 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
 
         results.push({ placement: placement.full_name, days: crewSummary.days.length, items: itemsCreated });
         synced++;
+
+        // Compute and write Overtime charge items for rotations exceeding 65h BLH
+        // Rotation = consecutive payable days; OT = (total flight BLH - 65) per rotation
+        const hhmmToDec = (h) => { const p = (h||'').split(':'); return p.length===2?parseInt(p[0])+parseInt(p[1])/60:0; };
+        const otCt = ctByCode['Overtime'];
+        if (otCt) {
+          let rotBLH = 0, rotStart = null, rotEndDay = null;
+          const flushRotation = async (endDate) => {
+            if (rotBLH > 65 && endDate) {
+              const otQty = Math.round((rotBLH - 65) * 100) / 100;
+              await adminSupabase.from('charge_items').upsert({
+                placement_id: placement.id, period_id: periodId,
+                charge_type_id: otCt.id, charge_date: endDate,
+                quantity: otQty, rate_amount: null, currency: 'USD', total_value: null, status: 'confirmed',
+              }, { onConflict: 'placement_id,charge_date,charge_type_id', returning: 'minimal' });
+            }
+          };
+          for (const day of crewSummary.days) {
+            if (day.isPayable) {
+              if (!rotStart) rotStart = day.date;
+              rotEndDay = day.date;
+              const acts = Array.isArray(day.activities) ? day.activities : [];
+              for (const a of acts) {
+                if (a?.aBLH && a.ActivityType?.toUpperCase() === 'FLIGHT') rotBLH += hhmmToDec(a.aBLH);
+              }
+            } else if (rotStart) {
+              await flushRotation(rotEndDay);
+              rotBLH = 0; rotStart = null; rotEndDay = null;
+            }
+          }
+          if (rotStart) await flushRotation(rotEndDay); // rotation reaching end of period
+        }
       } catch (e) {
         logger.error('Sync error', { placement: placement.full_name, error: e.message });
         errors++;
