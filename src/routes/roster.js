@@ -7,6 +7,7 @@ import { requireAuth, requireAgency, requireCompanyOrAbove } from '../middleware
 import { ApiError } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
 import { fetchRostersForCrew, rosterItemsList, mapRosterToRows, buildDailySummary, monthBounds, fetchActiveRolesForPeriod } from '../services/raido.js';
+import { fetchCarerixRatesForJob } from '../services/carerix.js';
 
 const router = Router();
 router.use(requireAuth);
@@ -41,7 +42,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
 
     const { data: placements } = await adminSupabase
       .from('placements')
-      .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, user_profile_id')
+      .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, carerix_job_id, user_profile_id')
       .not('crew_id', 'is', null);
 
     if (!placements?.length) return res.json({ message: 'No placements with crew_id configured', synced: 0 });
@@ -102,6 +103,41 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
 
         let itemsCreated = 0;
 
+        // Fetch live rates from Carerix (if placement has a carerix_job_id)
+        // Falls back to placement_rates table, then to null
+        let ratesByCode = {};
+        if (placement.carerix_job_id) {
+          try {
+            const carerixRateMap = await fetchCarerixRatesForJob(placement.carerix_job_id);
+            // Map carerix_type_id → charge code using chargeTypes
+            for (const ct of chargeTypes || []) {
+              if (ct.carerix_type_id && carerixRateMap[ct.carerix_type_id]) {
+                ratesByCode[ct.code] = carerixRateMap[ct.carerix_type_id];
+                // Persist to placement_rates for future use
+                await adminSupabase.from('placement_rates').upsert({
+                  placement_id: placement.id, charge_type_id: ct.id,
+                  amount: carerixRateMap[ct.carerix_type_id].amount,
+                  currency: carerixRateMap[ct.carerix_type_id].currency,
+                  fetched_at: new Date().toISOString(),
+                }, { onConflict: 'placement_id,charge_type_id' });
+              }
+            }
+            logger.info('Rates fetched from Carerix', { placement: placement.full_name, rateCount: Object.keys(ratesByCode).length });
+          } catch (e) {
+            logger.warn('Carerix rate fetch failed, using DB fallback', { placement: placement.full_name, error: e.message });
+          }
+        }
+        // Fallback: load from placement_rates table
+        if (!Object.keys(ratesByCode).length) {
+          const { data: storedRates } = await adminSupabase
+            .from('placement_rates').select('charge_type_id, amount, currency')
+            .eq('placement_id', placement.id);
+          for (const r of storedRates || []) {
+            const ct = (chargeTypes || []).find(c => c.id === r.charge_type_id);
+            if (ct) ratesByCode[ct.code] = { amount: Number(r.amount), currency: r.currency };
+          }
+        }
+
         for (const day of crewSummary.days) {
           // Upsert roster_day
           await adminSupabase.from('roster_days').upsert({
@@ -116,10 +152,14 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
             if (!qty) continue;
             const ct = ctByCode[chargeCode];
             if (!ct) continue;
+            const rateRow = ratesByCode[chargeCode];
+            const rate     = rateRow?.amount ?? null;
+            const currency = rateRow?.currency ?? 'USD';
+            const total    = rate != null ? Math.round(qty * rate * 100) / 100 : null;
             await adminSupabase.from('charge_items').upsert({
               placement_id: placement.id, period_id: periodId,
               charge_type_id: ct.id, charge_date: day.date,
-              quantity: qty, rate_amount: null, currency: 'USD', total_value: null, status: 'confirmed',
+              quantity: qty, rate_per_unit: rate, currency, total_amount: total, status: 'confirmed',
             }, { onConflict: 'placement_id,charge_date,charge_type_id', returning: 'minimal' });
             itemsCreated++;
           }
