@@ -531,36 +531,15 @@ router.get('/my-summary/:periodId', async (req, res, next) => {
     const { data: placement } = await adminSupabase.from('placements').select('id').eq('user_profile_id', req.user.id).maybeSingle();
     if (!placement) return res.status(404).json({ error: 'No placement found for this user' });
 
-    const [{ data: chargeItems }, { data: rosterDays }, { data: corrections }, { data: rosterStatus }, { data: companyCorrs }] = await Promise.all([
+    const [{ data: chargeItems }, { data: rosterDays }, { data: corrections }, { data: rosterStatus }] = await Promise.all([
       adminSupabase.from('charge_items').select('*, charge_types(code, label, sort_order)').eq('placement_id', placement.id).eq('period_id', periodId).order('charge_date'),
       adminSupabase.from('roster_days').select('roster_date, activities, is_payable').eq('placement_id', placement.id).eq('period_id', periodId).order('roster_date'),
       adminSupabase.from('charge_corrections').select('*, charge_types(code, label)').eq('placement_id', placement.id).eq('period_id', periodId).order('created_at', { ascending: false }),
       adminSupabase.from('roster_period_status').select('*').eq('placement_id', placement.id).eq('period_id', periodId).maybeSingle(),
-      adminSupabase.from('charge_corrections').select('correction_date, charge_codes').eq('placement_id', placement.id).eq('period_id', periodId).eq('correction_type', 'COMPANY').eq('status', 'approved'),
     ]);
 
-    // Charge type metadata for synthetic items from company corrections
-    const CHARGE_TYPE_META = {
-      DailyAllowance:      { code: 'DailyAllowance',      label: 'DA',  sort_order: 1 },
-      AvailabilityPremium: { code: 'AvailabilityPremium', label: 'AP',  sort_order: 2 },
-      YearsWithClient:     { code: 'YearsWithClient',     label: 'YWC', sort_order: 3 },
-      PerDiem:             { code: 'PerDiem',              label: 'PD',  sort_order: 4 },
-      SoldOffDay:          { code: 'SoldOffDay',           label: 'HD',  sort_order: 5 },
-      BODDays:             { code: 'BODDays',              label: 'BD',  sort_order: 6 },
-    };
-    const syntheticItems = (companyCorrs || []).flatMap(corr =>
-      (corr.charge_codes || []).filter(code => CHARGE_TYPE_META[code]).map(code => ({
-        charge_date: corr.correction_date,
-        quantity: 1,
-        total_amount: 0,
-        currency: 'EUR',
-        charge_types: CHARGE_TYPE_META[code],
-        _fromCompanyCorrection: true,
-      }))
-    );
-
     const rosterMap = Object.fromEntries((rosterDays || []).map(d => [d.roster_date, d]));
-    return res.json({ placement_id: placement.id, status: rosterStatus, chargeItems: [...(chargeItems || []), ...syntheticItems], rosterDays: rosterMap, corrections: corrections || [] });
+    return res.json({ placement_id: placement.id, status: rosterStatus, chargeItems: chargeItems || [], rosterDays: rosterMap, corrections: corrections || [] });
   } catch (err) { next(err); }
 });
 
@@ -575,45 +554,24 @@ router.get('/summary/:placementId/:periodId', async (req, res, next) => {
       if (!p || p.id !== placementId) throw new ApiError('Access denied', 403);
     }
 
-    const [{ data: chargeItems }, { data: rosterDays }, { data: corrections }, { data: rosterStatus }, { data: companyCorrs }] = await Promise.all([
+    const [{ data: chargeItems }, { data: rosterDays }, { data: corrections }, { data: rosterStatus }] = await Promise.all([
       adminSupabase.from('charge_items').select('*, charge_types(code, label, sort_order)').eq('placement_id', placementId).eq('period_id', periodId).order('charge_date'),
       adminSupabase.from('roster_days').select('roster_date, activities, is_payable').eq('placement_id', placementId).eq('period_id', periodId).order('roster_date'),
       adminSupabase.from('charge_corrections').select('*, charge_types(code, label)').eq('placement_id', placementId).eq('period_id', periodId).order('created_at', { ascending: false }),
       adminSupabase.from('roster_period_status').select('*').eq('placement_id', placementId).eq('period_id', periodId).maybeSingle(),
-      adminSupabase.from('charge_corrections').select('correction_date, charge_codes').eq('placement_id', placementId).eq('period_id', periodId).eq('correction_type', 'COMPANY').eq('status', 'approved'),
     ]);
-
-    const CHARGE_TYPE_META = {
-      DailyAllowance:      { code: 'DailyAllowance',      label: 'DA',  sort_order: 1 },
-      AvailabilityPremium: { code: 'AvailabilityPremium', label: 'AP',  sort_order: 2 },
-      YearsWithClient:     { code: 'YearsWithClient',     label: 'YWC', sort_order: 3 },
-      PerDiem:             { code: 'PerDiem',              label: 'PD',  sort_order: 4 },
-      SoldOffDay:          { code: 'SoldOffDay',           label: 'HD',  sort_order: 5 },
-      BODDays:             { code: 'BODDays',              label: 'BD',  sort_order: 6 },
-    };
-    const syntheticItems = (companyCorrs || []).flatMap(corr =>
-      (corr.charge_codes || []).filter(code => CHARGE_TYPE_META[code]).map(code => ({
-        charge_date: corr.correction_date,
-        quantity: 1,
-        total_amount: 0,
-        currency: 'EUR',
-        charge_types: CHARGE_TYPE_META[code],
-        _fromCompanyCorrection: true,
-      }))
-    );
-    const allChargeItems = [...(chargeItems || []), ...syntheticItems];
 
     // Build day map
     const rosterMap = Object.fromEntries((rosterDays || []).map(d => [d.roster_date, d]));
     const chargeByDate = {};
-    for (const ci of allChargeItems) {
+    for (const ci of chargeItems || []) {
       if (!chargeByDate[ci.charge_date]) chargeByDate[ci.charge_date] = [];
       chargeByDate[ci.charge_date].push(ci);
     }
 
     res.json({
       status: rosterStatus,
-      chargeItems: allChargeItems,
+      chargeItems: chargeItems || [],
       rosterDays: rosterMap,
       chargeByDate,
       corrections: corrections || [],
