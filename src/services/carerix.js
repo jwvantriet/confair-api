@@ -428,3 +428,111 @@ export async function fetchCarerixRatesForJob(carerixJobId) {
     return {};
   }
 }
+
+// ── Crew code → Carerix job matching ─────────────────────────────────────────
+
+/**
+ * Query all Carerix jobs and build a map of { "DAGF" → "jobId", ... }
+ * by inspecting employee.code1 / code2 / number for 4-letter crew codes.
+ */
+export async function buildCrewCodeToJobMap() {
+  const codeToJob = {};
+  let page = 0;
+  const size = 100;
+  let totalFetched = 0;
+
+  try {
+    while (true) {
+      const result = await queryGraphQL(`
+        query ActiveJobs($pageable: Pageable) {
+          crJobPage(pageable: $pageable) {
+            totalElements
+            items {
+              _id
+              jobID
+              toEmployee {
+                _id
+                employeeID
+                code1
+                code2
+                number
+              }
+            }
+          }
+        }
+      `, { pageable: { page, size } });
+
+      const items = result?.data?.crJobPage?.items || [];
+      const total = result?.data?.crJobPage?.totalElements || 0;
+
+      for (const job of items) {
+        const emp = job?.toEmployee;
+        if (!emp) continue;
+        // Try code1 first, then code2, then number — pick first that looks like a 4-letter crew code
+        const candidates = [emp.code1, emp.code2, emp.number]
+          .filter(Boolean)
+          .map(v => String(v).trim().toUpperCase());
+        for (const code of candidates) {
+          if (/^[A-Z]{4}$/.test(code) && !codeToJob[code]) {
+            codeToJob[code] = String(job.jobID || job._id);
+            break;
+          }
+        }
+      }
+
+      totalFetched += items.length;
+      if (totalFetched >= total || items.length < size) break;
+      page++;
+    }
+
+    logger.info('Carerix crew code map built', {
+      jobsScanned: totalFetched,
+      codesFound:  Object.keys(codeToJob).length,
+      codes:       Object.keys(codeToJob),
+    });
+    return codeToJob;
+  } catch (err) {
+    logger.warn('buildCrewCodeToJobMap failed', { error: err.message });
+    return {};
+  }
+}
+
+/**
+ * For all placements without a carerix_job_id, try to match via crew code
+ * against Carerix jobs. Updates placements table in place.
+ */
+export async function autoMatchPlacementsCarerixIds() {
+  const { data: unmatched } = await adminSupabase
+    .from('placements')
+    .select('id, crew_id, full_name')
+    .is('carerix_job_id', null)
+    .not('crew_id', 'is', null);
+
+  if (!unmatched?.length) return { matched: 0, unmatched: 0, details: [] };
+
+  const codeToJob = await buildCrewCodeToJobMap();
+  const details   = [];
+  let matched     = 0;
+
+  for (const placement of unmatched) {
+    const code  = placement.crew_id?.toUpperCase();
+    const jobId = codeToJob[code];
+    if (jobId) {
+      const { error } = await adminSupabase
+        .from('placements')
+        .update({ carerix_job_id: jobId, carerix_placement_id: jobId })
+        .eq('id', placement.id);
+      if (!error) {
+        matched++;
+        details.push({ crew_id: code, carerix_job_id: jobId, status: 'matched' });
+        logger.info('Auto-matched placement to Carerix job', { crew_id: code, jobId });
+      } else {
+        details.push({ crew_id: code, carerix_job_id: jobId, status: 'db_error', error: error.message });
+      }
+    } else {
+      details.push({ crew_id: code, carerix_job_id: null, status: 'not_found_in_carerix' });
+    }
+  }
+
+  return { matched, unmatched: unmatched.length - matched, details };
+}
