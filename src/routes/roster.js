@@ -6,7 +6,7 @@ import { adminSupabase } from '../services/supabase.js';
 import { requireAuth, requireAgency, requireCompanyOrAbove } from '../middleware/auth.js';
 import { ApiError } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
-import { fetchRostersForCrew, rosterItemsList, mapRosterToRows, buildDailySummary, monthBounds } from '../services/raido.js';
+import { fetchRostersForCrew, rosterItemsList, mapRosterToRows, buildDailySummary, monthBounds, fetchActiveRolesForPeriod } from '../services/raido.js';
 
 const router = Router();
 router.use(requireAuth);
@@ -51,6 +51,15 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
     let synced = 0, errors = 0;
     const results = [];
 
+    // Fetch active roles from /crew?RequestData=SpecialRoles once for the whole period
+    let rolesMap = {};
+    try {
+      rolesMap = await fetchActiveRolesForPeriod(periodFrom, periodTo);
+      logger.info('Roles fetched', { count: Object.keys(rolesMap).length });
+    } catch (e) {
+      logger.warn('Failed to fetch special roles', { error: e.message });
+    }
+
     // Load charge type IDs once
     const { data: chargeTypes } = await adminSupabase.from('charge_types').select('id, code, carerix_type_id');
     const ctByCode = Object.fromEntries((chargeTypes || []).map(ct => [ct.code, ct]));
@@ -80,9 +89,10 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
 
         if (!crewSummary?.days?.length) { results.push({ placement: placement.full_name, days: 0, items: 0 }); synced++; continue; }
 
-        // Write back qualification/active_roles from RAIDO if available
-        const qual = crewSummary.qualification;
-        const roles = crewSummary.activeRoles;
+        // Write back qualification from roster Crew object + active_roles from /crew SpecialRoles API
+        const qual       = crewSummary.qualification;
+        const rolesFromApi = rolesMap[placement.crew_id] || null;
+        const roles      = rolesFromApi || crewSummary.activeRoles || null;
         if (qual || roles) {
           await adminSupabase.from('placements').update({
             ...(qual  ? { qualification: qual }  : {}),
