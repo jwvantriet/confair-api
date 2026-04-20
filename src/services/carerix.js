@@ -365,3 +365,66 @@ export async function testCarerixConnection() {
   results.overallStatus = results.steps.every(s => s.status === 'success') ? 'connected' : 'partial_or_failed';
   return results;
 }
+/** Normalize Carerix currency label to ISO code */
+export function normalizeCurrency(raw) {
+  if (!raw) return 'USD';
+  const u = raw.toUpperCase().trim();
+  if (u === 'EUR' || u.includes('EURO')) return 'EUR';
+  if (u === 'USD' || u.includes('DOLLAR') || u.includes('US ')) return 'USD';
+  if (u === 'GBP' || u.includes('POUND') || u.includes('STERLING')) return 'GBP';
+  if (/^[A-Z]{3}$/.test(u)) return u;
+  return 'USD';
+}
+
+/**
+ * Fetch rates for a placement from Carerix crJobFinancePage.
+ * Returns a map of { carerix_type_id -> { amount, currency } }
+ */
+export async function fetchCarerixRatesForJob(carerixJobId) {
+  try {
+    const result = await queryGraphQL(`
+      query JobFinancePage($qualifier: String, $pageable: Pageable) {
+        crJobFinancePage(qualifier: $qualifier, pageable: $pageable) {
+          items {
+            _id
+            toFinance {
+              _id
+              amount
+              startDate
+              endDate
+              toKindNode { dataNodeID value }
+              toCurrencyNode { dataNodeID value }
+              toTypeNode { typeID }
+            }
+          }
+        }
+      }
+    `, {
+      qualifier: 'toJob.jobID == ' + parseInt(carerixJobId),
+      pageable: { page: 0, size: 100 }
+    });
+
+    const items = result?.data?.crJobFinancePage?.items || [];
+    const rateMap = {};
+    const today = new Date().toISOString().split('T')[0];
+
+    for (const item of items) {
+      const finance = item?.toFinance;
+      if (!finance) continue;
+      const endDate = finance.endDate ? String(finance.endDate).split('T')[0] : null;
+      if (endDate && endDate < today) continue;
+      const kindId = finance.toKindNode?.dataNodeID;
+      if (!kindId) continue;
+      const amount = finance.amount != null ? Number(finance.amount) : null;
+      const currency = normalizeCurrency((finance.toCurrencyNode?.value || '').trim());
+      if (!rateMap[kindId] && amount != null) {
+        rateMap[kindId] = { amount, currency };
+      }
+    }
+
+    return rateMap;
+  } catch (err) {
+    console.warn('fetchCarerixRatesForJob failed', { carerixJobId, error: err.message });
+    return {};
+  }
+}
