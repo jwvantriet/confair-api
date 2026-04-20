@@ -453,3 +453,76 @@ export function mapRosterToRows(rosterItems, crewId, crewNia) {
 }
 
 export { monthBounds };
+
+// ── Special Roles (Active Role) ────────────────────────────────────────────────
+// Whitelist from ServerModule1.py ROLE_WHITELIST
+const ROLE_WHITELIST = new Set(['WW','21-14','24-12','20-10','21-21','24-6','28-12','14-14','LEAD','SFO']);
+
+/**
+ * Fetch /crew?RequestData=SpecialRoles for the period window.
+ * Returns a map of crewKey → comma-joined active role codes.
+ * crewKey is the crew's Number/EmployeeNumber/Code1 (matches crew_id in placements).
+ */
+export async function fetchActiveRolesForPeriod(periodFrom, periodTo) {
+  const params = {
+    OnlyActive: 'true',
+    RequestData: 'SpecialRoles',
+    From: periodFrom,
+    To: periodTo,
+    limit: 5000,
+  };
+
+  let resp;
+  try {
+    resp = await httpGet('/crew', params);
+  } catch (e) {
+    return {};
+  }
+
+  const crews = Array.isArray(resp)
+    ? resp
+    : (resp?.items || resp?.data || []);
+
+  if (!Array.isArray(crews) || !crews.length) return {};
+
+  const winStart = new Date(periodFrom + 'T00:00:00Z');
+  const winEnd   = new Date(periodTo   + 'T23:59:59Z');
+  const rolesMap = {};
+
+  for (const crew of crews) {
+    if (!crew || typeof crew !== 'object') continue;
+
+    // Get crew key (same fields as in mapRosterToRows)
+    const key = (
+      crew.Number || crew.EmployeeNumber || crew.Code1 ||
+      crew.Code2  || crew.UniqueId || crew.CrewUniqueId || ''
+    ).toString().trim();
+    if (!key) continue;
+
+    const specialRoles = Array.isArray(crew.SpecialRoles) ? crew.SpecialRoles : [];
+    const activeCodes = [];
+
+    for (const role of specialRoles) {
+      if (!role || typeof role !== 'object') continue;
+      const code = (role.Code || '').toString().trim();
+      if (!ROLE_WHITELIST.has(code)) continue;
+      if (role.Active === false) continue;
+
+      const vf = role.ValidFrom ? new Date(role.ValidFrom) : new Date(0);
+      const vt = role.ValidTo   ? new Date(role.ValidTo)   : new Date('9999-12-31');
+
+      // Role valid if its window overlaps with the period window
+      if (vf <= winEnd && vt >= winStart) {
+        activeCodes.push(code);
+      }
+    }
+
+    // Preserve whitelist order (same as Python ROLE_WHITELIST ordering)
+    const ordered = [...ROLE_WHITELIST].filter(c => activeCodes.includes(c));
+    if (ordered.length > 0) {
+      rolesMap[key] = ordered.join(', ');
+    }
+  }
+
+  return rolesMap;
+}
