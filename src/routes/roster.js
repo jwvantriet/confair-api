@@ -7,7 +7,66 @@ import { requireAuth, requireAgency, requireCompanyOrAbove } from '../middleware
 import { ApiError } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
 import { fetchRostersForCrew, rosterItemsList, mapRosterToRows, buildDailySummary, monthBounds, fetchActiveRolesForPeriod } from '../services/raido.js';
-import { fetchCarerixRatesForJob } from '../services/carerix.js';
+
+// ── Rate helpers (inlined to avoid circular import) ───────────────────────────
+function normalizeCurrency(raw) {
+  if (!raw) return 'USD';
+  const u = raw.toUpperCase().trim();
+  if (u === 'EUR' || u.includes('EURO')) return 'EUR';
+  if (u === 'USD' || u.includes('DOLLAR') || u.includes('US ')) return 'USD';
+  if (u === 'GBP' || u.includes('POUND') || u.includes('STERLING')) return 'GBP';
+  if (/^[A-Z]{3}$/.test(u)) return u;
+  return 'USD';
+}
+
+async function fetchCarerixRatesForJob(carerixJobId) {
+  try {
+    const { queryGraphQL } = await import('../services/carerix.js');
+    const result = await queryGraphQL(`
+      query JobFinancePage($qualifier: String, $pageable: Pageable) {
+        crJobFinancePage(qualifier: $qualifier, pageable: $pageable) {
+          items {
+            _id
+            toFinance {
+              _id
+              amount
+              startDate
+              endDate
+              toKindNode { dataNodeID value }
+              toCurrencyNode { dataNodeID value }
+              toTypeNode { typeID }
+            }
+          }
+        }
+      }
+    `, {
+      qualifier: 'toJob.jobID == ' + parseInt(carerixJobId),
+      pageable: { page: 0, size: 100 }
+    });
+
+    const items = result?.data?.crJobFinancePage?.items || [];
+    const rateMap = {};
+    const today = new Date().toISOString().split('T')[0];
+
+    for (const item of items) {
+      const finance = item?.toFinance;
+      if (!finance) continue;
+      const endDate = finance.endDate ? String(finance.endDate).split('T')[0] : null;
+      if (endDate && endDate < today) continue;
+      const kindId = finance.toKindNode?.dataNodeID;
+      if (!kindId) continue;
+      const amount = finance.amount != null ? Number(finance.amount) : null;
+      const currency = normalizeCurrency((finance.toCurrencyNode?.value || '').trim());
+      if (!rateMap[kindId] && amount != null) {
+        rateMap[kindId] = { amount, currency };
+      }
+    }
+    return rateMap;
+  } catch (err) {
+    logger.warn('fetchCarerixRatesForJob failed', { carerixJobId, error: err.message });
+    return {};
+  }
+}
 
 const router = Router();
 router.use(requireAuth);
@@ -92,7 +151,13 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
 
         // Write back qualification from roster Crew object + active_roles from /crew SpecialRoles API
         const qual       = crewSummary.qualification;
-        const rolesFromApi = rolesMap[placement.crew_id] || null;
+        const rolesFromApi = rolesMap[placement.crew_id?.toUpperCase()] || null;
+        logger.info('Roles lookup', {
+          placement: placement.full_name,
+          crew_id: placement.crew_id,
+          rolesFound: rolesFromApi,
+          rolesMapKeys: Object.keys(rolesMap),
+        });
         const roles      = rolesFromApi || crewSummary.activeRoles || null;
         if (qual || roles) {
           await adminSupabase.from('placements').update({
