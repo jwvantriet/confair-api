@@ -486,6 +486,34 @@ router.post('/placement-correct', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── POST /payroll-roster/submit-corrections ───────────────────────────────────
+// Placement: mark existing corrections as submitted for review (status only, no new record)
+// Used by the "Decline — Request correction(s)" button when corrections already exist via ✎
+router.post('/submit-corrections', async (req, res, next) => {
+  try {
+    const { placementId, periodId } = req.body;
+    if (!placementId || !periodId) throw new ApiError('placementId and periodId required', 400);
+
+    if (req.user.role === 'placement') {
+      const { data: p } = await adminSupabase.from('placements').select('id').eq('user_profile_id', req.user.id).maybeSingle();
+      if (!p || p.id !== placementId) throw new ApiError('Access denied', 403);
+    }
+
+    const status = await getRosterPeriodStatus(placementId, periodId);
+    if (!status || !['contractor_check'].includes(status.status)) throw new ApiError('Can only submit corrections during contractor_check', 400);
+
+    // Verify there are actually pending corrections to submit
+    const { data: pending } = await adminSupabase.from('charge_corrections')
+      .select('id').eq('placement_id', placementId).eq('period_id', periodId)
+      .eq('status', 'pending').neq('correction_type', 'COMPANY').limit(1);
+    if (!pending?.length) throw new ApiError('No pending corrections to submit', 400);
+
+    await upsertRosterPeriodStatus(placementId, periodId, { status: 'contractor_correction' });
+
+    res.json({ submitted: true, placementId, periodId });
+  } catch (err) { next(err); }
+});
+
 // ── POST /payroll-roster/resolve-correction/:correctionId ─────────────────────
 // Company: approve or decline a correction → sets to definite when all resolved
 router.post('/resolve-correction/:correctionId', requireCompanyOrAbove, async (req, res, next) => {
