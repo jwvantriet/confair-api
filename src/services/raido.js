@@ -520,7 +520,7 @@ export async function fetchActiveRolesForPeriod(periodFrom, periodTo) {
     // Preserve whitelist order (same as Python ROLE_WHITELIST ordering)
     const ordered = [...ROLE_WHITELIST].filter(c => activeCodes.includes(c));
     if (ordered.length > 0) {
-      rolesMap[key] = ordered.join(', ');
+      rolesMap[key.toUpperCase()] = ordered.join(', ');
     }
   }
 
