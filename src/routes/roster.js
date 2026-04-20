@@ -106,6 +106,27 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
 
     if (!placements?.length) return res.json({ message: 'No placements with crew_id configured', synced: 0 });
 
+    // Auto-match any placements that are missing carerix_job_id
+    const needsMatch = (placements || []).filter(p => !p.carerix_job_id);
+    if (needsMatch.length > 0) {
+      try {
+        const { autoMatchPlacementsCarerixIds } = await import('../services/carerix.js');
+        const matchResult = await autoMatchPlacementsCarerixIds();
+        logger.info('Carerix auto-match', matchResult);
+        // Reload placements so newly matched IDs are available during sync
+        if (matchResult.matched > 0) {
+          const { data: refreshed } = await adminSupabase
+            .from('placements')
+            .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, carerix_job_id, user_profile_id')
+            .not('crew_id', 'is', null);
+          placements.splice(0, placements.length, ...(refreshed || []));
+        }
+      } catch (e) {
+        logger.warn('Carerix auto-match failed (non-fatal)', { error: e.message });
+      }
+    }
+
+
     const periodFrom = period.start_date;
     const periodTo   = period.end_date;
     let synced = 0, errors = 0;
