@@ -110,7 +110,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
             activities: day.activities, is_payable: day.isPayable,
             has_ground: day.hasGround, has_sim: day.hasSim, has_pxp: day.hasPxp,
             sold_off: day.soldOff, bod: day.bod, fetched_at: new Date().toISOString(),
-          }, { onConflict: 'placement_id,roster_date', returning: 'minimal' });
+          }, { onConflict: 'placement_id,period_id,roster_date', returning: 'minimal' });
 
           for (const [chargeCode, qty] of Object.entries(day.charges || {})) {
             if (!qty) continue;
