@@ -93,18 +93,30 @@ router.get('/charge-types', async (req, res, next) => {
 
 // ── POST /roster/sync/:periodId ───────────────────────────────────────────────
 router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
+  // Stream progress as NDJSON lines so the frontend can show real-time status
+  res.setHeader('Content-Type', 'application/x-ndjson');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
+  const emit = (step, data = {}) => {
+    try { res.write(JSON.stringify({ step, ts: Date.now(), ...data }) + '\n'); } catch(_e) {}
+  };
+
   try {
     const { periodId } = req.params;
 
     const { data: period } = await adminSupabase.from('payroll_periods').select('*').eq('id', periodId).single();
     if (!period) throw new ApiError('Period not found', 404);
+    emit('period', { ref: period.period_ref, from: period.start_date, to: period.end_date });
 
     const { data: placements } = await adminSupabase
       .from('placements')
       .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, carerix_job_id, user_profile_id')
       .not('crew_id', 'is', null);
 
-    if (!placements?.length) return res.json({ message: 'No placements with crew_id configured', synced: 0 });
+    if (!placements?.length) { emit('done', { synced: 0, errors: 0, results: [] }); res.end(); return; }
+    emit('placements', { count: placements.length, names: placements.map(p => p.crew_id) });
 
     // Auto-match any placements that are missing carerix_job_id
     const needsMatch = (placements || []).filter(p => !p.carerix_job_id);
@@ -113,6 +125,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
         const { autoMatchPlacementsCarerixIds } = await import('../services/carerix.js');
         const matchResult = await autoMatchPlacementsCarerixIds();
         logger.info('Carerix auto-match', matchResult);
+        emit('carerix_match', matchResult);
         // Reload placements so newly matched IDs are available during sync
         if (matchResult.matched > 0) {
           const { data: refreshed } = await adminSupabase
@@ -137,6 +150,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
     try {
       rolesMap = await fetchActiveRolesForPeriod(periodFrom, periodTo);
       logger.info('Roles fetched', { count: Object.keys(rolesMap).length });
+      emit('roles', { count: Object.keys(rolesMap).length, codes: Object.keys(rolesMap) });
     } catch (e) {
       logger.warn('Failed to fetch special roles', { error: e.message });
     }
@@ -146,6 +160,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
     const ctByCode = Object.fromEntries((chargeTypes || []).map(ct => [ct.code, ct]));
 
     for (const placement of placements) {
+      emit('placement_start', { name: placement.full_name, crew_id: placement.crew_id, has_carerix_job: !!placement.carerix_job_id });
       try {
         // Check if sync is locked for this placement/period (company has approved corrections)
         const { data: lockStatus } = await adminSupabase
@@ -167,6 +182,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
         const crewSummary  = buildDailySummary(rows).find(c => c.crewId?.toUpperCase() === placement.crew_id?.toUpperCase());
 
         logger.info('Roster sync', { placement: placement.full_name, rosterItems: items.length, rows: rows.length, days: crewSummary?.days?.length || 0 });
+        emit('raido', { crew_id: placement.crew_id, items: items.length, rows: rows.length, days: crewSummary?.days?.length || 0 });
 
         if (!crewSummary?.days?.length) { results.push({ placement: placement.full_name, days: 0, items: 0 }); synced++; continue; }
 
@@ -209,8 +225,10 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
               }
             }
             logger.info('Rates fetched from Carerix', { placement: placement.full_name, rateCount: Object.keys(ratesByCode).length });
+            emit('rates', { crew_id: placement.crew_id, source: 'carerix', rateCount: Object.keys(ratesByCode).length, codes: Object.keys(ratesByCode) });
           } catch (e) {
             logger.warn('Carerix rate fetch failed, using DB fallback', { placement: placement.full_name, error: e.message });
+            emit('rates_warn', { crew_id: placement.crew_id, error: e.message });
           }
         }
         // Fallback: load from placement_rates table
@@ -252,6 +270,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
         }
 
         results.push({ placement: placement.full_name, days: crewSummary.days.length, items: itemsCreated });
+        emit('placement_done', { name: placement.full_name, crew_id: placement.crew_id, days: crewSummary.days.length, items: itemsCreated });
         synced++;
 
         // Compute and write Overtime charge items for rotations exceeding 65h BLH
@@ -287,12 +306,16 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
         }
       } catch (e) {
         logger.error('Sync error', { placement: placement.full_name, error: e.message });
+        emit('placement_error', { name: placement.full_name, crew_id: placement.crew_id, error: e.message });
         errors++;
       }
     }
 
-    res.json({ message: 'Sync complete', synced, errors, results });
-  } catch (err) { next(err); }
+    emit('done', { message: 'Sync complete', synced, errors, results });
+    res.end();
+  } catch (err) {
+    try { emit('error', { message: err.message }); res.end(); } catch(_) { next(err); }
+  }
 });
 
 // ── GET /roster/summary/:periodId ─────────────────────────────────────────────
