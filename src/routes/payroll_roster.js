@@ -202,14 +202,22 @@ router.get('/periods', async (req, res, next) => {
 // ── POST /payroll-roster/sync/:periodId ──────────────────────────────────────
 // Agency: pull from RAIDO for all placements, set status to draft (or keep existing)
 router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
+  res.setHeader('Content-Type', 'application/x-ndjson');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('X-Accel-Buffering', 'no');
+  const emit = (step, data = {}) => {
+    try { res.write(JSON.stringify({ step, ts: Date.now(), ...data }) + '\n'); } catch(_e) {}
+  };
   try {
     const { periodId } = req.params;
     const { data: period } = await adminSupabase.from('payroll_periods').select('*').eq('id', periodId).single();
-    if (!period) throw new ApiError('Period not found', 404);
+    if (!period) { emit('error', { message: 'Period not found' }); return res.end(); }
+    emit('period', { ref: period.period_ref, from: period.start_date, to: period.end_date });
 
     const { data: placements } = await adminSupabase
       .from('placements').select('id, crew_id, crew_nia, full_name, carerix_job_id').not('crew_id', 'is', null);
 
+    emit('placements', { count: (placements||[]).length, names: (placements||[]).map(p=>p.crew_id) });
     const today  = new Date().toISOString().split('T')[0];
     const safeTo = period.end_date < today ? period.end_date : today;
     logger.info('Sync: fetching RAIDO', { from: period.start_date, to: safeTo });
@@ -223,9 +231,10 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
         firstItemKeys: allItems[0] ? Object.keys(allItems[0]).slice(0, 8) : [],
         raidoMessage: rosters?.message || null,
       });
+      emit('raido_fetch', { items: allItems.length, from: period.start_date, to: safeTo });
     } catch (raidoError) {
       logger.error('Sync: RAIDO fetch failed', { error: raidoError.message });
-      return res.status(500).json({ error: 'RAIDO fetch failed: ' + raidoError.message });
+      emit('error', { message: 'RAIDO fetch failed: ' + raidoError.message }); return res.end();
     }
 
     const { data: chargeTypes } = await adminSupabase.from('charge_types').select('id, code, carerix_type_id');
@@ -241,6 +250,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
 
     let synced = 0;
     for (const placement of placements || []) {
+      emit('placement_start', { name: placement.full_name, crew_id: placement.crew_id, has_carerix_job: !!placement.carerix_job_id });
       try {
         // Fetch live rates from Carerix for this placement's job
         let carerixRateMap = {};
@@ -252,6 +262,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
             rateCount: Object.keys(carerixRateMap).length,
             kindIds: Object.keys(carerixRateMap),
           });
+          emit('rates', { crew_id: placement.crew_id, source: 'carerix', rateCount: Object.keys(carerixRateMap).length });
 
           // Upsert live rates into placement_rates table for each charge type
           for (const ct of chargeTypes || []) {
@@ -327,14 +338,19 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
             status: 'draft', synced_at: new Date().toISOString(), synced_by: req.user.id,
           });
         }
+        emit('placement_done', { name: placement.full_name, crew_id: placement.crew_id, days: crewSummary?.days?.length || 0 });
         synced++;
       } catch (e) {
         logger.error('Sync error', { placement: placement.full_name, error: e.message });
+        emit('placement_error', { name: placement.full_name, crew_id: placement.crew_id, error: e.message });
       }
     }
 
-    res.json({ message: 'Sync complete', synced });
-  } catch (err) { next(err); }
+    emit('done', { message: 'Sync complete', synced });
+    res.end();
+  } catch (err) {
+    try { emit('error', { message: err.message }); res.end(); } catch(_) { next(err); }
+  }
 });
 
 // ── POST /payroll-roster/refresh/:periodId/:placementId ──────────────────────
