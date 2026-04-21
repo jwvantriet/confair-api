@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Carerix GraphQL Explorer — Confair</title>
+<style>
+  :root {
+    --bg: #0d0f12;
+    --surface: #161a20;
+    --border: #252b35;
+    --accent: #3b82f6;
+    --accent-dim: #1d4ed8;
+    --green: #22c55e;
+    --red: #ef4444;
+    --amber: #f59e0b;
+    --text: #e2e8f0;
+    --muted: #64748b;
+    --mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; font-size: 13px; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+  header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 10px 16px; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+  header h1 { font-size: 14px; font-weight: 600; letter-spacing: 0.02em; }
+  header .badge { background: var(--border); color: var(--muted); font-size: 10px; padding: 2px 7px; border-radius: 99px; font-family: var(--mono); }
+  .layout { display: flex; flex: 1; overflow: hidden; }
+  .sidebar { width: 260px; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden; }
+  .sidebar-section { padding: 10px 12px 6px; border-bottom: 1px solid var(--border); }
+  .sidebar-section h2 { font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin-bottom: 6px; }
+  .preset-btn { display: block; width: 100%; text-align: left; background: none; border: none; color: var(--text); padding: 7px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; transition: background 0.15s; line-height: 1.4; }
+  .preset-btn:hover { background: var(--border); }
+  .preset-btn .tag { font-size: 9px; background: var(--border); color: var(--muted); padding: 1px 5px; border-radius: 3px; float: right; margin-top: 1px; font-family: var(--mono); }
+  .preset-btn .tag.live { background: #1a3a1a; color: var(--green); }
+  .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .editor-area { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .query-panel { flex: 3; display: flex; flex-direction: column; border-right: 1px solid var(--border); }
+  .vars-panel { flex: 1; display: flex; flex-direction: column; }
+  .panel-header { padding: 6px 12px; background: var(--surface); border-bottom: 1px solid var(--border); font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); display: flex; justify-content: space-between; align-items: center; }
+  textarea { background: var(--bg); color: var(--text); border: none; resize: none; padding: 12px; font-family: var(--mono); font-size: 12px; line-height: 1.6; outline: none; flex: 1; tab-size: 2; }
+  .toolbar { padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+  .run-btn { background: var(--accent); color: white; border: none; padding: 6px 16px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; transition: background 0.15s; }
+  .run-btn:hover { background: var(--accent-dim); }
+  .run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .token-input { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 5px 9px; border-radius: 6px; font-size: 11px; font-family: var(--mono); width: 240px; }
+  .token-input::placeholder { color: var(--muted); }
+  .status { font-size: 11px; color: var(--muted); margin-left: auto; }
+  .status.ok { color: var(--green); }
+  .status.err { color: var(--red); }
+  .status.loading { color: var(--amber); }
+  .response-area { flex: 1; overflow: auto; }
+  pre { padding: 16px; font-family: var(--mono); font-size: 11px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
+  .key { color: #93c5fd; }
+  .str { color: #86efac; }
+  .num { color: #fbbf24; }
+  .bool { color: #f9a8d4; }
+  .null { color: var(--muted); }
+  .info-box { margin: 12px; padding: 10px 14px; background: #1a2a3a; border: 1px solid #1d4ed8; border-radius: 8px; font-size: 11px; line-height: 1.6; color: #93c5fd; }
+  .info-box strong { display: block; margin-bottom: 4px; color: #60a5fa; }
+  .divider { height: 1px; background: var(--border); margin: 4px 0; }
+  .field-highlight { background: #2a1a0a; border: 1px solid #f59e0b; border-radius: 6px; padding: 8px 12px; margin: 8px 12px; font-family: var(--mono); font-size: 12px; color: var(--amber); }
+</style>
+</head>
+<body>
+<header>
+  <h1>⚡ Carerix GraphQL Explorer</h1>
+  <span class="badge">confair-api · debug tool</span>
+</header>
+<div class="layout">
+  <div class="sidebar">
+    <div class="sidebar-section">
+      <h2>🔍 Crew Code Debug</h2>
+      <button class="preset-btn" onclick="loadPreset('probe_job_sample')">Sample jobs + additionalInfo <span class="tag">no auth</span></button>
+      <button class="preset-btn" onclick="loadPreset('probe_eric')">ERIC job 5319 — field 10189 <span class="tag">no auth</span></button>
+      <button class="preset-btn" onclick="loadPreset('probe_crew_code_map')">Run crew code map <span class="tag live">live</span></button>
+      <button class="preset-btn" onclick="loadPreset('match_placements')">Auto-match placements <span class="tag live">live</span></button>
+    </div>
+    <div class="sidebar-section">
+      <h2>💰 Rates & Finances</h2>
+      <button class="preset-btn" onclick="loadPreset('job_finances')">Job finances by jobID</button>
+      <button class="preset-btn" onclick="loadPreset('carerix_connection')">Connection test <span class="tag">no auth</span></button>
+    </div>
+    <div class="sidebar-section">
+      <h2>📝 Custom Query</h2>
+      <button class="preset-btn" onclick="loadPreset('blank')">Blank canvas</button>
+      <button class="preset-btn" onclick="loadPreset('introspect')">Introspect schema</button>
+    </div>
+    <div style="flex:1"></div>
+    <div class="sidebar-section">
+      <div style="font-size:10px;color:var(--muted);line-height:1.6;">
+        <strong style="color:var(--text)">Key field</strong><br>
+        additionalInfo[10189] = 4-letter crew code<br><br>
+        Presets marked <em>no auth</em> hit probe endpoints directly.<br>
+        Others need a token.
+      </div>
+    </div>
+  </div>
+  <div class="main">
+    <div class="toolbar">
+      <button class="run-btn" onclick="runQuery()" id="runBtn">▶ Run</button>
+      <input class="token-input" id="tokenInput" type="password" placeholder="Bearer token (for authenticated queries)">
+      <span class="status" id="status"></span>
+    </div>
+    <div class="editor-area" style="height:220px">
+      <div class="query-panel">
+        <div class="panel-header">GraphQL Query</div>
+        <textarea id="queryEditor" spellcheck="false" placeholder="Select a preset or type a query..."></textarea>
+      </div>
+      <div class="vars-panel">
+        <div class="panel-header">Variables (JSON)</div>
+        <textarea id="varsEditor" spellcheck="false">{}</textarea>
+      </div>
+    </div>
+    <div id="modeBar" class="info-box" style="display:none"></div>
+    <div class="response-area">
+      <pre id="responseOut"><span style="color:var(--muted)">// Response will appear here. Select a preset or run a query.</span></pre>
+    </div>
+  </div>
+</div>
+
+<script>
+const BASE = window.location.origin;
+
+const PRESETS = {
+  probe_job_sample: {
+    mode: 'probe_raw',
+    label: 'Sample jobs — confirms additionalInfo structure and field 10189',
+    query: `query {
+  crJobPage(pageable: { page: 0, size: 5 }) {
+    totalElements
+    items {
+      _id
+      jobID
+      name
+      additionalInfo
+    }
+  }
+}`,
+    vars: '{}'
+  },
+  probe_eric: {
+    mode: 'probe_raw',
+    label: "ERIC's job 5319 — look for field 10189 = 'ERIC' in additionalInfo",
+    query: `query {
+  crJob(_id: "5319") {
+    _id
+    jobID
+    name
+    additionalInfo
+  }
+}`,
+    vars: '{}'
+  },
+  probe_crew_code_map: {
+    mode: 'url_get',
+    url: '/carerix/crew-code-probe',
+    label: 'Runs buildCrewCodeToJobMap — shows all crew codes found and whether DAGF/ERIC matched'
+  },
+  match_placements: {
+    mode: 'url_post',
+    url: '/carerix/match-placements',
+    label: 'Runs autoMatchPlacementsCarerixIds — matches unmatched placements to Carerix jobs (requires auth)'
+  },
+  job_finances: {
+    mode: 'gql_explore',
+    label: 'Job finances — edit jobId in variables',
+    query: `query JobFinancePage($qualifier: String, $pageable: Pageable) {
+  crJobFinancePage(qualifier: $qualifier, pageable: $pageable) {
+    items {
+      _id
+      toJob { _id jobID name }
+      toFinance {
+        _id
+        amount
+        startDate
+        endDate
+        toKindNode { dataNodeID value }
+        toCurrencyNode { dataNodeID value }
+      }
+    }
+  }
+}`,
+    vars: '{\n  "qualifier": "toJob.jobID == 5319",\n  "pageable": { "page": 0, "size": 50 }\n}'
+  },
+  carerix_connection: {
+    mode: 'url_get',
+    url: '/carerix/test',
+    label: 'Tests Carerix OAuth + GraphQL connectivity — no auth required'
+  },
+  blank: {
+    mode: 'gql_explore',
+    label: 'Custom query — uses /carerix/gql-explore (requires auth token)',
+    query: `query {
+  __typename
+}`,
+    vars: '{}'
+  },
+  introspect: {
+    mode: 'gql_explore',
+    label: 'Schema introspection — lists all available types',
+    query: `query IntrospectionQuery {
+  __schema {
+    queryType { name }
+    types {
+      name
+      kind
+      fields { name type { name kind } }
+    }
+  }
+}`,
+    vars: '{}'
+  }
+};
+
+let currentMode = null;
+
+function loadPreset(key) {
+  const p = PRESETS[key];
+  if (!p) return;
+  currentMode = p;
+  setStatus('');
+  clearResponse();
+
+  const infoBox = document.getElementById('modeBar');
+  infoBox.style.display = 'block';
+  infoBox.innerHTML = `<strong>${p.label}</strong>`;
+
+  if (p.query !== undefined) {
+    document.getElementById('queryEditor').value = p.query;
+    document.getElementById('varsEditor').value = p.vars || '{}';
+  } else {
+    document.getElementById('queryEditor').value = '';
+    document.getElementById('varsEditor').value = '{}';
+  }
+}
+
+async function runQuery() {
+  const btn = document.getElementById('runBtn');
+  btn.disabled = true;
+  setStatus('Running…', 'loading');
+  clearResponse();
+
+  try {
+    const mode = currentMode;
+    if (!mode) {
+      // Default: try gql-explore with whatever is in the editor
+      await runGqlExplore();
+      return;
+    }
+    if (mode.mode === 'probe_raw') await runProbeRaw(mode.query, mode.vars);
+    else if (mode.mode === 'url_get') await runUrlGet(mode.url);
+    else if (mode.mode === 'url_post') await runUrlPost(mode.url);
+    else if (mode.mode === 'gql_explore') await runGqlExplore();
+  } catch (e) {
+    showResponse({ error: e.message });
+    setStatus('Error', 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function runProbeRaw(query, vars) {
+  const r = await fetch(`${BASE}/carerix/gql-explore`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeader() },
+    body: JSON.stringify({ query, variables: safeParseVars(vars) })
+  });
+  if (r.status === 403 || r.status === 401) {
+    // Try probe endpoint instead
+    const r2 = await fetch(`${BASE}/carerix/probe`);
+    const data = await r2.json();
+    showResponse(data);
+    setStatus(`Using probe endpoint — add token for full access`, 'ok');
+    return;
+  }
+  const data = await r.json();
+  showResponse(data);
+  setStatus(`${r.status} ${r.statusText}`, r.ok ? 'ok' : 'err');
+}
+
+async function runUrlGet(url) {
+  const r = await fetch(`${BASE}${url}`, { headers: authHeader() });
+  const data = await r.json();
+  showResponse(data);
+  setStatus(`${r.status} ${r.statusText}`, r.ok ? 'ok' : 'err');
+}
+
+async function runUrlPost(url) {
+  const token = document.getElementById('tokenInput').value.trim();
+  if (!token) { setStatus('Token required for this action', 'err'); showResponse({ error: 'Paste your Bearer token in the token field above' }); return; }
+  const r = await fetch(`${BASE}${url}`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeader() } });
+  const data = await r.json();
+  showResponse(data);
+  setStatus(`${r.status} ${r.statusText}`, r.ok ? 'ok' : 'err');
+}
+
+async function runGqlExplore() {
+  const query = document.getElementById('queryEditor').value.trim();
+  const vars = safeParseVars(document.getElementById('varsEditor').value);
+  const token = document.getElementById('tokenInput').value.trim();
+  if (!token) { setStatus('Token required', 'err'); showResponse({ error: 'Paste your Bearer token to use gql-explore' }); return; }
+  const r = await fetch(`${BASE}/carerix/gql-explore`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeader() },
+    body: JSON.stringify({ query, variables: vars })
+  });
+  const data = await r.json();
+  showResponse(data);
+  setStatus(`${r.status} ${r.statusText}`, r.ok ? 'ok' : 'err');
+}
+
+function authHeader() {
+  const token = document.getElementById('tokenInput').value.trim();
+  return token ? { 'Authorization': `Bearer ${token}` } : {};
+}
+
+function safeParseVars(str) {
+  try { return JSON.parse(str || '{}'); } catch { return {}; }
+}
+
+function setStatus(msg, cls = '') {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = `status ${cls}`;
+}
+
+function clearResponse() {
+  document.getElementById('responseOut').innerHTML = '<span style="color:var(--muted)">// Loading...</span>';
+}
+
+function showResponse(data) {
+  const json = JSON.stringify(data, null, 2);
+  document.getElementById('responseOut').innerHTML = syntaxHighlight(json);
+
+  // Check for field 10189 and highlight it
+  if (json.includes('10189')) {
+    const match = json.match(/"10189"\s*:\s*"([^"]+)"/);
+    if (match) {
+      const box = document.createElement('div');
+      box.className = 'field-highlight';
+      box.innerHTML = `⚡ additionalInfo[10189] = "${match[1]}" — this is the crew code used for matching`;
+      document.getElementById('responseOut').before(box);
+    }
+  }
+}
+
+function syntaxHighlight(json) {
+  return json.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, (match) => {
+    let cls = 'num';
+    if (/^"/.test(match)) {
+      if (/:$/.test(match)) cls = 'key';
+      else cls = 'str';
+    } else if (/true|false/.test(match)) cls = 'bool';
+    else if (/null/.test(match)) cls = 'null';
+    return `<span class="${cls}">${match.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</span>`;
+  });
+}
+
+// Initialize with probe_eric preset
+loadPreset('probe_eric');
+</script>
+</body>
+</html>
