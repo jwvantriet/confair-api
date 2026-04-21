@@ -432,10 +432,11 @@ export async function fetchCarerixRatesForJob(carerixJobId) {
 // ── Crew code → Carerix job matching ─────────────────────────────────────────
 
 /**
- * Query all Carerix jobs and build a map of { "DAGF" → "jobId", ... }
- * by inspecting employee.code1 / code2 / number for 4-letter crew codes.
+ * Query all Carerix jobs and build a map of { "DAGF" -> "jobId", ... }
+ * Crew code is stored in additionalInfo field 10189 on the crJob record.
  */
 export async function buildCrewCodeToJobMap() {
+  const CREW_CODE_FIELD = '10189';
   const codeToJob = {};
   let page = 0;
   const size = 100;
@@ -450,13 +451,7 @@ export async function buildCrewCodeToJobMap() {
             items {
               _id
               jobID
-              toEmployee {
-                _id
-                employeeID
-                code1
-                code2
-                number
-              }
+              additionalInfo
             }
           }
         }
@@ -466,17 +461,14 @@ export async function buildCrewCodeToJobMap() {
       const total = result?.data?.crJobPage?.totalElements || 0;
 
       for (const job of items) {
-        const emp = job?.toEmployee;
-        if (!emp) continue;
-        // Try code1 first, then code2, then number — pick first that looks like a 4-letter crew code
-        const candidates = [emp.code1, emp.code2, emp.number]
-          .filter(Boolean)
-          .map(v => String(v).trim().toUpperCase());
-        for (const code of candidates) {
-          if (/^[A-Z]{4}$/.test(code) && !codeToJob[code]) {
-            codeToJob[code] = String(job.jobID || job._id);
-            break;
-          }
+        const ai = job?.additionalInfo;
+        if (!ai || typeof ai !== 'object') continue;
+        // field 10189 may appear as numeric key or prefixed with underscore
+        const raw = ai[CREW_CODE_FIELD] ?? ai[`_${CREW_CODE_FIELD}`] ?? null;
+        if (!raw) continue;
+        const code = String(raw).trim().toUpperCase();
+        if (/^[A-Z]{4}$/.test(code) && !codeToJob[code]) {
+          codeToJob[code] = String(job.jobID || job._id);
         }
       }
 
