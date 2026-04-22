@@ -202,8 +202,9 @@ export function buildDailySummary(rows) {
     if (!perCrew.has(crewId)) {
       perCrew.set(crewId, {
         crewId, crewName, crewNia,
-        qualification: info.activities[0]?.qualification || null,
-        activeRoles: info.activities[0]?.active_roles || null,
+        qualification:    info.activities[0]?.qualification || null,
+        activeRoles:      info.activities[0]?.active_roles || null,
+        yearsSinceStart:  info.activities[0]?.years_since_start ?? null,
         days: new Map(),
         totals: {
           DailyAllowance: 0, AvailabilityPremium: 0, YearsWithClient: 0,
@@ -241,14 +242,15 @@ export function buildDailySummary(rows) {
         const hasWw = info.activities.some(a =>
           string(a.Designator || a.RosterDesignator).trim().toUpperCase() === 'WW'
         );
-        dayResult.charges.DailyAllowance     = 1;
+        dayResult.charges.DailyAllowance      = 1;
         dayResult.charges.AvailabilityPremium = hasWw ? 0 : 1;
-        dayResult.charges.YearsWithClient     = 1;   // one per payable day; rate comes from Carerix (type 12328)
         dayResult.charges.PerDiem             = info.hasPxp ? 0 : 1;
         crew.totals.DailyAllowance++;
         if (!hasWw) crew.totals.AvailabilityPremium++;
-        crew.totals.YearsWithClient++;
         crew.totals.PerDiem += info.hasPxp ? 0 : 1;
+        // YearsWithClient is tenure-based (≥ 5 years with the client). The
+        // per-day quantity is injected later in the sync route where we have
+        // the placement's client_start_date. See roster.js sync loop.
       }
 
       if (info.soldOff) {
@@ -342,6 +344,11 @@ export function mapRosterToRows(rosterItems, crewId, crewNia) {
       crewObj.ActiveRole || crewObj.ActiveRoles || crewObj.activeRoles ||
       crewObj.Role || crewObj.Roles || ''
     ).trim() || null;
+    // RAIDO exposes tenure via years_since_start (may be snake/camel/Pascal).
+    const rawYears = crewObj.years_since_start ?? crewObj.YearsSinceStart ?? crewObj.yearsSinceStart ?? null;
+    const itemYearsSinceStart = rawYears != null && !Number.isNaN(Number(rawYears))
+      ? Number(rawYears)
+      : null;
 
     // Filter to only the requested crew when crewId is provided
     if (crewId && itemCrewId && itemCrewId.toUpperCase() !== crewId.toUpperCase()) continue;
@@ -432,11 +439,12 @@ export function mapRosterToRows(rosterItems, crewId, crewNia) {
           : seg.sUtc.split('T')[0];
 
         rows.push({
-          crew_id:         itemCrewId || crewId || '',
-          crew_nia:        itemCrewNia || crewNia || '',
-          crew_name:       itemCrewName,
-          qualification:   itemQualification,
-          active_roles:    itemActiveRoles,
+          crew_id:            itemCrewId || crewId || '',
+          crew_nia:           itemCrewNia || crewNia || '',
+          crew_name:          itemCrewName,
+          qualification:      itemQualification,
+          active_roles:       itemActiveRoles,
+          years_since_start:  itemYearsSinceStart,
           ActivityCode:    string(act.ActivityCode || act.Code || ''),
           ActivityType:    activityType,
           ActivitySubType: string(act.ActivitySubType || act.SubType || ''),
