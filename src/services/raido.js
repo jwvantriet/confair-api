@@ -536,3 +536,41 @@ export async function fetchActiveRolesForPeriod(periodFrom, periodTo) {
 
   return rolesMap;
 }
+
+/**
+ * Fetch per-crew tenure (years_since_start) from the same /crew endpoint.
+ * Returns { [crewKey]: yearsSinceStart (number) } for crew where the field
+ * is present and numeric. The /rosters Crew object does not include this
+ * field, so this is the canonical source.
+ */
+export async function fetchYearsSinceStartForPeriod(periodFrom, periodTo) {
+  const params = {
+    OnlyActive: 'true',
+    RequestData: 'SpecialRoles',
+    From: periodFrom,
+    To: periodTo,
+    limit: 5000,
+  };
+  let resp;
+  try {
+    resp = await httpGet('/crew', params);
+  } catch (_e) {
+    return {};
+  }
+  const crews = Array.isArray(resp) ? resp : (resp?.items || resp?.data || []);
+  if (!Array.isArray(crews) || !crews.length) return {};
+
+  const yearsMap = {};
+  for (const crew of crews) {
+    if (!crew || typeof crew !== 'object') continue;
+    const key = (
+      crew.Number || crew.EmployeeNumber || crew.Code1 ||
+      crew.Code2  || crew.UniqueId || crew.CrewUniqueId || ''
+    ).toString().trim();
+    if (!key) continue;
+    const raw = crew.years_since_start ?? crew.YearsSinceStart ?? crew.yearsSinceStart ?? null;
+    const n = raw != null && !Number.isNaN(Number(raw)) ? Number(raw) : null;
+    if (n != null) yearsMap[key.toUpperCase()] = n;
+  }
+  return yearsMap;
+}
