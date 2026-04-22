@@ -202,8 +202,9 @@ export function buildDailySummary(rows) {
     if (!perCrew.has(crewId)) {
       perCrew.set(crewId, {
         crewId, crewName, crewNia,
-        qualification: info.activities[0]?.qualification || null,
-        activeRoles: info.activities[0]?.active_roles || null,
+        qualification:    info.activities[0]?.qualification || null,
+        activeRoles:      info.activities[0]?.active_roles || null,
+        yearsSinceStart:  info.activities[0]?.years_since_start ?? null,
         days: new Map(),
         totals: {
           DailyAllowance: 0, AvailabilityPremium: 0, YearsWithClient: 0,
@@ -343,6 +344,11 @@ export function mapRosterToRows(rosterItems, crewId, crewNia) {
       crewObj.ActiveRole || crewObj.ActiveRoles || crewObj.activeRoles ||
       crewObj.Role || crewObj.Roles || ''
     ).trim() || null;
+    // RAIDO exposes tenure via years_since_start (may be snake/camel/Pascal).
+    const rawYears = crewObj.years_since_start ?? crewObj.YearsSinceStart ?? crewObj.yearsSinceStart ?? null;
+    const itemYearsSinceStart = rawYears != null && !Number.isNaN(Number(rawYears))
+      ? Number(rawYears)
+      : null;
 
     // Filter to only the requested crew when crewId is provided
     if (crewId && itemCrewId && itemCrewId.toUpperCase() !== crewId.toUpperCase()) continue;
@@ -433,11 +439,12 @@ export function mapRosterToRows(rosterItems, crewId, crewNia) {
           : seg.sUtc.split('T')[0];
 
         rows.push({
-          crew_id:         itemCrewId || crewId || '',
-          crew_nia:        itemCrewNia || crewNia || '',
-          crew_name:       itemCrewName,
-          qualification:   itemQualification,
-          active_roles:    itemActiveRoles,
+          crew_id:            itemCrewId || crewId || '',
+          crew_nia:           itemCrewNia || crewNia || '',
+          crew_name:          itemCrewName,
+          qualification:      itemQualification,
+          active_roles:       itemActiveRoles,
+          years_since_start:  itemYearsSinceStart,
           ActivityCode:    string(act.ActivityCode || act.Code || ''),
           ActivityType:    activityType,
           ActivitySubType: string(act.ActivitySubType || act.SubType || ''),

@@ -363,16 +363,28 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
         }
 
         // YearsWithClient eligibility: crew earns it only after 5+ years with
-        // the client. Tenure is computed per-day against placement.client_start_date.
-        // If client_start_date is not set, YWC is skipped (safer than paying out
-        // what hasn't been earned).
+        // the client. RAIDO gives years_since_start directly; we prefer that,
+        // falling back to placement.client_start_date if RAIDO didn't supply it.
         const msPerYear = 365.25 * 24 * 3600 * 1000;
+        const yearsFromRaido = Number.isFinite(crewSummary.yearsSinceStart)
+          ? crewSummary.yearsSinceStart
+          : null;
         const clientStart = placement.client_start_date ? new Date(placement.client_start_date) : null;
         const ywcEligible = (dayDate) => {
-          if (!clientStart) return false;
-          const years = (new Date(dayDate) - clientStart) / msPerYear;
-          return years >= 5;
+          if (yearsFromRaido != null) return yearsFromRaido >= 5;
+          if (clientStart) return (new Date(dayDate) - clientStart) / msPerYear >= 5;
+          return false;
         };
+
+        // Persist a derived client_start_date on the placement so the value
+        // survives between syncs (useful for UI / reports).
+        if (yearsFromRaido != null && !placement.client_start_date) {
+          const derivedStart = new Date(Date.now() - yearsFromRaido * msPerYear)
+            .toISOString().split('T')[0];
+          await adminSupabase.from('placements')
+            .update({ client_start_date: derivedStart })
+            .eq('id', placement.id);
+        }
 
         let dayIdx = 0;
         for (const day of crewSummary.days) {
