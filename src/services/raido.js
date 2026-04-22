@@ -112,6 +112,21 @@ function string(v) {
   return v == null ? '' : String(v);
 }
 
+// ── Rotation-break codes (shared with frontend/lib/overtime.ts) ───────────────
+// A day counts as a "rotation stop" if ALL its activities are in this set.
+// Includes PXP (paid rest day) and the tour-code family.
+export const STOP_CODES = new Set([
+  '20-10','21-14','21-21','24-12','24-6','28-21',
+  'EML','RLO','RLOF','RLOW','MVTD','PXP','ULV','VAU','WFL','CNV',
+]);
+
+export function isStopDay(activities) {
+  if (!activities?.length) return true; // no activities = stop
+  return activities.every(a =>
+    STOP_CODES.has(String(a?.ActivityCode || '').toUpperCase().trim())
+  );
+}
+
 // ── Daily Allowance eligibility ───────────────────────────────────────────────
 // Direct port of _day_is_payable_for_summary from ServerModule1.py
 export function dayIsPayable(activities, crewNia) {

@@ -3,6 +3,7 @@ import { Router } from 'express';
 import { requireAuth, requireCompanyOrAbove } from '../middleware/auth.js';
 import { adminSupabase } from '../services/supabase.js';
 import { ApiError } from '../middleware/errorHandler.js';
+import { isStopDay } from '../services/raido.js';
 
 const router = Router();
 router.use(requireAuth, requireCompanyOrAbove);
@@ -84,9 +85,12 @@ router.get('/summary/:periodId', async (req, res, next) => {
       const hhmmToDec = (h) => { const p = (h||'').split(':'); return p.length===2 ? parseInt(p[0]) + parseInt(p[1])/60 : 0; };
       for (let i = 0; i < days.length; i++) {
         const d = days[i];
-        if (d.is_payable) {
+        const acts = Array.isArray(d.activities) ? d.activities : [];
+        // Rotation = payable AND not a stop-code day (PXP, ULV, etc.).
+        // Matches frontend/lib/overtime.ts and the sync-time OT calc.
+        const inRotation = d.is_payable && !isStopDay(acts);
+        if (inRotation) {
           if (!rotStart) rotStart = d.roster_date;
-          const acts = Array.isArray(d.activities) ? d.activities : [];
           for (const a of acts) {
             if (a?.aBLH && a.ActivityType?.toUpperCase() === 'FLIGHT') rotBLH += hhmmToDec(a.aBLH);
           }
@@ -129,9 +133,10 @@ router.get('/summary/:periodId', async (req, res, next) => {
       let rotBLH2 = 0;
       let inRot = false;
       for (const d of days) {
-        if (d.is_payable) {
+        const acts = Array.isArray(d.activities) ? d.activities : [];
+        const inRotation = d.is_payable && !isStopDay(acts);
+        if (inRotation) {
           inRot = true;
-          const acts = Array.isArray(d.activities) ? d.activities : [];
           for (const a of acts) {
             if (a?.aBLH && a.ActivityType?.toUpperCase() === 'FLIGHT') rotBLH2 += hhmmToDec2(a.aBLH);
           }
