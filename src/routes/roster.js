@@ -6,7 +6,7 @@ import { adminSupabase } from '../services/supabase.js';
 import { requireAuth, requireAgency, requireCompanyOrAbove } from '../middleware/auth.js';
 import { ApiError } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
-import { fetchRosters, fetchRostersForCrew, rosterItemsList, mapRosterToRows, buildDailySummary, monthBounds, fetchActiveRolesForPeriod, fetchYearsSinceStartForPeriod } from '../services/raido.js';
+import { fetchRosters, fetchRostersForCrew, rosterItemsList, mapRosterToRows, buildDailySummary, monthBounds, fetchActiveRolesForPeriod, fetchDateOfEmploymentForPeriod } from '../services/raido.js';
 
 // ── Rate helpers (inlined to avoid circular import) ───────────────────────────
 function normalizeCurrency(raw) {
@@ -270,15 +270,17 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
     const { data: chargeTypes } = await adminSupabase.from('charge_types').select('id, code, carerix_type_id');
     const ctByCode = Object.fromEntries((chargeTypes || []).map(ct => [ct.code, ct]));
 
-    // Fetch years_since_start per crew from /crew endpoint once (not in /rosters)
-    let yearsSinceStartMap = {};
+    // Fetch DateOfEmployment per crew from /crew endpoint once.
+    // Used to gate YearsWithClient (≥5 years from that date, per day).
+    let doeMap = {};
     try {
-      yearsSinceStartMap = await fetchYearsSinceStartForPeriod(periodFrom, periodTo);
-      logger.info('years_since_start fetched', { count: Object.keys(yearsSinceStartMap).length });
-      emit('tenure', { count: Object.keys(yearsSinceStartMap).length, codes: Object.keys(yearsSinceStartMap) });
+      doeMap = await fetchDateOfEmploymentForPeriod(periodFrom, periodTo);
+      logger.info('DateOfEmployment fetched', { count: Object.keys(doeMap).length });
+      emit('tenure', { count: Object.keys(doeMap).length, codes: Object.keys(doeMap) });
     } catch (e) {
-      logger.warn('Failed to fetch years_since_start', { error: e.message });
+      logger.warn('Failed to fetch DateOfEmployment', { error: e.message });
     }
+    const msPerYear = 365.25 * 24 * 3600 * 1000;
 
     for (const placement of placements) {
       emit('placement_start', { name: placement.full_name, crew_id: placement.crew_id, has_carerix_job: !!placement.carerix_job_id });
@@ -372,22 +374,23 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
           }
         }
 
-        // YearsWithClient eligibility: crew earns YWC only when RAIDO says
-        // they've been with the client for 5+ years. Primary source is
-        // fetchYearsSinceStartForPeriod (/crew endpoint). Fallback to
-        // whatever buildDailySummary surfaced from /rosters in case RAIDO
-        // starts including it there. No local persistence.
+        // YearsWithClient: tenure-based, per day. Crew earns YWC on a given
+        // day only if (day.date - DateOfEmployment) ≥ 5 years. RAIDO's
+        // DateOfEmployment from /crew is the source of truth (confirmed via
+        // /raido-probe). No local persistence: re-derived every sync.
         const crewKey = placement.crew_id?.toUpperCase();
-        const yearsFromCrewApi = crewKey ? yearsSinceStartMap[crewKey] : null;
-        const yearsFromRosters = Number.isFinite(crewSummary.yearsSinceStart)
-          ? crewSummary.yearsSinceStart : null;
-        const years = Number.isFinite(yearsFromCrewApi) ? yearsFromCrewApi : yearsFromRosters;
-        const ywcEligible = years != null && years >= 5;
+        const dateOfEmployment = crewKey ? doeMap[crewKey] : null; // 'YYYY-MM-DD' or undefined
+        const ywcEligibleForDay = (dayDate) => {
+          if (!dateOfEmployment) return false;
+          const diffYears = (new Date(dayDate) - new Date(dateOfEmployment)) / msPerYear;
+          return diffYears >= 5;
+        };
         const ywcCt = ctByCode['YearsWithClient'];
 
-        // Purge stale YWC rows for this placement+period if not eligible.
-        // Clears leftovers from earlier syncs that ran before the tenure gate.
-        if (!ywcEligible && ywcCt) {
+        // Clean slate per sync: wipe all YWC for this placement+period, then
+        // re-emit only the days that qualify. Idempotent, and clears any
+        // rows left by earlier syncs that used different rules.
+        if (ywcCt) {
           await adminSupabase.from('charge_items')
             .delete()
             .eq('placement_id', placement.id)
@@ -398,10 +401,10 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
         let dayIdx = 0;
         for (const day of crewSummary.days) {
           dayIdx++;
-          // Inject YWC quantity into the day's charges based on tenure.
-          // day.charges is built per-placement in buildDailySummary so it's
-          // safe to mutate here.
-          if (day.isPayable && ywcEligible) {
+          // Inject YWC quantity on payable days where the crew has already
+          // reached 5 years with the client as of this specific day. The
+          // crossing day itself is the first eligible day.
+          if (day.isPayable && ywcEligibleForDay(day.date)) {
             day.charges = { ...day.charges, YearsWithClient: 1 };
           }
           try {

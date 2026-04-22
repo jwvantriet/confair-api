@@ -538,15 +538,14 @@ export async function fetchActiveRolesForPeriod(periodFrom, periodTo) {
 }
 
 /**
- * Fetch per-crew tenure (years_since_start) from the same /crew endpoint.
- * Returns { [crewKey]: yearsSinceStart (number) } for crew where the field
- * is present and numeric. The /rosters Crew object does not include this
- * field, so this is the canonical source.
+ * Fetch per-crew DateOfEmployment from the /crew endpoint. This is the
+ * canonical tenure signal — RAIDO does not expose `years_since_start`
+ * on our tenant. Returns { [crewKey]: 'YYYY-MM-DD' } for crew where a
+ * real date (not the 1900-01-01 placeholder) is present.
  */
-export async function fetchYearsSinceStartForPeriod(periodFrom, periodTo) {
+export async function fetchDateOfEmploymentForPeriod(periodFrom, periodTo) {
   const params = {
     OnlyActive: 'true',
-    RequestData: 'SpecialRoles',
     From: periodFrom,
     To: periodTo,
     limit: 5000,
@@ -560,7 +559,7 @@ export async function fetchYearsSinceStartForPeriod(periodFrom, periodTo) {
   const crews = Array.isArray(resp) ? resp : (resp?.items || resp?.data || []);
   if (!Array.isArray(crews) || !crews.length) return {};
 
-  const yearsMap = {};
+  const doeMap = {};
   for (const crew of crews) {
     if (!crew || typeof crew !== 'object') continue;
     const key = (
@@ -568,9 +567,13 @@ export async function fetchYearsSinceStartForPeriod(periodFrom, periodTo) {
       crew.Code2  || crew.UniqueId || crew.CrewUniqueId || ''
     ).toString().trim();
     if (!key) continue;
-    const raw = crew.years_since_start ?? crew.YearsSinceStart ?? crew.yearsSinceStart ?? null;
-    const n = raw != null && !Number.isNaN(Number(raw)) ? Number(raw) : null;
-    if (n != null) yearsMap[key.toUpperCase()] = n;
+    const raw = crew.DateOfEmployment
+      || (Array.isArray(crew.DatesOfEmployment) ? crew.DatesOfEmployment[0] : null);
+    if (!raw) continue;
+    const ymd = String(raw).split('T')[0]; // 'YYYY-MM-DD'
+    if (ymd === '1900-01-01') continue;    // RAIDO placeholder
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) continue;
+    doeMap[key.toUpperCase()] = ymd;
   }
-  return yearsMap;
+  return doeMap;
 }
