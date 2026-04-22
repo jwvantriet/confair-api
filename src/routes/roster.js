@@ -266,30 +266,21 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
           }
         }
 
-        // Wrap a Supabase call with a 20s timeout so a stuck connection does
-        // not hang the whole sync. The outer try/catch for this placement
-        // will convert any thrown error into a `placement_error` event.
-        const withTimeout = (p, label) => Promise.race([
-          p,
-          new Promise((_, rej) => setTimeout(
-            () => rej(new Error(`timeout >20s on ${label}`)), 20_000)),
-        ]);
-
         let dayIdx = 0;
         for (const day of crewSummary.days) {
           dayIdx++;
           try {
-            // Upsert roster_day
-            const rd = await withTimeout(
-              adminSupabase.from('roster_days').upsert({
-                placement_id: placement.id, period_id: periodId, roster_date: day.date,
-                crew_id: placement.crew_id, crew_nia: placement.crew_nia,
-                activities: day.activities, is_payable: day.isPayable,
-                has_ground: day.hasGround, has_sim: day.hasSim, has_pxp: day.hasPxp,
-                sold_off: day.soldOff, bod: day.bod, fetched_at: new Date().toISOString(),
-              }, { onConflict: 'placement_id,period_id,roster_date', returning: 'minimal' }),
-              `roster_days ${day.date}`
-            );
+            // Upsert roster_day. Chain .select() so the call returns a real
+            // Promise — wrapping a PostgrestBuilder in Promise.race caused
+            // silent no-op writes (the builder's thenable was consumed
+            // without triggering fetch).
+            const rd = await adminSupabase.from('roster_days').upsert({
+              placement_id: placement.id, period_id: periodId, roster_date: day.date,
+              crew_id: placement.crew_id, crew_nia: placement.crew_nia,
+              activities: day.activities, is_payable: day.isPayable,
+              has_ground: day.hasGround, has_sim: day.hasSim, has_pxp: day.hasPxp,
+              sold_off: day.soldOff, bod: day.bod, fetched_at: new Date().toISOString(),
+            }, { onConflict: 'placement_id,period_id,roster_date' }).select('id').limit(1);
             if (rd?.error) throw new Error(`roster_days ${day.date}: ${rd.error.message}`);
 
             for (const [chargeCode, qty] of Object.entries(day.charges || {})) {
@@ -300,14 +291,11 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
               const rate     = rateRow?.amount ?? null;
               const currency = rateRow?.currency ?? 'USD';
               const total    = rate != null ? Math.round(qty * rate * 100) / 100 : null;
-              const ci = await withTimeout(
-                adminSupabase.from('charge_items').upsert({
-                  placement_id: placement.id, period_id: periodId,
-                  charge_type_id: ct.id, charge_date: day.date,
-                  quantity: qty, rate_per_unit: rate, currency, total_amount: total, status: 'confirmed',
-                }, { onConflict: 'placement_id,charge_date,charge_type_id', returning: 'minimal' }),
-                `charge_items ${day.date}/${chargeCode}`
-              );
+              const ci = await adminSupabase.from('charge_items').upsert({
+                placement_id: placement.id, period_id: periodId,
+                charge_type_id: ct.id, charge_date: day.date,
+                quantity: qty, rate_per_unit: rate, currency, total_amount: total, status: 'confirmed',
+              }, { onConflict: 'placement_id,charge_date,charge_type_id' }).select('id').limit(1);
               if (ci?.error) throw new Error(`charge_items ${day.date}/${chargeCode}: ${ci.error.message}`);
               itemsCreated++;
             }
