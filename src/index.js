@@ -22,6 +22,7 @@ import diagnosticsRoutes     from './routes/diagnostics.js';
 import confairExpenseRoutes  from './routes/confair_expense.js';
 import expenseRoutes         from './routes/expenses.js';
 import payrollApprovalRoutes from './routes/payroll_approval.js';
+import raidoProbeRoutes      from './routes/raido_probe.js';
 
 const app = express();
 
@@ -71,6 +72,7 @@ app.use('/invoice',      invoiceRoutes);
 app.use('/roster',      rosterRoutes);
 app.use('/payroll-roster', payrollRosterRoutes);
 app.use('/diagnostics',    diagnosticsRoutes);
+app.use('/raido-probe',    raidoProbeRoutes);  // no-auth, disposable diagnostic
 app.use(errorHandler);
 
 app.listen(config.port, () =>
