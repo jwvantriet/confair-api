@@ -432,61 +432,76 @@ export async function fetchCarerixRatesForJob(carerixJobId) {
 // ── Crew code → Carerix job matching ─────────────────────────────────────────
 
 /**
- * Query all Carerix jobs and build a map of { "DAGF" -> "jobId", ... }
+ * Query Carerix jobs and build a map of { "DAGF" -> "jobId", ... }
  * Crew code is stored in additionalInfo field 10189 on the crJob record.
+ *
+ * Jobs are sorted by modificationDate DESC so recently-changed records
+ * (where new crew codes typically appear) are scanned first. When
+ * `targetCodes` is provided, the scan stops as soon as every requested
+ * code has been found — avoiding a full-tenant scan when only a handful
+ * of placements need matching.
+ *
+ * Per-page failures (timeouts, transient GraphQL errors) are logged but
+ * do not abort the whole scan — we return whatever we managed to collect.
  */
-export async function buildCrewCodeToJobMap() {
+export async function buildCrewCodeToJobMap({ targetCodes = null, maxPages = 100 } = {}) {
   const CREW_CODE_FIELD = '10189';
   const codeToJob = {};
-  let page = 0;
   const size = 100;
   let totalFetched = 0;
+  let pagesScanned = 0;
+  const needed = targetCodes ? new Set([...targetCodes].map(c => c.toUpperCase())) : null;
 
-  try {
-    while (true) {
+  for (let page = 0; page < maxPages; page++) {
+    let items, total;
+    try {
       const result = await queryGraphQL(`
         query ActiveJobs($pageable: Pageable) {
           crJobPage(pageable: $pageable) {
             totalElements
-            items {
-              _id
-              jobID
-              additionalInfo
-            }
+            items { _id jobID additionalInfo }
           }
         }
-      `, { pageable: { page, size } });
-
-      const items = result?.data?.crJobPage?.items || [];
-      const total = result?.data?.crJobPage?.totalElements || 0;
-
-      for (const job of items) {
-        const ai = job?.additionalInfo;
-        if (!ai || typeof ai !== 'object') continue;
-        // field 10189 may appear as numeric key or prefixed with underscore
-        const raw = ai[CREW_CODE_FIELD] ?? ai[`_${CREW_CODE_FIELD}`] ?? null;
-        if (!raw) continue;
-        const code = String(raw).trim().toUpperCase();
-        if (/^[A-Z]{4}$/.test(code) && !codeToJob[code]) {
-          codeToJob[code] = String(job.jobID || job._id);
-        }
-      }
-
-      totalFetched += items.length;
-      if (totalFetched >= total || items.length < size) break;
-      page++;
+      `, { pageable: { page, size, sort: [{ property: 'modificationDate', direction: 'DESC' }] } });
+      items = result?.data?.crJobPage?.items || [];
+      total = result?.data?.crJobPage?.totalElements || 0;
+    } catch (err) {
+      logger.warn('crJobPage fetch failed (continuing)', { page, error: err.message });
+      break;
     }
 
-    logger.info('Carerix crew code map built', {
-      jobsScanned: totalFetched,
-      codesFound:  Object.keys(codeToJob).length,
-      codes:       Object.keys(codeToJob),
-    });
-    return codeToJob;
-  } catch (err) {
-    logger.warn('buildCrewCodeToJobMap failed', { error: err.message });
-    return {};
+    for (const job of items) {
+      const ai = job?.additionalInfo;
+      if (!ai || typeof ai !== 'object') continue;
+      // field 10189 may appear as numeric key or prefixed with underscore
+      const raw = ai[CREW_CODE_FIELD] ?? ai[`_${CREW_CODE_FIELD}`] ?? null;
+      if (!raw) continue;
+      const code = String(raw).trim().toUpperCase();
+      if (/^[A-Z]{4}$/.test(code) && !codeToJob[code]) {
+        codeToJob[code] = String(job.jobID || job._id);
+      }
+    }
+
+    totalFetched += items.length;
+    pagesScanned++;
+
+    // Early exit when every requested code has been resolved
+    if (needed && needed.size > 0) {
+      const stillMissing = [...needed].some(c => !codeToJob[c]);
+      if (!stillMissing) break;
+    }
+
+    if (totalFetched >= total || items.length < size) break;
   }
+
+  logger.info('Carerix crew code map built', {
+    pagesScanned,
+    jobsScanned: totalFetched,
+    codesFound:  Object.keys(codeToJob).length,
+    targetCount: needed?.size ?? null,
+    targetsResolved: needed ? [...needed].filter(c => codeToJob[c]).length : null,
+  });
+  return codeToJob;
 }
 
 /**
@@ -502,7 +517,10 @@ export async function autoMatchPlacementsCarerixIds() {
 
   if (!unmatched?.length) return { matched: 0, unmatched: 0, details: [] };
 
-  const codeToJob = await buildCrewCodeToJobMap();
+  const targetCodes = unmatched
+    .map(p => p.crew_id?.toUpperCase())
+    .filter(Boolean);
+  const codeToJob = await buildCrewCodeToJobMap({ targetCodes });
   const details   = [];
   let matched     = 0;
 

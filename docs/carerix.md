@@ -65,18 +65,48 @@ We cache the token for `expires_in - 60s` in-process.
 
 ## 3. Query shape
 
-Pattern for "list" queries: `cr<Entity>Page(qualifier, pageable, sort)`.
+The schema has **two parallel query namespaces** (confirmed against
+`docs/carerix-schema.graphql`, 373 root Query fields total):
+
+### 3a. Legacy `cr*` namespace (318 fields) — what we currently use
+
+Pattern: `cr<Entity>Page(qualifier, pageable, language, norestrict)`
+returning `{ totalElements, items[…] }`; or `cr<Entity>(_id, language)` for
+one record. Rich types with dozens of fields per record.
+
+### 3b. Modern namespace (55 fields)
+
+Pattern: `<entity>Page(filter, pageable)` / `<entity>(_id)`, e.g.
+`candidate`, `placement`, `match`, `vacancy`, `contact`, `company`, `lead`,
+`opportunity`, `officeEmployee`, `talentpool`.
+
+These types are deliberately minimal — typically only `_id`, `_kind`,
+`displayName`, and a few `APIResource` references. Good for link-walking,
+not for bulk data pulls.
+
+**Rule of thumb**: stay in the `cr*` namespace for anything payroll-related;
+the modern surface is an API-resource view that assumes you'll dereference
+into the legacy types for detail.
 
 ### Pageable
 
 ```graphql
-input Pageable { page: Int!, size: Int! }
+input Pageable {
+  page: Int       # zero-indexed, defaults to 0
+  size: Int       # defaults to 20, we use 100
+  sort: [Order]   # optional — NOT available on SimplePageable
+}
+
+input Order {
+  property: String!          # dotted path, e.g. "updateDate"
+  direction: Direction       # ASC | DESC  (defaults to ASC)
+}
 ```
 
-- `page` is zero-indexed.
-- Typical `size` limit is 100 (Carerix-documented soft cap; larger may work but
-  can time out).
-- Returns `{ totalElements, items[…] }`.
+Some nested list fields on `cr*` types expose `SimplePageable` instead,
+which has **only `{ page, size }`** — no sorting.
+
+Returns `{ totalElements, items[…], first, last, numberOfElements, page, size, sort, totalPages }`.
 
 ### Qualifier
 
@@ -233,16 +263,36 @@ review. If introspection is disabled on the endpoint, the script will exit with
 a clear error — in that case, ask Carerix to enable it for our service client
 or accept that the schema doc will fall out of date.
 
-## 10. Things we don't know yet (open items)
+## 10. Schema snapshot findings (April 2026)
 
-- Exact rate limits (requests / sec, daily quota).
-- Max `Pageable.size` server-side hard cap.
-- Whether `crJobPage` supports `sort` parameter (for incremental sync by
-  `lastModified`).
-- Full list of scopes and which permit which entities.
-- Whether Carerix offers an introspection endpoint we can snapshot into the
-  repo.
-- Stability guarantees / versioning of the `v1` path.
+Summary of what introspection (`docs/carerix-schema.graphql`) actually tells us:
+
+- **Totals**: 373 Query fields (318 legacy `cr*`, 55 modern) and **517
+  Mutation fields**. Near-complete CRUD surface in the `cr*` namespace
+  (`cr<Entity>Create`, `cr<Entity>Update`, `cr<Entity>Delete`, plus bulk
+  variants and specialised ops like `crArticleSendEmail`).
+- **Sort** is available via `Pageable.sort: [Order]`. Use e.g.
+  `sort: [{ property: "updateDate", direction: DESC }]` for incremental sync.
+- **Patch semantics**: mutations take `_patch: PatchStrategy`
+  (`replaceMerge`, `delete`, …) so nested list updates don't blow away
+  untouched elements.
+- **Resource envelope**: every legacy type implements `APIResource`
+  (`_id`, `_kind`) and most carry `creationDate`, `createdBy`, and often
+  `changedSinceLastBaseline` / `diffLastCheckpoint` — usable for delta
+  detection without us tracking versions ourselves.
+- **No webhooks in GraphQL**: webhook management is REST-only at
+  `https://api.carerix.io/webhooks/v1/applications/…`.
+- **Introspection is enabled** for our service client — safe to re-snapshot
+  any time with `npm run carerix:schema`.
+
+## 11. Things we still don't know (open items)
+
+- Exact rate limits (requests / sec, daily quota). Not in the schema.
+- Max `Pageable.size` server-side hard cap (100 is the documented sweet
+  spot; we haven't tested higher).
+- Whether there's an official changelog we can watch for schema breaks.
+- Stability guarantees / versioning of the `v1` path (no `v2` visible in
+  the schema today).
 
 When any of these get clarified, update this file rather than scattering notes
 across issues.
