@@ -6,7 +6,7 @@ import { adminSupabase } from '../services/supabase.js';
 import { requireAuth, requireAgency, requireCompanyOrAbove } from '../middleware/auth.js';
 import { ApiError } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
-import { fetchRostersForCrew, rosterItemsList, mapRosterToRows, buildDailySummary, monthBounds, fetchActiveRolesForPeriod } from '../services/raido.js';
+import { fetchRosters, fetchRostersForCrew, rosterItemsList, mapRosterToRows, buildDailySummary, monthBounds, fetchActiveRolesForPeriod } from '../services/raido.js';
 
 // ── Rate helpers (inlined to avoid circular import) ───────────────────────────
 function normalizeCurrency(raw) {
@@ -160,6 +160,20 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
       logger.warn('Failed to fetch special roles', { error: e.message });
     }
 
+    // Fetch the full period roster from RAIDO ONCE. RAIDO cannot filter by
+    // crew server-side, so fetching per-placement just re-downloads the same
+    // payload N times. Share the items across the per-placement loop below.
+    let sharedRosterItems = [];
+    try {
+      const allRosters = await fetchRosters(periodFrom, periodTo);
+      sharedRosterItems = rosterItemsList(allRosters);
+      logger.info('RAIDO global fetch', { items: sharedRosterItems.length });
+      emit('raido_global', { items: sharedRosterItems.length });
+    } catch (e) {
+      logger.warn('RAIDO global fetch failed (will try per-placement as fallback)', { error: e.message });
+      emit('raido_global_error', { error: e.message });
+    }
+
     // Load charge type IDs once
     const { data: chargeTypes } = await adminSupabase.from('charge_types').select('id, code, carerix_type_id');
     const ctByCode = Object.fromEntries((chargeTypes || []).map(ct => [ct.code, ct]));
@@ -181,13 +195,18 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
           continue;
         }
 
-        const rosters      = await fetchRostersForCrew(periodFrom, periodTo, placement.crew_id);
-        const items        = rosterItemsList(rosters);
+        // Reuse the shared period-level fetch. Fallback to per-crew fetch
+        // only if the global fetch failed (sharedRosterItems empty).
+        let items = sharedRosterItems;
+        if (!items.length) {
+          const rosters = await fetchRostersForCrew(periodFrom, periodTo, placement.crew_id);
+          items = rosterItemsList(rosters);
+        }
         const rows         = mapRosterToRows(items, placement.crew_id, placement.crew_nia);
         const crewSummary  = buildDailySummary(rows).find(c => c.crewId?.toUpperCase() === placement.crew_id?.toUpperCase());
 
-        logger.info('Roster sync', { placement: placement.full_name, rosterItems: items.length, rows: rows.length, days: crewSummary?.days?.length || 0 });
-        emit('raido', { crew_id: placement.crew_id, items: items.length, rows: rows.length, days: crewSummary?.days?.length || 0 });
+        logger.info('Roster sync', { placement: placement.full_name, rosterRows: rows.length, days: crewSummary?.days?.length || 0 });
+        emit('raido', { crew_id: placement.crew_id, rows: rows.length, days: crewSummary?.days?.length || 0 });
 
         if (!crewSummary?.days?.length) { results.push({ placement: placement.full_name, days: 0, items: 0 }); synced++; continue; }
 
@@ -247,30 +266,63 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
           }
         }
 
-        for (const day of crewSummary.days) {
-          // Upsert roster_day
-          await adminSupabase.from('roster_days').upsert({
-            placement_id: placement.id, period_id: periodId, roster_date: day.date,
-            crew_id: placement.crew_id, crew_nia: placement.crew_nia,
-            activities: day.activities, is_payable: day.isPayable,
-            has_ground: day.hasGround, has_sim: day.hasSim, has_pxp: day.hasPxp,
-            sold_off: day.soldOff, bod: day.bod, fetched_at: new Date().toISOString(),
-          }, { onConflict: 'placement_id,period_id,roster_date', returning: 'minimal' });
+        // Wrap a Supabase call with a 20s timeout so a stuck connection does
+        // not hang the whole sync. The outer try/catch for this placement
+        // will convert any thrown error into a `placement_error` event.
+        const withTimeout = (p, label) => Promise.race([
+          p,
+          new Promise((_, rej) => setTimeout(
+            () => rej(new Error(`timeout >20s on ${label}`)), 20_000)),
+        ]);
 
-          for (const [chargeCode, qty] of Object.entries(day.charges || {})) {
-            if (!qty) continue;
-            const ct = ctByCode[chargeCode];
-            if (!ct) continue;
-            const rateRow = ratesByCode[chargeCode];
-            const rate     = rateRow?.amount ?? null;
-            const currency = rateRow?.currency ?? 'USD';
-            const total    = rate != null ? Math.round(qty * rate * 100) / 100 : null;
-            await adminSupabase.from('charge_items').upsert({
-              placement_id: placement.id, period_id: periodId,
-              charge_type_id: ct.id, charge_date: day.date,
-              quantity: qty, rate_per_unit: rate, currency, total_amount: total, status: 'confirmed',
-            }, { onConflict: 'placement_id,charge_date,charge_type_id', returning: 'minimal' });
-            itemsCreated++;
+        let dayIdx = 0;
+        for (const day of crewSummary.days) {
+          dayIdx++;
+          try {
+            // Upsert roster_day
+            const rd = await withTimeout(
+              adminSupabase.from('roster_days').upsert({
+                placement_id: placement.id, period_id: periodId, roster_date: day.date,
+                crew_id: placement.crew_id, crew_nia: placement.crew_nia,
+                activities: day.activities, is_payable: day.isPayable,
+                has_ground: day.hasGround, has_sim: day.hasSim, has_pxp: day.hasPxp,
+                sold_off: day.soldOff, bod: day.bod, fetched_at: new Date().toISOString(),
+              }, { onConflict: 'placement_id,period_id,roster_date', returning: 'minimal' }),
+              `roster_days ${day.date}`
+            );
+            if (rd?.error) throw new Error(`roster_days ${day.date}: ${rd.error.message}`);
+
+            for (const [chargeCode, qty] of Object.entries(day.charges || {})) {
+              if (!qty) continue;
+              const ct = ctByCode[chargeCode];
+              if (!ct) continue;
+              const rateRow = ratesByCode[chargeCode];
+              const rate     = rateRow?.amount ?? null;
+              const currency = rateRow?.currency ?? 'USD';
+              const total    = rate != null ? Math.round(qty * rate * 100) / 100 : null;
+              const ci = await withTimeout(
+                adminSupabase.from('charge_items').upsert({
+                  placement_id: placement.id, period_id: periodId,
+                  charge_type_id: ct.id, charge_date: day.date,
+                  quantity: qty, rate_per_unit: rate, currency, total_amount: total, status: 'confirmed',
+                }, { onConflict: 'placement_id,charge_date,charge_type_id', returning: 'minimal' }),
+                `charge_items ${day.date}/${chargeCode}`
+              );
+              if (ci?.error) throw new Error(`charge_items ${day.date}/${chargeCode}: ${ci.error.message}`);
+              itemsCreated++;
+            }
+          } catch (dayErr) {
+            emit('day_error', { crew_id: placement.crew_id, date: day.date, error: dayErr.message });
+            throw dayErr;
+          }
+
+          // Progress ping every 5 days so the client sees forward motion
+          if (dayIdx % 5 === 0 || dayIdx === crewSummary.days.length) {
+            emit('placement_progress', {
+              crew_id: placement.crew_id,
+              dayIdx, totalDays: crewSummary.days.length,
+              lastDate: day.date, itemsSoFar: itemsCreated,
+            });
           }
         }
 
