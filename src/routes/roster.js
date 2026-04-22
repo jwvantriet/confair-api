@@ -19,7 +19,16 @@ function normalizeCurrency(raw) {
   return 'USD';
 }
 
-async function fetchCarerixRatesForJob(carerixJobId) {
+/**
+ * Fetch every finance row for a Carerix job and return them grouped by
+ * `kindId` (which maps to our charge_type codes). Rows are kept with their
+ * start/end dates so the caller can pick the right rate per day.
+ *
+ * Returns: { [kindId]: [{ amount, currency, start, end }, ...] }
+ * - each array is sorted by `start` ascending (nulls first)
+ * - expired rows (end < periodFrom) are dropped if periodFrom provided
+ */
+async function fetchCarerixRatesForJob(carerixJobId, periodFrom = null) {
   try {
     const { queryGraphQL } = await import('../services/carerix.js');
     const result = await queryGraphQL(`
@@ -46,26 +55,43 @@ async function fetchCarerixRatesForJob(carerixJobId) {
 
     const items = result?.data?.crJobFinancePage?.items || [];
     const rateMap = {};
-    const today = new Date().toISOString().split('T')[0];
 
     for (const item of items) {
       const finance = item?.toFinance;
       if (!finance) continue;
-      const endDate = finance.endDate ? String(finance.endDate).split('T')[0] : null;
-      if (endDate && endDate < today) continue;
+      const start  = finance.startDate ? String(finance.startDate).split('T')[0] : null;
+      const end    = finance.endDate   ? String(finance.endDate).split('T')[0]   : null;
+      if (periodFrom && end && end < periodFrom) continue; // ends before period starts
       const kindId = finance.toKindNode?.dataNodeID;
       if (!kindId) continue;
       const amount = finance.amount != null ? Number(finance.amount) : null;
+      if (amount == null) continue;
       const currency = normalizeCurrency((finance.toCurrencyNode?.value || '').trim());
-      if (!rateMap[kindId] && amount != null) {
-        rateMap[kindId] = { amount, currency };
-      }
+      if (!rateMap[kindId]) rateMap[kindId] = [];
+      rateMap[kindId].push({ amount, currency, start, end });
+    }
+
+    // Sort each kind's rates by start date ascending (nulls first = open-ended from past)
+    for (const k of Object.keys(rateMap)) {
+      rateMap[k].sort((a, b) => (a.start || '').localeCompare(b.start || ''));
     }
     return rateMap;
   } catch (err) {
     logger.warn('fetchCarerixRatesForJob failed', { carerixJobId, error: err.message });
     return {};
   }
+}
+
+// Pick the rate whose [start, end] window covers `dayDate`. Falls back to the
+// newest-starting rate if nothing covers the day (e.g. future rate only).
+function pickRateForDay(rates, dayDate) {
+  if (!rates?.length) return null;
+  const covering = rates.find(r =>
+    (!r.start || r.start <= dayDate) &&
+    (!r.end   || r.end   >= dayDate)
+  );
+  if (covering) return covering;
+  return rates[rates.length - 1]; // last-resort
 }
 
 const router = Router();
@@ -99,17 +125,77 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.setHeader('Access-Control-Allow-Origin', '*');
 
+  // Persistent audit trail. Every emit() is pushed into eventBuffer; we
+  // flush the row on terminal states (done / error / client-disconnect).
+  const eventBuffer = [];
+  let syncRunId = null;
+  let lastStep  = null;
+  const runState = { placements_synced: 0, placements_errors: 0, items_created: 0, placements_total: 0 };
+
   const emit = (step, data = {}) => {
-    try { res.write(JSON.stringify({ step, ts: Date.now(), ...data }) + '\n'); } catch(_e) {}
+    const evt = { step, ts: Date.now(), ...data };
+    eventBuffer.push(evt);
+    lastStep = step;
+    try { res.write(JSON.stringify(evt) + '\n'); } catch(_e) {}
+  };
+
+  const finalizeRun = async (status, errorMessage = null) => {
+    if (!syncRunId) return;
+    try {
+      await adminSupabase.from('sync_runs').update({
+        ended_at: new Date().toISOString(),
+        status,
+        placements_total:  runState.placements_total,
+        placements_synced: runState.placements_synced,
+        placements_errors: runState.placements_errors,
+        items_created:     runState.items_created,
+        last_step:         lastStep,
+        error_message:     errorMessage,
+        event_count:       eventBuffer.length,
+        raw_events:        eventBuffer,
+      }).eq('id', syncRunId);
+    } catch (e) {
+      logger.warn('sync_runs finalize failed', { error: e.message });
+    }
   };
 
   // Heartbeat every 10s so clients (and proxies) know the connection is alive
   // during long Supabase/RAIDO/Carerix awaits.
   const heartbeat = setInterval(() => emit('heartbeat'), 10_000);
-  res.on('close', () => clearInterval(heartbeat));
+
+  // Client disconnect handling — record the run as cancelled if the stream
+  // was closed before we emitted `done`/`error`.
+  let didFinalize = false;
+  const markFinal = async (status, msg) => {
+    if (didFinalize) return;
+    didFinalize = true;
+    clearInterval(heartbeat);
+    await finalizeRun(status, msg);
+  };
+  res.on('close', () => {
+    clearInterval(heartbeat);
+    if (!didFinalize) {
+      // Fire-and-forget — the socket is gone so we can't await cleanly
+      markFinal('cancelled', 'client disconnected before done/error');
+    }
+  });
 
   try {
     const { periodId } = req.params;
+
+    // Create the sync_runs row immediately so concurrent syncs are visible.
+    try {
+      const { data: runRow } = await adminSupabase.from('sync_runs').insert({
+        kind: 'roster_sync',
+        period_id: periodId,
+        triggered_by: req.user?.id || null,
+        status: 'running',
+      }).select('id').single();
+      syncRunId = runRow?.id || null;
+    } catch (e) {
+      logger.warn('sync_runs insert failed (non-fatal)', { error: e.message });
+    }
+    emit('sync_run', { id: syncRunId });
 
     const { data: period } = await adminSupabase.from('payroll_periods').select('*').eq('id', periodId).single();
     if (!period) throw new ApiError('Period not found', 404);
@@ -120,7 +206,13 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
       .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, carerix_job_id, user_profile_id')
       .not('crew_id', 'is', null);
 
-    if (!placements?.length) { emit('done', { synced: 0, errors: 0, results: [] }); clearInterval(heartbeat); res.end(); return; }
+    if (!placements?.length) {
+      emit('done', { synced: 0, errors: 0, results: [] });
+      await markFinal('completed');
+      res.end();
+      return;
+    }
+    runState.placements_total = placements.length;
     emit('placements', { count: placements.length, names: placements.map(p => p.crew_id) });
 
     // Auto-match any placements that are missing carerix_job_id
@@ -229,24 +321,27 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
 
         let itemsCreated = 0;
 
-        // Fetch live rates from Carerix (if placement has a carerix_job_id)
-        // Falls back to placement_rates table, then to null
+        // Fetch live rates from Carerix (if placement has a carerix_job_id).
+        // ratesByCode is now { code: [{amount,currency,start,end}, ...] } so the
+        // day loop below can pick the rate valid for each specific day.
         let ratesByCode = {};
         if (placement.carerix_job_id) {
           try {
-            const carerixRateMap = await fetchCarerixRatesForJob(placement.carerix_job_id);
+            const carerixRateMap = await fetchCarerixRatesForJob(placement.carerix_job_id, periodFrom);
             // Map carerix_type_id → charge code using chargeTypes
             for (const ct of chargeTypes || []) {
-              if (ct.carerix_type_id && carerixRateMap[ct.carerix_type_id]) {
-                ratesByCode[ct.code] = carerixRateMap[ct.carerix_type_id];
-                // Persist to placement_rates for future use
-                await adminSupabase.from('placement_rates').upsert({
-                  placement_id: placement.id, charge_type_id: ct.id,
-                  amount: carerixRateMap[ct.carerix_type_id].amount,
-                  currency: carerixRateMap[ct.carerix_type_id].currency,
-                  fetched_at: new Date().toISOString(),
-                }, { onConflict: 'placement_id,charge_type_id' });
-              }
+              const rates = ct.carerix_type_id ? carerixRateMap[ct.carerix_type_id] : null;
+              if (!rates?.length) continue;
+              ratesByCode[ct.code] = rates;
+              // Persist the currently-applicable rate (the one covering today)
+              // to placement_rates so other code paths keep a simple cache.
+              const today = new Date().toISOString().split('T')[0];
+              const nowRate = pickRateForDay(rates, today) || rates[0];
+              await adminSupabase.from('placement_rates').upsert({
+                placement_id: placement.id, charge_type_id: ct.id,
+                amount: nowRate.amount, currency: nowRate.currency,
+                fetched_at: new Date().toISOString(),
+              }, { onConflict: 'placement_id,charge_type_id' });
             }
             logger.info('Rates fetched from Carerix', { placement: placement.full_name, rateCount: Object.keys(ratesByCode).length });
             emit('rates', { crew_id: placement.crew_id, source: 'carerix', rateCount: Object.keys(ratesByCode).length, codes: Object.keys(ratesByCode) });
@@ -255,14 +350,15 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
             emit('rates_warn', { crew_id: placement.crew_id, error: e.message });
           }
         }
-        // Fallback: load from placement_rates table
+        // Fallback: load a single amount per code from placement_rates table.
+        // Wrap in an array so the per-day lookup still works.
         if (!Object.keys(ratesByCode).length) {
           const { data: storedRates } = await adminSupabase
             .from('placement_rates').select('charge_type_id, amount, currency')
             .eq('placement_id', placement.id);
           for (const r of storedRates || []) {
             const ct = (chargeTypes || []).find(c => c.id === r.charge_type_id);
-            if (ct) ratesByCode[ct.code] = { amount: Number(r.amount), currency: r.currency };
+            if (ct) ratesByCode[ct.code] = [{ amount: Number(r.amount), currency: r.currency, start: null, end: null }];
           }
         }
 
@@ -287,7 +383,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
               if (!qty) continue;
               const ct = ctByCode[chargeCode];
               if (!ct) continue;
-              const rateRow = ratesByCode[chargeCode];
+              const rateRow  = pickRateForDay(ratesByCode[chargeCode], day.date);
               const rate     = rateRow?.amount ?? null;
               const currency = rateRow?.currency ?? 'USD';
               const total    = rate != null ? Math.round(qty * rate * 100) / 100 : null;
@@ -317,6 +413,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
         results.push({ placement: placement.full_name, days: crewSummary.days.length, items: itemsCreated });
         emit('placement_done', { name: placement.full_name, crew_id: placement.crew_id, days: crewSummary.days.length, items: itemsCreated });
         synced++;
+        runState.items_created += itemsCreated;
 
         // Compute and write Overtime charge items for rotations exceeding 65h BLH
         // Rotation = consecutive payable days; OT = (total flight BLH - 65) per rotation
@@ -356,12 +453,15 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
       }
     }
 
+    runState.placements_synced = synced;
+    runState.placements_errors = errors;
     emit('done', { message: 'Sync complete', synced, errors, results });
-    clearInterval(heartbeat);
+    await markFinal(errors > 0 ? 'completed' : 'completed');
     res.end();
   } catch (err) {
-    clearInterval(heartbeat);
-    try { emit('error', { message: err.message }); res.end(); } catch(_) { next(err); }
+    try { emit('error', { message: err.message }); } catch(_) {}
+    await markFinal('failed', err.message);
+    try { res.end(); } catch(_) { next(err); }
   }
 });
 
