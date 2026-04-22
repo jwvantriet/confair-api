@@ -385,18 +385,15 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
           const diffYears = (new Date(dayDate) - new Date(dateOfEmployment)) / msPerYear;
           return diffYears >= 5;
         };
-        const ywcCt = ctByCode['YearsWithClient'];
-
-        // Clean slate per sync: wipe all YWC for this placement+period, then
-        // re-emit only the days that qualify. Idempotent, and clears any
-        // rows left by earlier syncs that used different rules.
-        if (ywcCt) {
-          await adminSupabase.from('charge_items')
-            .delete()
-            .eq('placement_id', placement.id)
-            .eq('period_id', periodId)
-            .eq('charge_type_id', ywcCt.id);
-        }
+        // Clean slate per sync: wipe ALL charge_items for this placement+
+        // period, then re-emit only what the current rules produce (day
+        // loop below + Overtime flush after). Keeps the table in sync
+        // with rule changes — e.g. PerDiem no longer emitted on PXP days,
+        // YWC gated on DateOfEmployment — without accumulating stale rows.
+        await adminSupabase.from('charge_items')
+          .delete()
+          .eq('placement_id', placement.id)
+          .eq('period_id', periodId);
 
         let dayIdx = 0;
         for (const day of crewSummary.days) {
