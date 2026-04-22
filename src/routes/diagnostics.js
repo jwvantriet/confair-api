@@ -163,4 +163,46 @@ router.get('/special-roles/:periodId', async (req, res) => {
   }
 });
 
+// ── GET /diagnostics/raido-crew/:crewId? ──────────────────────────────────────
+// Dump the raw RAIDO /crew payload for one crew member. Useful to discover
+// what fields RAIDO exposes (e.g. tenure / client start date) so we can wire
+// them into downstream logic without guessing. If no crewId is given, returns
+// the first crew from the response.
+router.get('/raido-crew/:crewId?', async (req, res) => {
+  try {
+    const { config } = await import('../config.js');
+    const axios = (await import('axios')).default;
+    const url = `${config.raido.baseUrl}/crew`;
+    const params = {
+      OnlyActive: 'true',
+      RequestData: 'SpecialRoles',
+      // Wide window so tenure fields like StartDate / FirstAssignment
+      // surface even if they're only populated when inside it.
+      From: '2000-01-01',
+      To:   new Date().toISOString().split('T')[0],
+      limit: 5000,
+    };
+    const resp = await axios.get(url, {
+      headers: { 'Ocp-Apim-Subscription-Key': config.raido.apiKey, 'Accept': 'application/json' },
+      params, timeout: 30_000,
+    });
+    const body  = resp.data;
+    const list  = Array.isArray(body) ? body : (body?.items || body?.data || []);
+    const crewId = req.params.crewId?.toUpperCase();
+    const match = crewId
+      ? list.find(c => [c?.Number, c?.EmployeeNumber, c?.Code1, c?.Code2]
+          .some(v => String(v || '').toUpperCase() === crewId))
+      : list[0];
+    res.json({
+      endpoint: url,
+      totalCrew: list.length,
+      query: { crewId: crewId || null },
+      rawSampleKeys: match ? Object.keys(match).sort() : null,
+      raw: match || null,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, status: err.response?.status, body: err.response?.data });
+  }
+});
+
 export default router;

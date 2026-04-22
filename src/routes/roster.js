@@ -203,7 +203,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
 
     const { data: placements } = await adminSupabase
       .from('placements')
-      .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, carerix_job_id, user_profile_id')
+      .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, carerix_job_id, user_profile_id, client_start_date')
       .not('crew_id', 'is', null);
 
     if (!placements?.length) {
@@ -227,7 +227,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
         if (matchResult.matched > 0) {
           const { data: refreshed } = await adminSupabase
             .from('placements')
-            .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, carerix_job_id, user_profile_id')
+            .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, carerix_job_id, user_profile_id, client_start_date')
             .not('crew_id', 'is', null);
           placements.splice(0, placements.length, ...(refreshed || []));
         }
@@ -362,9 +362,27 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
           }
         }
 
+        // YearsWithClient eligibility: crew earns it only after 5+ years with
+        // the client. Tenure is computed per-day against placement.client_start_date.
+        // If client_start_date is not set, YWC is skipped (safer than paying out
+        // what hasn't been earned).
+        const msPerYear = 365.25 * 24 * 3600 * 1000;
+        const clientStart = placement.client_start_date ? new Date(placement.client_start_date) : null;
+        const ywcEligible = (dayDate) => {
+          if (!clientStart) return false;
+          const years = (new Date(dayDate) - clientStart) / msPerYear;
+          return years >= 5;
+        };
+
         let dayIdx = 0;
         for (const day of crewSummary.days) {
           dayIdx++;
+          // Inject YWC quantity into the day's charges based on tenure.
+          // day.charges is built per-placement in buildDailySummary so it's
+          // safe to mutate here.
+          if (day.isPayable && ywcEligible(day.date)) {
+            day.charges = { ...day.charges, YearsWithClient: 1 };
+          }
           try {
             // Upsert roster_day. Chain .select() so the call returns a real
             // Promise — wrapping a PostgrestBuilder in Promise.race caused

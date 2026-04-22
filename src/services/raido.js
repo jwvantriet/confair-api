@@ -241,14 +241,15 @@ export function buildDailySummary(rows) {
         const hasWw = info.activities.some(a =>
           string(a.Designator || a.RosterDesignator).trim().toUpperCase() === 'WW'
         );
-        dayResult.charges.DailyAllowance     = 1;
+        dayResult.charges.DailyAllowance      = 1;
         dayResult.charges.AvailabilityPremium = hasWw ? 0 : 1;
-        dayResult.charges.YearsWithClient     = 1;   // one per payable day; rate comes from Carerix (type 12328)
         dayResult.charges.PerDiem             = info.hasPxp ? 0 : 1;
         crew.totals.DailyAllowance++;
         if (!hasWw) crew.totals.AvailabilityPremium++;
-        crew.totals.YearsWithClient++;
         crew.totals.PerDiem += info.hasPxp ? 0 : 1;
+        // YearsWithClient is tenure-based (≥ 5 years with the client). The
+        // per-day quantity is injected later in the sync route where we have
+        // the placement's client_start_date. See roster.js sync loop.
       }
 
       if (info.soldOff) {
