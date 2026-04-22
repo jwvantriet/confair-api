@@ -217,7 +217,23 @@ Defined in `src/config.js`:
 - Useful to replace polling for: placement created/updated, job updates, finance
   changes.
 
-## 9. Things we don't know yet (open items)
+## 9. Refreshing the schema snapshot
+
+```bash
+# needs CARERIX_CLIENT_ID + CARERIX_API_KEY in env or .env
+npm run carerix:schema
+```
+
+Writes two files into `docs/`:
+- `carerix-schema.json` — raw introspection result (machine-readable).
+- `carerix-schema.graphql` — SDL form (human-readable; diff-friendly in PRs).
+
+Re-run whenever Carerix updates their API so we can spot breaking changes in
+review. If introspection is disabled on the endpoint, the script will exit with
+a clear error — in that case, ask Carerix to enable it for our service client
+or accept that the schema doc will fall out of date.
+
+## 10. Things we don't know yet (open items)
 
 - Exact rate limits (requests / sec, daily quota).
 - Max `Pageable.size` server-side hard cap.
