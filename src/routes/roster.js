@@ -6,7 +6,7 @@ import { adminSupabase } from '../services/supabase.js';
 import { requireAuth, requireAgency, requireCompanyOrAbove } from '../middleware/auth.js';
 import { ApiError } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
-import { fetchRosters, fetchRostersForCrew, rosterItemsList, mapRosterToRows, buildDailySummary, monthBounds, fetchActiveRolesForPeriod } from '../services/raido.js';
+import { fetchRosters, fetchRostersForCrew, rosterItemsList, mapRosterToRows, buildDailySummary, monthBounds, fetchActiveRolesForPeriod, fetchYearsSinceStartForPeriod } from '../services/raido.js';
 
 // ── Rate helpers (inlined to avoid circular import) ───────────────────────────
 function normalizeCurrency(raw) {
@@ -270,6 +270,16 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
     const { data: chargeTypes } = await adminSupabase.from('charge_types').select('id, code, carerix_type_id');
     const ctByCode = Object.fromEntries((chargeTypes || []).map(ct => [ct.code, ct]));
 
+    // Fetch years_since_start per crew from /crew endpoint once (not in /rosters)
+    let yearsSinceStartMap = {};
+    try {
+      yearsSinceStartMap = await fetchYearsSinceStartForPeriod(periodFrom, periodTo);
+      logger.info('years_since_start fetched', { count: Object.keys(yearsSinceStartMap).length });
+      emit('tenure', { count: Object.keys(yearsSinceStartMap).length, codes: Object.keys(yearsSinceStartMap) });
+    } catch (e) {
+      logger.warn('Failed to fetch years_since_start', { error: e.message });
+    }
+
     for (const placement of placements) {
       emit('placement_start', { name: placement.full_name, crew_id: placement.crew_id, has_carerix_job: !!placement.carerix_job_id });
       try {
@@ -363,13 +373,16 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
         }
 
         // YearsWithClient eligibility: crew earns YWC only when RAIDO says
-        // they've been with the client for 5+ years. RAIDO is the single
-        // source of truth — no local persistence, no fallback: if RAIDO
-        // doesn't supply the field for a given sync, no YWC is applied.
-        const yearsFromRaido = Number.isFinite(crewSummary.yearsSinceStart)
-          ? crewSummary.yearsSinceStart
-          : null;
-        const ywcEligible = yearsFromRaido != null && yearsFromRaido >= 5;
+        // they've been with the client for 5+ years. Primary source is
+        // fetchYearsSinceStartForPeriod (/crew endpoint). Fallback to
+        // whatever buildDailySummary surfaced from /rosters in case RAIDO
+        // starts including it there. No local persistence.
+        const crewKey = placement.crew_id?.toUpperCase();
+        const yearsFromCrewApi = crewKey ? yearsSinceStartMap[crewKey] : null;
+        const yearsFromRosters = Number.isFinite(crewSummary.yearsSinceStart)
+          ? crewSummary.yearsSinceStart : null;
+        const years = Number.isFinite(yearsFromCrewApi) ? yearsFromCrewApi : yearsFromRosters;
+        const ywcEligible = years != null && years >= 5;
         const ywcCt = ctByCode['YearsWithClient'];
 
         // Purge stale YWC rows for this placement+period if not eligible.
