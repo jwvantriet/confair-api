@@ -103,6 +103,11 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
     try { res.write(JSON.stringify({ step, ts: Date.now(), ...data }) + '\n'); } catch(_e) {}
   };
 
+  // Heartbeat every 10s so clients (and proxies) know the connection is alive
+  // during long Supabase/RAIDO/Carerix awaits.
+  const heartbeat = setInterval(() => emit('heartbeat'), 10_000);
+  res.on('close', () => clearInterval(heartbeat));
+
   try {
     const { periodId } = req.params;
 
@@ -115,7 +120,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
       .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, carerix_job_id, user_profile_id')
       .not('crew_id', 'is', null);
 
-    if (!placements?.length) { emit('done', { synced: 0, errors: 0, results: [] }); res.end(); return; }
+    if (!placements?.length) { emit('done', { synced: 0, errors: 0, results: [] }); clearInterval(heartbeat); res.end(); return; }
     emit('placements', { count: placements.length, names: placements.map(p => p.crew_id) });
 
     // Auto-match any placements that are missing carerix_job_id
@@ -312,8 +317,10 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
     }
 
     emit('done', { message: 'Sync complete', synced, errors, results });
+    clearInterval(heartbeat);
     res.end();
   } catch (err) {
+    clearInterval(heartbeat);
     try { emit('error', { message: err.message }); res.end(); } catch(_) { next(err); }
   }
 });
