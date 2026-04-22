@@ -203,7 +203,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
 
     const { data: placements } = await adminSupabase
       .from('placements')
-      .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, carerix_job_id, user_profile_id, client_start_date')
+      .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, carerix_job_id, user_profile_id')
       .not('crew_id', 'is', null);
 
     if (!placements?.length) {
@@ -227,7 +227,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
         if (matchResult.matched > 0) {
           const { data: refreshed } = await adminSupabase
             .from('placements')
-            .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, carerix_job_id, user_profile_id, client_start_date')
+            .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, carerix_job_id, user_profile_id')
             .not('crew_id', 'is', null);
           placements.splice(0, placements.length, ...(refreshed || []));
         }
@@ -362,28 +362,24 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
           }
         }
 
-        // YearsWithClient eligibility: crew earns it only after 5+ years with
-        // the client. RAIDO gives years_since_start directly; we prefer that,
-        // falling back to placement.client_start_date if RAIDO didn't supply it.
-        const msPerYear = 365.25 * 24 * 3600 * 1000;
+        // YearsWithClient eligibility: crew earns YWC only when RAIDO says
+        // they've been with the client for 5+ years. RAIDO is the single
+        // source of truth — no local persistence, no fallback: if RAIDO
+        // doesn't supply the field for a given sync, no YWC is applied.
         const yearsFromRaido = Number.isFinite(crewSummary.yearsSinceStart)
           ? crewSummary.yearsSinceStart
           : null;
-        const clientStart = placement.client_start_date ? new Date(placement.client_start_date) : null;
-        const ywcEligible = (dayDate) => {
-          if (yearsFromRaido != null) return yearsFromRaido >= 5;
-          if (clientStart) return (new Date(dayDate) - clientStart) / msPerYear >= 5;
-          return false;
-        };
+        const ywcEligible = yearsFromRaido != null && yearsFromRaido >= 5;
+        const ywcCt = ctByCode['YearsWithClient'];
 
-        // Persist a derived client_start_date on the placement so the value
-        // survives between syncs (useful for UI / reports).
-        if (yearsFromRaido != null && !placement.client_start_date) {
-          const derivedStart = new Date(Date.now() - yearsFromRaido * msPerYear)
-            .toISOString().split('T')[0];
-          await adminSupabase.from('placements')
-            .update({ client_start_date: derivedStart })
-            .eq('id', placement.id);
+        // Purge stale YWC rows for this placement+period if not eligible.
+        // Clears leftovers from earlier syncs that ran before the tenure gate.
+        if (!ywcEligible && ywcCt) {
+          await adminSupabase.from('charge_items')
+            .delete()
+            .eq('placement_id', placement.id)
+            .eq('period_id', periodId)
+            .eq('charge_type_id', ywcCt.id);
         }
 
         let dayIdx = 0;
@@ -392,7 +388,7 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
           // Inject YWC quantity into the day's charges based on tenure.
           // day.charges is built per-placement in buildDailySummary so it's
           // safe to mutate here.
-          if (day.isPayable && ywcEligible(day.date)) {
+          if (day.isPayable && ywcEligible) {
             day.charges = { ...day.charges, YearsWithClient: 1 };
           }
           try {
