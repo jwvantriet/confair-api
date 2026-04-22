@@ -243,9 +243,11 @@ export function buildDailySummary(rows) {
         );
         dayResult.charges.DailyAllowance     = 1;
         dayResult.charges.AvailabilityPremium = hasWw ? 0 : 1;
+        dayResult.charges.YearsWithClient     = 1;   // one per payable day; rate comes from Carerix (type 12328)
         dayResult.charges.PerDiem             = info.hasPxp ? 0 : 1;
         crew.totals.DailyAllowance++;
         if (!hasWw) crew.totals.AvailabilityPremium++;
+        crew.totals.YearsWithClient++;
         crew.totals.PerDiem += info.hasPxp ? 0 : 1;
       }
 
