@@ -6,7 +6,7 @@ import { adminSupabase } from '../services/supabase.js';
 import { requireAuth, requireAgency, requireCompanyOrAbove } from '../middleware/auth.js';
 import { ApiError } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
-import { fetchRostersForCrew, rosterItemsList, mapRosterToRows, buildDailySummary, monthBounds, fetchActiveRolesForPeriod } from '../services/raido.js';
+import { fetchRosters, fetchRostersForCrew, rosterItemsList, mapRosterToRows, buildDailySummary, monthBounds, fetchActiveRolesForPeriod } from '../services/raido.js';
 
 // ── Rate helpers (inlined to avoid circular import) ───────────────────────────
 function normalizeCurrency(raw) {
@@ -160,6 +160,20 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
       logger.warn('Failed to fetch special roles', { error: e.message });
     }
 
+    // Fetch the full period roster from RAIDO ONCE. RAIDO cannot filter by
+    // crew server-side, so fetching per-placement just re-downloads the same
+    // payload N times. Share the items across the per-placement loop below.
+    let sharedRosterItems = [];
+    try {
+      const allRosters = await fetchRosters(periodFrom, periodTo);
+      sharedRosterItems = rosterItemsList(allRosters);
+      logger.info('RAIDO global fetch', { items: sharedRosterItems.length });
+      emit('raido_global', { items: sharedRosterItems.length });
+    } catch (e) {
+      logger.warn('RAIDO global fetch failed (will try per-placement as fallback)', { error: e.message });
+      emit('raido_global_error', { error: e.message });
+    }
+
     // Load charge type IDs once
     const { data: chargeTypes } = await adminSupabase.from('charge_types').select('id, code, carerix_type_id');
     const ctByCode = Object.fromEntries((chargeTypes || []).map(ct => [ct.code, ct]));
@@ -181,13 +195,18 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
           continue;
         }
 
-        const rosters      = await fetchRostersForCrew(periodFrom, periodTo, placement.crew_id);
-        const items        = rosterItemsList(rosters);
+        // Reuse the shared period-level fetch. Fallback to per-crew fetch
+        // only if the global fetch failed (sharedRosterItems empty).
+        let items = sharedRosterItems;
+        if (!items.length) {
+          const rosters = await fetchRostersForCrew(periodFrom, periodTo, placement.crew_id);
+          items = rosterItemsList(rosters);
+        }
         const rows         = mapRosterToRows(items, placement.crew_id, placement.crew_nia);
         const crewSummary  = buildDailySummary(rows).find(c => c.crewId?.toUpperCase() === placement.crew_id?.toUpperCase());
 
-        logger.info('Roster sync', { placement: placement.full_name, rosterItems: items.length, rows: rows.length, days: crewSummary?.days?.length || 0 });
-        emit('raido', { crew_id: placement.crew_id, items: items.length, rows: rows.length, days: crewSummary?.days?.length || 0 });
+        logger.info('Roster sync', { placement: placement.full_name, rosterRows: rows.length, days: crewSummary?.days?.length || 0 });
+        emit('raido', { crew_id: placement.crew_id, rows: rows.length, days: crewSummary?.days?.length || 0 });
 
         if (!crewSummary?.days?.length) { results.push({ placement: placement.full_name, days: 0, items: 0 }); synced++; continue; }
 
