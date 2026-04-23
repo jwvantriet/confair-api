@@ -41,12 +41,12 @@ export async function companyIdsForUser(user) {
  * Does a placement's contract overlap with a given period?
  *
  * A placement is "active in period" if:
- *   • its start_date is null, OR ≤ period.end_date       (started in time)
+ *   • it has a non-null start_date ≤ period.end_date       (known start, in time)
  *   AND
- *   • its end_date   is null, OR ≥ period.start_date     (not ended yet)
+ *   • its end_date is null, OR ≥ period.start_date          (not ended yet)
  *
- * Nullable dates are treated as open-ended on that side, matching the
- * Carerix import which leaves end_date null for ongoing contracts.
+ * A null start_date is treated as "not importable / not active" — matching the
+ * product rule: every placement must have a known start date in Carerix.
  *
  * @param placement - any object with `start_date` and `end_date` fields
  *                    (strings in 'YYYY-MM-DD' format)
@@ -56,7 +56,8 @@ export function isPlacementActiveInPeriod(placement, period) {
   if (!period?.start_date || !period?.end_date) return true;
   const s = placement?.start_date || null;
   const e = placement?.end_date || null;
-  const startedInTime = !s || s <= period.end_date;
-  const notEndedYet   = !e || e >= period.start_date;
-  return startedInTime && notEndedYet;
+  if (!s) return false;
+  if (s > period.end_date) return false;
+  if (e && e < period.start_date) return false;
+  return true;
 }
