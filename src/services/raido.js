@@ -112,6 +112,14 @@ function string(v) {
   return v == null ? '' : String(v);
 }
 
+// ── Rotation stop codes (shared with the rotations service + frontend) ───────
+// A day counts as a rotation STOP when ALL its activities' ActivityCode
+// values are in this set. Kept in sync with confair-platform/lib/overtime.ts.
+export const STOP_CODES = new Set([
+  '20-10','21-14','21-21','24-12','24-6','28-21',
+  'EML','RLO','RLOF','RLOW','MVTD','PXP','ULV','VAU','WFL','CNV',
+]);
+
 // ── Daily Allowance eligibility ───────────────────────────────────────────────
 // Direct port of _day_is_payable_for_summary from ServerModule1.py
 export function dayIsPayable(activities, crewNia) {
