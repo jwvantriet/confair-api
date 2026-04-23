@@ -88,7 +88,9 @@ async function paginate(query, qualifier, field) {
   let page = 0;
   const size = 100;
   while (true) {
-    const res = await queryGraphQL(query, { qualifier, pageable: { page, size } });
+    // Bulk imports can return big payloads — give each page a generous
+    // timeout so a full tenant doesn't blow up under Carerix latency.
+    const res = await queryGraphQL(query, { qualifier, pageable: { page, size } }, { timeoutMs: 60_000 });
     const items = res?.data?.[field]?.items || [];
     const total = res?.data?.[field]?.totalElements ?? items.length;
     all.push(...items);
