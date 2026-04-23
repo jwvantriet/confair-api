@@ -78,8 +78,8 @@ function crewCodeFromJob(job) {
 
 function isoDateOrNull(v) {
   if (!v) return null;
-  const d = String(v).split('T')[0];
-  return /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null;
+  const m = String(v).match(/^(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : null;
 }
 
 /** Paginate a GraphQL list query; query must accept { qualifier, pageable }. */
@@ -257,8 +257,9 @@ export async function syncCarerixCompany(carerixCompanyID, emit = () => {}) {
   const jobs = allJobs.filter(j => {
     const s = isoDateOrNull(j?.startDate);
     const e = isoDateOrNull(j?.endDate);
-    if (s && s > todayStr) return false;
-    if (e && e < todayStr) return false;
+    if (!s) return false;                 // no start date → skip per user rule
+    if (s > todayStr) return false;       // starts in future → skip
+    if (e && e < todayStr) return false;  // ended in past → skip
     return true;
   });
   result.placements.fetched = allJobs.length;
