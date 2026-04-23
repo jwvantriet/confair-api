@@ -43,7 +43,6 @@ const CR_JOBS_Q = `
           _id employeeID firstName lastName emailAddress
           paymentIbanCode paymentBicCode paymentAccountName
         }
-        toAgency { _id }
       }
     }
   }`;
@@ -137,7 +136,6 @@ async function upsertPlacement(companyId, crJob) {
     company_id:           companyId,
     carerix_job_id:       carerixJobId,
     carerix_placement_id: carerixPlacementId,
-    carerix_agency_id:    crJob.toAgency?._id ? String(crJob.toAgency._id) : null,
     full_name:            fullName,
     email:                emp.emailAddress || null,
     crew_id:              crewId,
@@ -236,14 +234,23 @@ export async function syncCarerixCompany(carerixCompanyID) {
   };
 
   // ── 2. Active jobs for this company ──────────────────────────────────────
-  const today = new Date().toISOString().split('T')[0];
+  // Keep the qualifier simple (only Carerix-native filters that we're sure
+  // about) and do the active-window check client-side. NSCalendarDate string
+  // formats have been flaky across tenants; avoiding them here.
   const jobsQualifier =
-    `toCompany.companyID == ${Number(carerixCompanyID)} ` +
-    `AND deleted == 0 ` +
-    `AND (endDate = nil OR endDate >= (NSCalendarDate) '${today}') ` +
-    `AND (startDate = nil OR startDate <= (NSCalendarDate) '${today}')`;
+    `toCompany.companyID == ${Number(carerixCompanyID)} AND deleted == 0`;
 
-  const jobs = await paginate(CR_JOBS_Q, jobsQualifier, 'crJobPage');
+  const allJobs = await paginate(CR_JOBS_Q, jobsQualifier, 'crJobPage');
+  const todayStr = new Date().toISOString().split('T')[0];
+  const jobs = allJobs.filter(j => {
+    const s = isoDateOrNull(j?.startDate);
+    const e = isoDateOrNull(j?.endDate);
+    if (s && s > todayStr) return false;   // starts in the future
+    if (e && e < todayStr) return false;   // already ended
+    return true;
+  });
+  result.placements.fetched = allJobs.length;
+  result.placements.filtered_active = jobs.length;
   for (const job of jobs) {
     try {
       const r = await upsertPlacement(companyId, job);
