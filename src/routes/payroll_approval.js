@@ -23,17 +23,23 @@ router.get('/summary/:periodId', async (req, res, next) => {
     if (periodErr) throw new ApiError(periodErr.message);
     if (!period) return res.json({ placements: [] });
 
-    // Agency sees all placements; company sees only their own
+    // Agency sees all placements; company sees only their own.
+    // Agency may narrow to a single company via ?companyId=<uuid>.
     const isAgency = user.role?.startsWith('agency_');
+    const requestedCompanyId = (req.query.companyId || '').trim() || null;
+
     let placementsQuery = adminSupabase
       .from('placements')
-      .select('id, crew_id, full_name, qualification, active_roles, crew_group, start_date, end_date')
+      .select('id, crew_id, full_name, qualification, active_roles, crew_group, start_date, end_date, company_id, companies(id, name, carerix_company_id)')
       .order('full_name');
 
     if (!isAgency) {
       const companyIds = await companyIdsForUser(user);
       if (!companyIds?.length) return res.json({ placements: [] });
       placementsQuery = placementsQuery.in('company_id', companyIds);
+    }
+    if (requestedCompanyId) {
+      placementsQuery = placementsQuery.eq('company_id', requestedCompanyId);
     }
 
     const { data: rawPlacements, error: pErr } = await placementsQuery;
@@ -179,6 +185,9 @@ router.get('/summary/:periodId', async (req, res, next) => {
       qualification: p.qualification,
       active_roles:  p.active_roles,
       crew_group:    p.crew_group,
+      companyId:             p.company_id,
+      companyName:           p.companies?.name ?? null,
+      carerixCompanyId:      p.companies?.carerix_company_id ?? null,
       sync_locked:   statusMap[p.id]?.sync_locked || false,
       sync_locked_at: statusMap[p.id]?.sync_locked_at || null,
       status:        statusMap[p.id]?.status || 'draft',
