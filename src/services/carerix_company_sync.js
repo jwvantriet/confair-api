@@ -214,13 +214,24 @@ async function upsertUserProfile(companyId, cru) {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-export async function syncCarerixCompany(carerixCompanyID) {
+/**
+ * Sync a Carerix company's active jobs + user-company links into our tables.
+ *
+ * Pass an `emit(step, data?)` callback to receive progress events; a sensible
+ * no-op is used when omitted. Events emitted:
+ *   started, company, jobs_fetching, jobs_fetched, placement_upserted,
+ *   placements_done, users_fetching, users_fetched, user_upserted,
+ *   users_done, done, error
+ */
+export async function syncCarerixCompany(carerixCompanyID, emit = () => {}) {
   const result = {
     carerixCompanyID: Number(carerixCompanyID),
     company: null,
     placements: { processed: 0, created: 0, updated: 0, errors: [] },
     users:      { processed: 0, created: 0, updated: 0, errors: [] },
   };
+
+  emit('started', { carerixCompanyID: Number(carerixCompanyID) });
 
   // ── 1. Company ────────────────────────────────────────────────────────────
   const companyResp = await queryGraphQL(CR_COMPANY_Q, {
@@ -234,44 +245,61 @@ export async function syncCarerixCompany(carerixCompanyID) {
     carerix_company_id: String(crCompany.companyID),
     name: crCompany.name,
   };
+  emit('company', result.company);
 
   // ── 2. Active jobs for this company ──────────────────────────────────────
-  // Keep the qualifier simple (only Carerix-native filters that we're sure
-  // about) and do the active-window check client-side. NSCalendarDate string
-  // formats have been flaky across tenants; avoiding them here.
   const jobsQualifier =
     `toCompany.companyID == ${Number(carerixCompanyID)} AND deleted == 0`;
 
+  emit('jobs_fetching', { qualifier: jobsQualifier });
   const allJobs = await paginate(CR_JOBS_Q, jobsQualifier, 'crJobPage');
   const todayStr = new Date().toISOString().split('T')[0];
   const jobs = allJobs.filter(j => {
     const s = isoDateOrNull(j?.startDate);
     const e = isoDateOrNull(j?.endDate);
-    if (s && s > todayStr) return false;   // starts in the future
-    if (e && e < todayStr) return false;   // already ended
+    if (s && s > todayStr) return false;
+    if (e && e < todayStr) return false;
     return true;
   });
   result.placements.fetched = allJobs.length;
   result.placements.filtered_active = jobs.length;
+  emit('jobs_fetched', { total: allJobs.length, active: jobs.length });
+
+  let pIdx = 0;
   for (const job of jobs) {
+    pIdx++;
     try {
       const r = await upsertPlacement(companyId, job);
       result.placements.processed++;
       if (r.created) result.placements.created++;
       else           result.placements.updated++;
+      if (pIdx % 10 === 0 || pIdx === jobs.length) {
+        emit('placements_progress', {
+          done: pIdx, total: jobs.length,
+          created: result.placements.created,
+          updated: result.placements.updated,
+        });
+      }
     } catch (e) {
       result.placements.errors.push({ jobID: job.jobID, error: e.message });
+      emit('placement_error', { jobID: job.jobID, error: e.message });
       logger.warn('placement upsert failed', { jobID: job.jobID, error: e.message });
     }
   }
+  emit('placements_done', result.placements);
 
   // ── 3. Users (contacts) linked to this company ───────────────────────────
   const userQualifier =
     `toCompany.companyID == ${Number(carerixCompanyID)} ` +
     `AND toUser.isActive == 1 AND toUser.deleted == 0`;
 
+  emit('users_fetching', { qualifier: userQualifier });
   const links = await paginate(CR_USER_COMPANY_Q, userQualifier, 'crUserCompanyPage');
+  emit('users_fetched', { total: links.length });
+
+  let uIdx = 0;
   for (const link of links) {
+    uIdx++;
     const cru = link?.toUser;
     if (!cru) continue;
     try {
@@ -281,11 +309,20 @@ export async function syncCarerixCompany(carerixCompanyID) {
       result.users.processed++;
       if (before.data) result.users.updated++;
       else             result.users.created++;
+      if (uIdx % 10 === 0 || uIdx === links.length) {
+        emit('users_progress', {
+          done: uIdx, total: links.length,
+          created: result.users.created,
+          updated: result.users.updated,
+        });
+      }
     } catch (e) {
       result.users.errors.push({ userID: cru.userID, _id: cru._id, error: e.message });
+      emit('user_error', { userID: cru.userID, _id: cru._id, error: e.message });
       logger.warn('user upsert failed', { userID: cru.userID, error: e.message });
     }
   }
+  emit('users_done', result.users);
 
   return result;
 }

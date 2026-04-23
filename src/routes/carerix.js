@@ -417,29 +417,53 @@ router.get('/placement-rates/:carerixPlacementId', requireAuth, requireAgency, a
 });
 
 // ── POST /carerix/sync/company/:carerixCompanyID ──────────────────────────────
-// Agency-only. Pull CRCompany + active CRJobs + CRUserCompany links for the
-// given companyID and upsert into our companies / placements / user_profiles /
-// user_company_access tables. Idempotent — safe to re-run.
+// Agency-only. Streams progress as newline-delimited JSON events so the
+// frontend can show live progress without the 2-minute axios client timeout
+// (Air Atlanta with ~hundreds of jobs can take several minutes).
+//
+// Event stream (one JSON object per line, \n-terminated):
+//   { step: 'started', carerixCompanyID }
+//   { step: 'heartbeat' }                 // every 10s
+//   { step: 'company', ...companyRow }
+//   { step: 'jobs_fetching' }
+//   { step: 'jobs_fetched', total, active }
+//   { step: 'placements_progress', done, total, created, updated }
+//   { step: 'placement_error', jobID, error }
+//   { step: 'placements_done', ...stats }
+//   { step: 'users_fetching' }
+//   { step: 'users_fetched', total }
+//   { step: 'users_progress', done, total, created, updated }
+//   { step: 'user_error', userID, error }
+//   { step: 'users_done', ...stats }
+//   { step: 'done', result }              // final success
+//   { step: 'error', message, carerix? }  // terminal failure
 router.post('/sync/company/:carerixCompanyID', requireAuth, requireAgency, async (req, res) => {
   const id = Number(req.params.carerixCompanyID);
   if (!Number.isInteger(id) || id <= 0) {
     return res.status(400).json({ error: 'invalid carerixCompanyID', carerixCompanyID: req.params.carerixCompanyID });
   }
+  res.setHeader('Content-Type',   'application/x-ndjson');
+  res.setHeader('Cache-Control',  'no-cache');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  const emit = (step, data = {}) => {
+    try { res.write(JSON.stringify({ step, ts: Date.now(), ...data }) + '\n'); } catch (_e) { /* socket gone */ }
+  };
+  const heartbeat = setInterval(() => emit('heartbeat'), 10_000);
+  res.on('close', () => clearInterval(heartbeat));
+
   try {
-    const result = await syncCarerixCompany(id);
-    res.json(result);
+    const result = await syncCarerixCompany(id, emit);
+    emit('done', { result });
   } catch (err) {
-    // Surface the actual failure (Carerix GraphQL body, Supabase error, etc.)
-    // so the Admin tools page shows something useful instead of a generic 500.
-    const status = err?.response?.status || err?.status || 500;
-    const body = {
-      error:    `Carerix company sync failed for ${id}`,
-      message:  err?.message || String(err),
-      status,
-      carerix:  err?.response?.data ?? null,   // GraphQL errors / HTML / etc.
-      stack:    process.env.NODE_ENV === 'production' ? undefined : err?.stack,
-    };
-    res.status(status >= 400 && status < 600 ? status : 500).json(body);
+    emit('error', {
+      message: err?.message || String(err),
+      status:  err?.response?.status || err?.status || 500,
+      carerix: err?.response?.data ?? null,
+    });
+  } finally {
+    clearInterval(heartbeat);
+    res.end();
   }
 });
 
