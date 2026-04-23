@@ -86,11 +86,11 @@ async function getServiceToken() {
 
 
 // ── GraphQL client ─────────────────────────────────────────────────────────────
-export async function queryGraphQL(query, variables = {}) {
-  return carerixGQL(query, variables);
+export async function queryGraphQL(query, variables = {}, options = {}) {
+  return carerixGQL(query, variables, options);
 }
 
-async function carerixGQL(query, variables = {}) {
+async function carerixGQL(query, variables = {}, { timeoutMs = 30_000 } = {}) {
   const token = await getServiceToken();
   const res = await axios.post(config.carerix.graphApiUrl, { query, variables }, {
     headers: {
@@ -98,7 +98,7 @@ async function carerixGQL(query, variables = {}) {
       'Content-Type':  'application/json',
       'User-Agent':    'confair-platform/1.0',
     },
-    timeout: 6_000,
+    timeout: timeoutMs,
   });
   if (res.data.errors?.length) {
     logger.warn('Carerix GraphQL errors', { errors: res.data.errors });
