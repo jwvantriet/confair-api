@@ -467,4 +467,44 @@ router.post('/sync/company/:carerixCompanyID', requireAuth, requireAgency, async
   }
 });
 
+// ── GET /carerix/probe/jobs/:carerixCompanyID ─────────────────────────────────
+// Agency-only. Returns the first 5 CRJob rows (raw) for a company so we can
+// eyeball what Carerix actually sends for fields like startDate/endDate/status.
+router.get('/probe/jobs/:carerixCompanyID', requireAuth, requireAgency, async (req, res, next) => {
+  try {
+    const id = Number(req.params.carerixCompanyID);
+    if (!Number.isInteger(id) || id <= 0) throw new ApiError('invalid carerixCompanyID', 400);
+    const { queryGraphQL } = await import('../services/carerix.js');
+    const result = await queryGraphQL(`
+      query ProbeJobs($qualifier: String, $pageable: Pageable) {
+        crJobPage(qualifier: $qualifier, pageable: $pageable) {
+          totalElements
+          items {
+            _id jobID name
+            startDate endDate deleted status statusDisplay
+            creationDate modificationDate forecastDate
+            toStatusNode { _id value dataNodeID }
+            toCompany { _id companyID name }
+            toEmployee { _id employeeID firstName lastName }
+          }
+        }
+      }
+    `, {
+      qualifier: `toCompany.companyID == ${id} AND deleted == 0`,
+      pageable: { page: 0, size: 5 },
+    }, { timeoutMs: 30_000 });
+    res.json({
+      carerixCompanyID: id,
+      totalElements: result?.data?.crJobPage?.totalElements ?? null,
+      sample: result?.data?.crJobPage?.items ?? [],
+      errors: result?.errors ?? null,
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err?.message || String(err),
+      carerix: err?.response?.data ?? null,
+    });
+  }
+});
+
 export default router;
