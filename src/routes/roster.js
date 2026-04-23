@@ -7,6 +7,7 @@ import { requireAuth, requireAgency, requireCompanyOrAbove } from '../middleware
 import { ApiError } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
 import { fetchRosters, fetchRostersForCrew, rosterItemsList, mapRosterToRows, buildDailySummary, monthBounds, fetchActiveRolesForPeriod, fetchDateOfEmploymentForPeriod } from '../services/raido.js';
+import { recomputePlacementRotations } from '../services/rotations.js';
 
 // ── Rate helpers (inlined to avoid circular import) ───────────────────────────
 function normalizeCurrency(raw) {
@@ -454,36 +455,34 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
         synced++;
         runState.items_created += itemsCreated;
 
-        // Compute and write Overtime charge items for rotations exceeding 65h BLH
-        // Rotation = consecutive payable days; OT = (total flight BLH - 65) per rotation
-        const hhmmToDec = (h) => { const p = (h||'').split(':'); return p.length===2?parseInt(p[0])+parseInt(p[1])/60:0; };
+        // Recompute rotations for this placement (looking back ~4 months so
+        // cross-month rotations stay consistent) and emit Overtime rows for
+        // any closed rotation with ot_hours > 0, keyed to the period the
+        // rotation ended in.
         const otCt = ctByCode['Overtime'];
-        if (otCt) {
-          let rotBLH = 0, rotStart = null, rotEndDay = null;
-          const flushRotation = async (endDate) => {
-            if (rotBLH > 65 && endDate) {
-              const otQty = Math.round((rotBLH - 65) * 100) / 100;
+        try {
+          const { wrote } = await recomputePlacementRotations(placement.id, { lookbackMonths: 4 });
+          emit('rotations', { crew_id: placement.crew_id, count: wrote });
+
+          if (otCt) {
+            const { data: closedOt } = await adminSupabase
+              .from('rotations')
+              .select('end_date, ot_hours, ot_period_id')
+              .eq('placement_id', placement.id)
+              .eq('ot_period_id', periodId)
+              .gt('ot_hours', 0);
+            for (const r of closedOt || []) {
               await adminSupabase.from('charge_items').upsert({
                 placement_id: placement.id, period_id: periodId,
-                charge_type_id: otCt.id, charge_date: endDate,
-                quantity: otQty, rate_amount: null, currency: 'USD', total_value: null, status: 'confirmed',
+                charge_type_id: otCt.id, charge_date: r.end_date,
+                quantity: r.ot_hours, rate_amount: null, currency: 'USD',
+                total_value: null, status: 'confirmed',
               }, { onConflict: 'placement_id,charge_date,charge_type_id', returning: 'minimal' });
             }
-          };
-          for (const day of crewSummary.days) {
-            if (day.isPayable) {
-              if (!rotStart) rotStart = day.date;
-              rotEndDay = day.date;
-              const acts = Array.isArray(day.activities) ? day.activities : [];
-              for (const a of acts) {
-                if (a?.aBLH && a.ActivityType?.toUpperCase() === 'FLIGHT') rotBLH += hhmmToDec(a.aBLH);
-              }
-            } else if (rotStart) {
-              await flushRotation(rotEndDay);
-              rotBLH = 0; rotStart = null; rotEndDay = null;
-            }
           }
-          if (rotStart) await flushRotation(rotEndDay); // rotation reaching end of period
+        } catch (rotErr) {
+          logger.warn('rotation recompute failed', { placement: placement.full_name, error: rotErr.message });
+          emit('rotations_warn', { crew_id: placement.crew_id, error: rotErr.message });
         }
       } catch (e) {
         logger.error('Sync error', { placement: placement.full_name, error: e.message });
