@@ -420,13 +420,27 @@ router.get('/placement-rates/:carerixPlacementId', requireAuth, requireAgency, a
 // Agency-only. Pull CRCompany + active CRJobs + CRUserCompany links for the
 // given companyID and upsert into our companies / placements / user_profiles /
 // user_company_access tables. Idempotent — safe to re-run.
-router.post('/sync/company/:carerixCompanyID', requireAuth, requireAgency, async (req, res, next) => {
+router.post('/sync/company/:carerixCompanyID', requireAuth, requireAgency, async (req, res) => {
+  const id = Number(req.params.carerixCompanyID);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: 'invalid carerixCompanyID', carerixCompanyID: req.params.carerixCompanyID });
+  }
   try {
-    const id = Number(req.params.carerixCompanyID);
-    if (!Number.isInteger(id) || id <= 0) throw new ApiError('invalid carerixCompanyID', 400);
     const result = await syncCarerixCompany(id);
     res.json(result);
-  } catch (err) { next(err); }
+  } catch (err) {
+    // Surface the actual failure (Carerix GraphQL body, Supabase error, etc.)
+    // so the Admin tools page shows something useful instead of a generic 500.
+    const status = err?.response?.status || err?.status || 500;
+    const body = {
+      error:    `Carerix company sync failed for ${id}`,
+      message:  err?.message || String(err),
+      status,
+      carerix:  err?.response?.data ?? null,   // GraphQL errors / HTML / etc.
+      stack:    process.env.NODE_ENV === 'production' ? undefined : err?.stack,
+    };
+    res.status(status >= 400 && status < 600 ? status : 500).json(body);
+  }
 });
 
 export default router;
