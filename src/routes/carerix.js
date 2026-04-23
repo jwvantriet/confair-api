@@ -507,4 +507,97 @@ router.get('/probe/jobs/:carerixCompanyID', requireAuth, requireAgency, async (r
   }
 });
 
+// ── GET /carerix/probe/jobs-schema ────────────────────────────────────────────
+// Agency-only. Introspects the CRJob type so we can see every scalar/relation
+// Carerix exposes — used to discover things like `jobActiveTag`.
+router.get('/probe/jobs-schema', requireAuth, requireAgency, async (req, res) => {
+  try {
+    const { queryGraphQL } = await import('../services/carerix.js');
+    const result = await queryGraphQL(`
+      query JobSchema {
+        __type(name: "CRJob") {
+          name
+          fields {
+            name
+            type {
+              name kind
+              ofType { name kind ofType { name kind } }
+            }
+          }
+        }
+      }
+    `, {}, { timeoutMs: 30_000 });
+    res.json({
+      type: result?.data?.__type?.name ?? null,
+      fields: result?.data?.__type?.fields ?? [],
+      errors: result?.errors ?? null,
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err?.message || String(err),
+      carerix: err?.response?.data ?? null,
+    });
+  }
+});
+
+// ── GET /carerix/probe/jobs-statuses/:carerixCompanyID ────────────────────────
+// Agency-only. Pulls a wider page of jobs and reports the distribution of
+// status / statusDisplay / toStatusNode.value so we can decide which states
+// count as "active" before adding a status-based filter to the import.
+router.get('/probe/jobs-statuses/:carerixCompanyID', requireAuth, requireAgency, async (req, res) => {
+  try {
+    const id = Number(req.params.carerixCompanyID);
+    if (!Number.isInteger(id) || id <= 0) throw new ApiError('invalid carerixCompanyID', 400);
+    const { queryGraphQL } = await import('../services/carerix.js');
+    const result = await queryGraphQL(`
+      query ProbeStatuses($qualifier: String, $pageable: Pageable) {
+        crJobPage(qualifier: $qualifier, pageable: $pageable) {
+          totalElements
+          items {
+            jobID status statusDisplay
+            startDate endDate
+            toStatusNode { _id value dataNodeID }
+          }
+        }
+      }
+    `, {
+      qualifier: `toCompany.companyID == ${id} AND deleted == 0`,
+      pageable: { page: 0, size: 500 },
+    }, { timeoutMs: 60_000 });
+    const items = result?.data?.crJobPage?.items ?? [];
+    const todayStr = new Date().toISOString().split('T')[0];
+    const parseYMD = v => { if (!v) return null; const m = String(v).match(/^(\d{4}-\d{2}-\d{2})/); return m ? m[1] : null; };
+    const counts = new Map();
+    for (const j of items) {
+      const s = parseYMD(j?.startDate);
+      const e = parseYMD(j?.endDate);
+      const currentByDate =
+        s && s <= todayStr && (!e || e >= todayStr);
+      const key = JSON.stringify({
+        status: j?.status ?? null,
+        statusDisplay: j?.statusDisplay ?? null,
+        nodeValue: j?.toStatusNode?.value ?? null,
+        dataNodeID: j?.toStatusNode?.dataNodeID ?? null,
+        currentByDate: Boolean(currentByDate),
+      });
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    const distribution = [...counts.entries()]
+      .map(([k, count]) => ({ ...JSON.parse(k), count }))
+      .sort((a, b) => b.count - a.count);
+    res.json({
+      carerixCompanyID: id,
+      sampled: items.length,
+      totalElements: result?.data?.crJobPage?.totalElements ?? null,
+      distribution,
+      errors: result?.errors ?? null,
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err?.message || String(err),
+      carerix: err?.response?.data ?? null,
+    });
+  }
+});
+
 export default router;

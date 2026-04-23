@@ -143,7 +143,6 @@ async function upsertPlacement(companyId, crJob) {
     crew_id:              crewId,
     start_date:           isoDateOrNull(crJob.startDate),
     end_date:             isoDateOrNull(crJob.endDate),
-    is_active:            true,
     inv_iban:             emp.paymentIbanCode || null,
     inv_bic:              emp.paymentBicCode || null,
     inv_account_name:     emp.paymentAccountName || null,

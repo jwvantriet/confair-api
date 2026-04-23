@@ -28,7 +28,6 @@ router.get('/summary/:periodId', async (req, res, next) => {
     let placementsQuery = adminSupabase
       .from('placements')
       .select('id, crew_id, full_name, qualification, active_roles, crew_group, start_date, end_date')
-      .eq('is_active', true)
       .order('full_name');
 
     if (!isAgency) {
