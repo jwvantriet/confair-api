@@ -248,12 +248,12 @@ export async function syncCarerixCompany(carerixCompanyID, emit = () => {}) {
   emit('company', result.company);
 
   // ── 2. Active jobs for this company ──────────────────────────────────────
-  // Carerix stores each job's status as a CRDataNode with `active` / `notActive`
-  // flags (the "jobActiveTag" concept). Jobs whose status node is inactive
-  // (e.g. Finished, Did not start, Cancelled) must not reach the roster.
+  // NOTE: Previously tried narrowing with `AND toStatusNode.active == 1` but
+  // that appeared to return zero jobs in practice, which combined with the
+  // orphan-cleanup below wiped all placements. Revert to the plain qualifier
+  // until the status-node filter is verified via /carerix/probe/jobs-statuses.
   const jobsQualifier =
-    `toCompany.companyID == ${Number(carerixCompanyID)} AND deleted == 0 ` +
-    `AND toStatusNode.active == 1`;
+    `toCompany.companyID == ${Number(carerixCompanyID)} AND deleted == 0`;
 
   emit('jobs_fetching', { qualifier: jobsQualifier });
   const allJobs = await paginate(CR_JOBS_Q, jobsQualifier, 'crJobPage');
@@ -293,49 +293,16 @@ export async function syncCarerixCompany(carerixCompanyID, emit = () => {}) {
   }
   emit('placements_done', result.placements);
 
-  // ── 2b. Orphan cleanup ───────────────────────────────────────────────────
-  // Any placement previously imported for this company whose carerix_job_id
-  // was NOT returned by the qualifier this time is now "dead" from Carerix's
-  // perspective (deleted, moved to an inactive status, reassigned to another
-  // company, etc.). Per the agreed data-model (placement visibility is
-  // driven by start_date/end_date; is_active is unused), the cleanest action
-  // is to hard-delete these rows. CASCADE sweeps dependent rows.
-  try {
-    const seenIds = new Set(
-      jobs.map(j => (j?.jobID != null ? String(j.jobID) : null)).filter(Boolean),
-    );
-    const { data: existing } = await adminSupabase
-      .from('placements')
-      .select('id, carerix_job_id, full_name')
-      .eq('company_id', companyId);
-
-    const orphans = (existing || []).filter(
-      p => p.carerix_job_id && !seenIds.has(String(p.carerix_job_id)),
-    );
-
-    result.placements.orphans_found = orphans.length;
-    emit('orphans_found', { count: orphans.length });
-
-    if (orphans.length) {
-      const orphanIds = orphans.map(o => o.id);
-      const { error: delErr } = await adminSupabase
-        .from('placements')
-        .delete()
-        .in('id', orphanIds);
-      if (delErr) {
-        result.placements.orphan_cleanup_error = delErr.message;
-        emit('orphan_cleanup_error', { error: delErr.message });
-        logger.warn('orphan cleanup failed', { error: delErr.message });
-      } else {
-        result.placements.orphans_deleted = orphans.length;
-        emit('orphans_deleted', { count: orphans.length });
-      }
-    }
-  } catch (e) {
-    result.placements.orphan_cleanup_error = e.message;
-    emit('orphan_cleanup_error', { error: e.message });
-    logger.warn('orphan cleanup failed', { error: e.message });
-  }
+  // ── 2b. Orphan cleanup — DISABLED ────────────────────────────────────────
+  // Previous implementation hard-deleted placements whose carerix_job_id was
+  // not in the fetched set. Combined with a qualifier that returned zero
+  // jobs (e.g. a bad filter), this wiped the entire company.
+  //
+  // Re-enable only when:
+  //   1. The fetched set is compared against the RAW allJobs (unfiltered by
+  //      date) so history rows aren't considered orphans; AND
+  //   2. A guard refuses to delete when the fetched set is empty or
+  //      represents a suspicious drop (e.g. > 20% of prior population).
 
   // ── 3. Users (contacts) linked to this company ───────────────────────────
   const userQualifier =
