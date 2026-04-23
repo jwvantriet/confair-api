@@ -8,6 +8,7 @@ import { ApiError } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
 import { fetchRosters, fetchRostersForCrew, rosterItemsList, mapRosterToRows, buildDailySummary, monthBounds, fetchActiveRolesForPeriod, fetchDateOfEmploymentForPeriod } from '../services/raido.js';
 import { recomputePlacementRotations } from '../services/rotations.js';
+import { companyIdsForUser } from '../services/access.js';
 
 // ── Rate helpers (inlined to avoid circular import) ───────────────────────────
 function normalizeCurrency(raw) {
@@ -517,9 +518,9 @@ router.get('/summary/:periodId', async (req, res, next) => {
       if (!p) return res.json({ placements: [] });
       placementIds = [p.id];
     } else if (user.role === 'company_admin' || user.role === 'company_user') {
-      const { data: company } = await adminSupabase.from('companies').select('id').eq('carerix_company_id', user.carerix_company_id).maybeSingle();
-      if (!company) return res.json({ placements: [] });
-      const { data: plist } = await adminSupabase.from('placements').select('id').eq('company_id', company.id);
+      const companyIds = await companyIdsForUser(user);
+      if (!companyIds?.length) return res.json({ placements: [] });
+      const { data: plist } = await adminSupabase.from('placements').select('id').in('company_id', companyIds);
       if (!plist?.length) return res.json({ placements: [] });
       placementIds = plist.map(p => p.id);
     }
@@ -646,10 +647,9 @@ router.get('/corrections/:periodId?', requireCompanyOrAbove, async (req, res, ne
     if (req.params.periodId) query = query.eq('period_id', req.params.periodId);
 
     if (req.user.role === 'company_admin' || req.user.role === 'company_user') {
-      const { data: company } = await adminSupabase
-        .from('companies').select('id').eq('carerix_company_id', req.user.carerix_company_id).maybeSingle();
-      if (!company) return res.json([]);
-      const { data: plist } = await adminSupabase.from('placements').select('id').eq('company_id', company.id);
+      const companyIds = await companyIdsForUser(req.user);
+      if (!companyIds?.length) return res.json([]);
+      const { data: plist } = await adminSupabase.from('placements').select('id').in('company_id', companyIds);
       const pids = (plist || []).map(p => p.id);
       if (!pids.length) return res.json([]);
       query = query.in('placement_id', pids);

@@ -3,6 +3,7 @@ import { Router } from 'express';
 import { requireAuth, requireCompanyOrAbove } from '../middleware/auth.js';
 import { adminSupabase } from '../services/supabase.js';
 import { ApiError } from '../middleware/errorHandler.js';
+import { companyIdsForUser } from '../services/access.js';
 
 const router = Router();
 router.use(requireAuth, requireCompanyOrAbove);
@@ -22,12 +23,9 @@ router.get('/summary/:periodId', async (req, res, next) => {
       .order('full_name');
 
     if (!isAgency) {
-      const { data: company } = await adminSupabase
-        .from('companies').select('id')
-        .eq('carerix_company_id', user.carerix_company_id)
-        .maybeSingle();
-      if (!company) throw new ApiError('Company not found', 404);
-      placementsQuery = placementsQuery.eq('company_id', company.id);
+      const companyIds = await companyIdsForUser(user);
+      if (!companyIds?.length) return res.json({ placements: [] });
+      placementsQuery = placementsQuery.in('company_id', companyIds);
     }
 
     const { data: placements, error: pErr } = await placementsQuery;
@@ -198,15 +196,12 @@ router.get('/roster/:placementId/:periodId', async (req, res, next) => {
 
     // Agency can access any placement; company can only access their own
     if (!user.role?.startsWith('agency_')) {
-      const { data: company } = await adminSupabase
-        .from('companies').select('id')
-        .eq('carerix_company_id', user.carerix_company_id)
-        .maybeSingle();
-      if (!company) throw new ApiError('Company not found', 404);
+      const companyIds = await companyIdsForUser(user);
+      if (!companyIds?.length) throw new ApiError('Placement not found or access denied', 404);
       const { data: placement } = await adminSupabase
         .from('placements').select('id')
         .eq('id', placementId)
-        .eq('company_id', company.id)
+        .in('company_id', companyIds)
         .maybeSingle();
       if (!placement) throw new ApiError('Placement not found or access denied', 404);
     }
@@ -251,17 +246,13 @@ router.post('/correction', async (req, res, next) => {
     if (!placement_id || !period_id || !correction_date)
       throw new ApiError('placement_id, period_id and correction_date are required', 400);
 
-    // Verify ownership
-    const { data: company } = await adminSupabase
-      .from('companies').select('id')
-      .eq('carerix_company_id', user.carerix_company_id)
-      .maybeSingle();
-    if (!company) throw new ApiError('Company not found', 404);
-
+    // Verify ownership — placement must be in one of the user's companies
+    const companyIds = await companyIdsForUser(user);
+    if (!companyIds?.length) throw new ApiError('Placement not found or access denied', 404);
     const { data: placement } = await adminSupabase
       .from('placements').select('id')
       .eq('id', placement_id)
-      .eq('company_id', company.id)
+      .in('company_id', companyIds)
       .maybeSingle();
     if (!placement) throw new ApiError('Placement not found or access denied', 404);
 
@@ -316,11 +307,10 @@ router.post('/approve-line/:placementId/:periodId', async (req, res, next) => {
 
     // Verify placement belongs to this company (or agency can approve any)
     if (!user.role?.startsWith('agency_')) {
-      const { data: company } = await adminSupabase
-        .from('companies').select('id').eq('carerix_company_id', user.carerix_company_id).maybeSingle();
-      if (!company) throw new ApiError('Company not found', 404);
+      const companyIds = await companyIdsForUser(user);
+      if (!companyIds?.length) throw new ApiError('Forbidden', 403);
       const { data: placement } = await adminSupabase
-        .from('placements').select('id').eq('id', placementId).eq('company_id', company.id).maybeSingle();
+        .from('placements').select('id').eq('id', placementId).in('company_id', companyIds).maybeSingle();
       if (!placement) throw new ApiError('Forbidden', 403);
     }
 
@@ -366,13 +356,14 @@ router.post('/approve-correction/:id', async (req, res, next) => {
     if (fetchErr || !correction) throw new ApiError('Correction not found', 404);
     if (correction.correction_type === 'COMPANY') throw new ApiError('Cannot approve company corrections this way', 400);
 
-    // Verify placement belongs to this company
-    const { data: company } = await adminSupabase
-      .from('companies').select('id').eq('carerix_company_id', user.carerix_company_id).maybeSingle();
-    if (!company) throw new ApiError('Company not found', 404);
-    const { data: placement } = await adminSupabase
-      .from('placements').select('id').eq('id', correction.placement_id).eq('company_id', company.id).maybeSingle();
-    if (!placement) throw new ApiError('Forbidden', 403);
+    // Verify placement belongs to one of the user's companies
+    {
+      const companyIds = await companyIdsForUser(user);
+      if (!companyIds?.length) throw new ApiError('Forbidden', 403);
+      const { data: placement } = await adminSupabase
+        .from('placements').select('id').eq('id', correction.placement_id).in('company_id', companyIds).maybeSingle();
+      if (!placement) throw new ApiError('Forbidden', 403);
+    }
 
     // Approve
     const { error } = await adminSupabase
@@ -422,13 +413,14 @@ router.post('/decline-correction/:id', async (req, res, next) => {
     if (correction.correction_type === 'COMPANY') throw new ApiError('Cannot decline company corrections', 400);
     if (correction.status !== 'pending') throw new ApiError('Only pending corrections can be declined', 400);
 
-    // Verify placement belongs to this company
-    const { data: company } = await adminSupabase
-      .from('companies').select('id').eq('carerix_company_id', user.carerix_company_id).maybeSingle();
-    if (!company) throw new ApiError('Company not found', 404);
-    const { data: placement } = await adminSupabase
-      .from('placements').select('id').eq('id', correction.placement_id).eq('company_id', company.id).maybeSingle();
-    if (!placement) throw new ApiError('Forbidden', 403);
+    // Verify placement belongs to one of the user's companies
+    {
+      const companyIds = await companyIdsForUser(user);
+      if (!companyIds?.length) throw new ApiError('Forbidden', 403);
+      const { data: placement } = await adminSupabase
+        .from('placements').select('id').eq('id', correction.placement_id).in('company_id', companyIds).maybeSingle();
+      if (!placement) throw new ApiError('Forbidden', 403);
+    }
 
     const { error } = await adminSupabase
       .from('charge_corrections')
