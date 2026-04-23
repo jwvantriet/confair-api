@@ -7,6 +7,7 @@ import { XMLParser } from 'fast-xml-parser';
 import { config } from '../config.js';
 import { adminSupabase } from '../services/supabase.js';
 import { fetchAndCacheFee, testCarerixConnection } from '../services/carerix.js';
+import { syncCarerixCompany } from '../services/carerix_company_sync.js';
 import { requireAuth, requireAgency } from '../middleware/auth.js';
 import { ApiError } from '../middleware/errorHandler.js';
 
@@ -415,5 +416,17 @@ router.get('/placement-rates/:carerixPlacementId', requireAuth, requireAgency, a
   } catch (err) { next(err); }
 });
 
+// ── POST /carerix/sync/company/:carerixCompanyID ──────────────────────────────
+// Agency-only. Pull CRCompany + active CRJobs + CRUserCompany links for the
+// given companyID and upsert into our companies / placements / user_profiles /
+// user_company_access tables. Idempotent — safe to re-run.
+router.post('/sync/company/:carerixCompanyID', requireAuth, requireAgency, async (req, res, next) => {
+  try {
+    const id = Number(req.params.carerixCompanyID);
+    if (!Number.isInteger(id) || id <= 0) throw new ApiError('invalid carerixCompanyID', 400);
+    const result = await syncCarerixCompany(id);
+    res.json(result);
+  } catch (err) { next(err); }
+});
 
 export default router;

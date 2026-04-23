@@ -10,6 +10,7 @@
 import { Router } from 'express';
 import { requireAuth, requireCompanyOrAbove } from '../middleware/auth.js';
 import { adminSupabase } from '../services/supabase.js';
+import { companyIdsForUser } from '../services/access.js';
 import { ApiError } from '../middleware/errorHandler.js';
 import { writeAuditLog } from '../utils/audit.js';
 
@@ -168,12 +169,14 @@ router.delete('/:id', async (req, res, next) => {
       if (correction.correction_type !== 'COMPANY') {
         throw new ApiError('Company users can only delete company corrections', 403);
       }
-      // Verify placement belongs to this company
-      const { data: company } = await adminSupabase
-        .from('companies').select('id').eq('carerix_company_id', user.carerix_company_id).maybeSingle();
-      if (!company) throw new ApiError('Company not found', 404);
+      // Verify the placement belongs to any of the user's companies
+      const companyIds = await companyIdsForUser(user);
+      if (!companyIds?.length) throw new ApiError('Forbidden', 403);
       const { data: placement } = await adminSupabase
-        .from('placements').select('id').eq('id', correction.placement_id).eq('company_id', company.id).maybeSingle();
+        .from('placements').select('id')
+        .eq('id', correction.placement_id)
+        .in('company_id', companyIds)
+        .maybeSingle();
       if (!placement) throw new ApiError('Forbidden', 403);
     } else if (!user.role?.startsWith('agency_')) {
       throw new ApiError('Forbidden', 403);

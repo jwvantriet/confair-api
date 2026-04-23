@@ -8,6 +8,7 @@ import { adminSupabase } from '../services/supabase.js';
 import { requireAuth, requireCompanyOrAbove } from '../middleware/auth.js';
 import { ApiError } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
+import { companyIdsForUser } from '../services/access.js';
 
 const router = Router();
 
@@ -140,10 +141,9 @@ router.get('/', async (req, res, next) => {
       if (!p) return res.json([]);
       query = query.eq('placement_id', p.id);
     } else if (user.role === 'company_admin' || user.role === 'company_user') {
-      const profile = await getUserProfile(user.id);
-      const { data: company } = await adminSupabase.from('companies').select('id').eq('carerix_company_id', profile.carerix_company_id).maybeSingle();
-      if (!company) return res.json([]);
-      const { data: placements } = await adminSupabase.from('placements').select('id').eq('company_id', company.id);
+      const companyIds = await companyIdsForUser(user);
+      if (!companyIds?.length) return res.json([]);
+      const { data: placements } = await adminSupabase.from('placements').select('id').in('company_id', companyIds);
       const ids = (placements || []).map(p => p.id);
       if (!ids.length) return res.json([]);
       query = query.in('placement_id', ids).neq('status', 'draft');
