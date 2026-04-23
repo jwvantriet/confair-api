@@ -483,7 +483,7 @@ router.get('/probe/jobs/:carerixCompanyID', requireAuth, requireAgency, async (r
             _id jobID name
             startDate endDate deleted status statusDisplay
             creationDate modificationDate forecastDate
-            toStatusNode { _id value dataNodeID }
+            toStatusNode { _id value dataNodeID active notActive tag }
             toCompany { _id companyID name }
             toEmployee { _id employeeID firstName lastName }
           }
@@ -556,7 +556,7 @@ router.get('/probe/jobs-statuses/:carerixCompanyID', requireAuth, requireAgency,
           items {
             jobID status statusDisplay
             startDate endDate
-            toStatusNode { _id value dataNodeID }
+            toStatusNode { _id value dataNodeID active notActive tag }
           }
         }
       }
@@ -577,6 +577,9 @@ router.get('/probe/jobs-statuses/:carerixCompanyID', requireAuth, requireAgency,
         status: j?.status ?? null,
         statusDisplay: j?.statusDisplay ?? null,
         nodeValue: j?.toStatusNode?.value ?? null,
+        nodeActive: j?.toStatusNode?.active ?? null,
+        nodeNotActive: j?.toStatusNode?.notActive ?? null,
+        nodeTag: j?.toStatusNode?.tag ?? null,
         dataNodeID: j?.toStatusNode?.dataNodeID ?? null,
         currentByDate: Boolean(currentByDate),
       });
