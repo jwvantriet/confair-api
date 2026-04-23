@@ -6,7 +6,7 @@ import { adminSupabase } from '../services/supabase.js';
 import { requireAuth, requireAgency, requireCompanyOrAbove } from '../middleware/auth.js';
 import { ApiError } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
-import { fetchRosters, fetchRostersForCrew, rosterItemsList, mapRosterToRows, buildDailySummary, monthBounds, fetchActiveRolesForPeriod, fetchDateOfEmploymentForPeriod, isStopDay } from '../services/raido.js';
+import { fetchRosters, fetchRostersForCrew, rosterItemsList, mapRosterToRows, buildDailySummary, monthBounds, fetchActiveRolesForPeriod, fetchDateOfEmploymentForPeriod } from '../services/raido.js';
 
 // ── Rate helpers (inlined to avoid circular import) ───────────────────────────
 function normalizeCurrency(raw) {
@@ -454,10 +454,8 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
         synced++;
         runState.items_created += itemsCreated;
 
-        // Compute and write Overtime charge items for rotations exceeding 65h BLH.
-        // Rotation = consecutive days that are BOTH payable AND not stop-code days.
-        // PXP, ULV, VAU and the tour codes (see STOP_CODES) break the rotation
-        // even though they're payable — matches the frontend overtime.ts rule.
+        // Compute and write Overtime charge items for rotations exceeding 65h BLH
+        // Rotation = consecutive payable days; OT = (total flight BLH - 65) per rotation
         const hhmmToDec = (h) => { const p = (h||'').split(':'); return p.length===2?parseInt(p[0])+parseInt(p[1])/60:0; };
         const otCt = ctByCode['Overtime'];
         if (otCt) {
@@ -473,11 +471,10 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
             }
           };
           for (const day of crewSummary.days) {
-            const acts = Array.isArray(day.activities) ? day.activities : [];
-            const inRotation = day.isPayable && !isStopDay(acts);
-            if (inRotation) {
+            if (day.isPayable) {
               if (!rotStart) rotStart = day.date;
               rotEndDay = day.date;
+              const acts = Array.isArray(day.activities) ? day.activities : [];
               for (const a of acts) {
                 if (a?.aBLH && a.ActivityType?.toUpperCase() === 'FLIGHT') rotBLH += hhmmToDec(a.aBLH);
               }
