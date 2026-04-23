@@ -24,6 +24,7 @@ import expenseRoutes         from './routes/expenses.js';
 import payrollApprovalRoutes from './routes/payroll_approval.js';
 import errorLogRoutes        from './routes/errors.js';
 import rotationsAdminRoutes  from './routes/rotations_admin.js';
+import chargeConfigRoutes    from './routes/charge_config.js';
 
 const app = express();
 
@@ -75,6 +76,7 @@ app.use('/payroll-roster', payrollRosterRoutes);
 app.use('/diagnostics',    diagnosticsRoutes);
 app.use('/errors',         errorLogRoutes);
 app.use('/rotations',      rotationsAdminRoutes);
+app.use('/charge-config',  chargeConfigRoutes);
 app.use(errorHandler);
 
 app.listen(config.port, () =>
