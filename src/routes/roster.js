@@ -8,7 +8,7 @@ import { ApiError } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
 import { fetchRosters, fetchRostersForCrew, rosterItemsList, mapRosterToRows, buildDailySummary, monthBounds, fetchActiveRolesForPeriod, fetchDateOfEmploymentForPeriod } from '../services/raido.js';
 import { recomputePlacementRotations } from '../services/rotations.js';
-import { companyIdsForUser } from '../services/access.js';
+import { companyIdsForUser, isPlacementActiveInPeriod } from '../services/access.js';
 
 // ── Rate helpers (inlined to avoid circular import) ───────────────────────────
 function normalizeCurrency(raw) {
@@ -203,10 +203,15 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
     if (!period) throw new ApiError('Period not found', 404);
     emit('period', { ref: period.period_ref, from: period.start_date, to: period.end_date });
 
-    const { data: placements } = await adminSupabase
+    const { data: allPlacementsForSync } = await adminSupabase
       .from('placements')
-      .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, carerix_job_id, user_profile_id')
+      .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, carerix_job_id, user_profile_id, start_date, end_date')
       .not('crew_id', 'is', null);
+
+    // Only sync placements whose contract overlaps the period being synced.
+    // Skips legacy / inactive / future-start / already-ended jobs that may
+    // share a crew_id with someone currently on contract.
+    const placements = (allPlacementsForSync || []).filter(p => isPlacementActiveInPeriod(p, period));
 
     if (!placements?.length) {
       emit('done', { synced: 0, errors: 0, results: [] });
@@ -225,13 +230,15 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
         const matchResult = await autoMatchPlacementsCarerixIds();
         logger.info('Carerix auto-match', matchResult);
         emit('carerix_match', matchResult);
-        // Reload placements so newly matched IDs are available during sync
+        // Reload placements so newly matched IDs are available during sync.
+        // Re-apply the period-active filter after the reload.
         if (matchResult.matched > 0) {
           const { data: refreshed } = await adminSupabase
             .from('placements')
-            .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, carerix_job_id, user_profile_id')
+            .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, carerix_job_id, user_profile_id, start_date, end_date')
             .not('crew_id', 'is', null);
-          placements.splice(0, placements.length, ...(refreshed || []));
+          const active = (refreshed || []).filter(p => isPlacementActiveInPeriod(p, period));
+          placements.splice(0, placements.length, ...active);
         }
       } catch (e) {
         logger.warn('Carerix auto-match failed (non-fatal)', { error: e.message });
@@ -510,19 +517,29 @@ router.get('/summary/:periodId', async (req, res, next) => {
     const { periodId } = req.params;
     const { user }     = req;
 
-    // Determine which placements to show
-    let placementIds = null; // null = no filter (agency sees all)
+    // Resolve the period so we can filter placements by contract-overlap
+    const { data: period } = await adminSupabase
+      .from('payroll_periods').select('id, start_date, end_date')
+      .eq('id', periodId).maybeSingle();
+    if (!period) return res.json({ placements: [] });
+
+    // Determine which placements to show (scoped by role) and then keep
+    // only those whose contract overlaps this period.
+    let placementIds = null; // null = no scope filter (agency)
 
     if (user.role === 'placement') {
-      const { data: p } = await adminSupabase.from('placements').select('id').eq('user_profile_id', user.id).maybeSingle();
-      if (!p) return res.json({ placements: [] });
+      const { data: p } = await adminSupabase.from('placements')
+        .select('id, start_date, end_date').eq('user_profile_id', user.id).maybeSingle();
+      if (!p || !isPlacementActiveInPeriod(p, period)) return res.json({ placements: [] });
       placementIds = [p.id];
     } else if (user.role === 'company_admin' || user.role === 'company_user') {
       const companyIds = await companyIdsForUser(user);
       if (!companyIds?.length) return res.json({ placements: [] });
-      const { data: plist } = await adminSupabase.from('placements').select('id').in('company_id', companyIds);
-      if (!plist?.length) return res.json({ placements: [] });
-      placementIds = plist.map(p => p.id);
+      const { data: plist } = await adminSupabase.from('placements')
+        .select('id, start_date, end_date').in('company_id', companyIds);
+      const active = (plist || []).filter(p => isPlacementActiveInPeriod(p, period));
+      if (!active.length) return res.json({ placements: [] });
+      placementIds = active.map(p => p.id);
     }
 
     // Fetch charge items

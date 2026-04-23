@@ -3,7 +3,7 @@ import { Router } from 'express';
 import { requireAuth, requireCompanyOrAbove } from '../middleware/auth.js';
 import { adminSupabase } from '../services/supabase.js';
 import { ApiError } from '../middleware/errorHandler.js';
-import { companyIdsForUser } from '../services/access.js';
+import { companyIdsForUser, isPlacementActiveInPeriod } from '../services/access.js';
 
 const router = Router();
 router.use(requireAuth, requireCompanyOrAbove);
@@ -14,11 +14,20 @@ router.get('/summary/:periodId', async (req, res, next) => {
     const { user } = req;
     const { periodId } = req.params;
 
+    // Resolve the period up front — we need its start/end to filter
+    // placements by contract-overlap (start_date ≤ period.end AND
+    // (end_date is null OR end_date ≥ period.start)).
+    const { data: period, error: periodErr } = await adminSupabase
+      .from('payroll_periods').select('id, start_date, end_date')
+      .eq('id', periodId).maybeSingle();
+    if (periodErr) throw new ApiError(periodErr.message);
+    if (!period) return res.json({ placements: [] });
+
     // Agency sees all placements; company sees only their own
     const isAgency = user.role?.startsWith('agency_');
     let placementsQuery = adminSupabase
       .from('placements')
-      .select('id, crew_id, full_name, qualification, active_roles, crew_group')
+      .select('id, crew_id, full_name, qualification, active_roles, crew_group, start_date, end_date')
       .eq('is_active', true)
       .order('full_name');
 
@@ -28,9 +37,13 @@ router.get('/summary/:periodId', async (req, res, next) => {
       placementsQuery = placementsQuery.in('company_id', companyIds);
     }
 
-    const { data: placements, error: pErr } = await placementsQuery;
+    const { data: rawPlacements, error: pErr } = await placementsQuery;
     if (pErr) throw new ApiError(pErr.message);
-    if (!placements?.length) return res.json({ placements: [] });
+    if (!rawPlacements?.length) return res.json({ placements: [] });
+
+    // Only keep placements whose contract overlaps this period
+    const placements = rawPlacements.filter(p => isPlacementActiveInPeriod(p, period));
+    if (!placements.length) return res.json({ placements: [] });
 
     const placementIds = placements.map(p => p.id);
 

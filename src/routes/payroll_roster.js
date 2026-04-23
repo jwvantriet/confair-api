@@ -8,7 +8,7 @@ import { requireAuth, requireAgency, requireCompanyOrAbove } from '../middleware
 import { ApiError } from '../middleware/errorHandler.js';
 import { logger } from '../utils/logger.js';
 import { fetchRostersForCrew, rosterItemsList, mapRosterToRows, buildDailySummary } from '../services/raido.js';
-import { companyIdsForUser } from '../services/access.js';
+import { companyIdsForUser, isPlacementActiveInPeriod } from '../services/access.js';
 
 const router = Router();
 
@@ -136,16 +136,21 @@ router.get('/periods', async (req, res, next) => {
 
     if (!placementIds.length) return res.json([]);
 
-    // Get all roster_period_status for these placements
+    // Get all roster_period_status for these placements. Pull the placement's
+    // start/end dates too so we can filter out rows where the placement's
+    // contract didn't overlap the period.
     const { data: statuses } = await adminSupabase
       .from('roster_period_status')
-      .select('*, placements(id, full_name, crew_id), payroll_periods(id, period_ref, month, year, start_date, end_date, status)')
+      .select('*, placements(id, full_name, crew_id, start_date, end_date), payroll_periods(id, period_ref, month, year, start_date, end_date, status)')
       .in('placement_id', placementIds)
       .order('created_at', { ascending: false });
 
-    // For placement role, only show contractor_check and beyond
+    // Keep only (placement, period) rows where the placement's contract
+    // overlaps the period. Then apply the existing role-status filter.
     const filtered = (statuses || []).filter(s => {
-      if (user.role === 'placement') return true; // all statuses — filter by charge data below
+      const overlap = isPlacementActiveInPeriod(s.placements || {}, s.payroll_periods || {});
+      if (!overlap) return false;
+      if (user.role === 'placement') return true;
       if (user.role === 'company_admin' || user.role === 'company_user') return ['client_check', 'contractor_check', 'contractor_correction', 'contractor_approved', 'definite'].includes(s.status);
       return true; // agency sees all
     });
