@@ -40,23 +40,33 @@ router.get('/role-groups', async (_req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ── GET /charge-config/function-groups?companyId=X ───────────────────────────
+// ── GET /charge-config/function-groups?companyId=X&activeOnly=true ───────────
 // Distinct carerix_function_group values present on placements for a company.
-// Powers the Function group dropdown in Roster & Charges.
+// Powers the Function group dropdown in Roster & Charges. By default only
+// counts placements that pass the active-status filter (tag = JobActiveTag
+// AND status_active = 1, OR no status ingested yet). Pass ?activeOnly=false
+// to count everything.
 router.get('/function-groups', async (req, res, next) => {
   try {
     const { companyId } = req.query;
+    const activeOnly = String(req.query.activeOnly ?? 'true').toLowerCase() !== 'false';
+
     let q = adminSupabase
       .from('placements')
-      .select('carerix_function_group, carerix_function_group_id')
+      .select('carerix_function_group, carerix_function_group_id, carerix_status_tag, carerix_status_id, carerix_status_active')
       .not('carerix_function_group', 'is', null);
     if (companyId) q = q.eq('company_id', companyId);
     const { data, error } = await q;
     if (error) throw new ApiError(error.message, 500);
 
+    const passesActive = row =>
+      (row.carerix_status_tag === null && row.carerix_status_id === null) ||
+      (row.carerix_status_tag === 'JobActiveTag' && row.carerix_status_active === 1);
+
     // Deduplicate + sort alphabetically; include a count per value.
     const counts = new Map();
     for (const row of data || []) {
+      if (activeOnly && !passesActive(row)) continue;
       const key = row.carerix_function_group;
       const prev = counts.get(key) || { value: key, id: row.carerix_function_group_id, count: 0 };
       prev.count++;

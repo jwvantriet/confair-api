@@ -80,6 +80,12 @@
       <button class="preset-btn" onclick="loadPreset('carerix_connection')">Connection test <span class="tag">no auth</span></button>
     </div>
     <div class="sidebar-section">
+      <h2>🔢 Count reconcile (AAI 7 Pilots)</h2>
+      <button class="preset-btn" onclick="loadPreset('count_pilots_raw')">Count — all Pilots (raw) <span class="tag">auth</span></button>
+      <button class="preset-btn" onclick="loadPreset('count_pilots_active')">Count — Pilots JobActiveTag <span class="tag">auth</span></button>
+      <button class="preset-btn" onclick="loadPreset('list_pilots_raw')">List — all Pilots (IDs + status) <span class="tag">auth</span></button>
+    </div>
+    <div class="sidebar-section">
       <h2>📋 Data Nodes (Carerix tables)</h2>
       <button class="preset-btn" onclick="loadPreset('dn_node_types')">All node types (tables) <span class="tag">auth</span></button>
       <button class="preset-btn" onclick="loadPreset('dn_list_types')">All distinct listType <span class="tag">auth</span></button>
@@ -205,6 +211,44 @@ const PRESETS = {
   __typename
 }`,
     vars: '{}'
+  },
+  count_pilots_raw: {
+    mode: 'gql_explore',
+    label: 'All CRJobs for AAI 7 with function group Pilots (dataNodeID 9590), deleted=0, no other filter. This is the raw total in Carerix.',
+    query: `query CountPilotsRaw($qualifier: String, $pageable: Pageable) {
+  crJobPage(qualifier: $qualifier, pageable: $pageable) {
+    totalElements
+    items { jobID }
+  }
+}`,
+    vars: '{\n  "qualifier": "toCompany.companyID == 7 AND deleted == 0 AND toEmployee.toFunction1Level1Node.dataNodeID == 9590",\n  "pageable": { "page": 0, "size": 1 }\n}'
+  },
+  count_pilots_active: {
+    mode: 'gql_explore',
+    label: 'Pilots at AAI 7 whose toStatusNode has the JobActiveTag tag. This is the operational total in Carerix.',
+    query: `query CountPilotsActive($qualifier: String, $pageable: Pageable) {
+  crJobPage(qualifier: $qualifier, pageable: $pageable) {
+    totalElements
+    items { jobID }
+  }
+}`,
+    vars: '{\n  "qualifier": "toCompany.companyID == 7 AND deleted == 0 AND toEmployee.toFunction1Level1Node.dataNodeID == 9590 AND toStatusNode.tag == \\"JobActiveTag\\"",\n  "pageable": { "page": 0, "size": 1 }\n}'
+  },
+  list_pilots_raw: {
+    mode: 'gql_explore',
+    label: 'Every Pilot CRJob at AAI 7 — raw, with jobID, startDate, endDate, status info. Use this to diff against the DB.',
+    query: `query ListPilotsRaw($qualifier: String, $pageable: Pageable) {
+  crJobPage(qualifier: $qualifier, pageable: $pageable) {
+    totalElements
+    items {
+      jobID _id name
+      startDate endDate deleted
+      toStatusNode { _id dataNodeID value tag active notActive }
+      toEmployee { employeeID firstName lastName }
+    }
+  }
+}`,
+    vars: '{\n  "qualifier": "toCompany.companyID == 7 AND deleted == 0 AND toEmployee.toFunction1Level1Node.dataNodeID == 9590",\n  "pageable": { "page": 0, "size": 500 }\n}'
   },
   dn_node_types: {
     mode: 'gql_explore',
