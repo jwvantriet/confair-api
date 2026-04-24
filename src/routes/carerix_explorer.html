@@ -81,11 +81,13 @@
     </div>
     <div class="sidebar-section">
       <h2>📋 Data Nodes (Carerix tables)</h2>
-      <button class="preset-btn" onclick="loadPreset('dn_list_types')">All list types <span class="tag">auth</span></button>
+      <button class="preset-btn" onclick="loadPreset('dn_node_types')">All node types (tables) <span class="tag">auth</span></button>
+      <button class="preset-btn" onclick="loadPreset('dn_list_types')">All distinct listType <span class="tag">auth</span></button>
       <button class="preset-btn" onclick="loadPreset('dn_job_statuses')">Job statuses <span class="tag">auth</span></button>
       <button class="preset-btn" onclick="loadPreset('dn_function1_level1')">Function group — Level 1 <span class="tag">auth</span></button>
       <button class="preset-btn" onclick="loadPreset('dn_function1_level2')">Function position — Level 2 <span class="tag">auth</span></button>
       <button class="preset-btn" onclick="loadPreset('dn_finance_kinds')">Finance / charge kinds <span class="tag">auth</span></button>
+      <button class="preset-btn" onclick="loadPreset('dn_by_type_identifier')">Nodes by type.identifier (param) <span class="tag">auth</span></button>
       <button class="preset-btn" onclick="loadPreset('dn_by_list_type')">Nodes by listType (param) <span class="tag">auth</span></button>
       <button class="preset-btn" onclick="loadPreset('dn_by_id')">Node by dataNodeID (param) <span class="tag">auth</span></button>
     </div>
@@ -204,9 +206,23 @@ const PRESETS = {
 }`,
     vars: '{}'
   },
+  dn_node_types: {
+    mode: 'gql_explore',
+    label: 'Every CRNodeType (Carerix "table") with its identifier + label — START HERE to learn the real type names for this tenant.',
+    query: `query NodeTypes($pageable: Pageable) {
+  crNodeTypePage(pageable: $pageable) {
+    totalElements
+    items {
+      _id identifier label labelPlural customType
+      isEnumerated isExtracted deleted
+    }
+  }
+}`,
+    vars: '{\n  "pageable": { "page": 0, "size": 500 }\n}'
+  },
   dn_list_types: {
     mode: 'gql_explore',
-    label: 'All distinct listType values across CRDataNode (shows what "tables" exist in Carerix).',
+    label: 'Distinct listType values across CRDataNode — mostly null in practice; use node types above as the primary classifier.',
     query: `query DistinctListTypes($pageable: Pageable) {
   crDataNodePage(pageable: $pageable) {
     totalElements
@@ -217,64 +233,83 @@ const PRESETS = {
   },
   dn_job_statuses: {
     mode: 'gql_explore',
-    label: 'All CRJob status nodes — the options we filter on (toStatusNode).',
+    label: 'All CRJob status nodes — the options we filter on (toStatusNode). Qualified on the node type identifier.',
     query: `query JobStatuses($qualifier: String, $pageable: Pageable) {
   crDataNodePage(qualifier: $qualifier, pageable: $pageable) {
     totalElements
     items {
       _id dataNodeID value label listType tag
       active notActive isDefault isHidden sortOrder
+      type { _id identifier label }
     }
   }
 }`,
-    vars: '{\n  "qualifier": "listType == \\"JobStatus\\"",\n  "pageable": { "page": 0, "size": 200 }\n}'
+    vars: '{\n  "qualifier": "type.identifier == \\"JobStatus\\"",\n  "pageable": { "page": 0, "size": 200 }\n}'
   },
   dn_function1_level1: {
     mode: 'gql_explore',
-    label: 'CREmployee function GROUPS — Level 1 (Pilot / Mechanic / Loadmaster / etc).',
+    label: 'CREmployee function GROUPS — Level 1 (Pilot / Mechanic / Loadmaster). Qualified on node type.',
     query: `query FunctionLevel1($qualifier: String, $pageable: Pageable) {
   crDataNodePage(qualifier: $qualifier, pageable: $pageable) {
     totalElements
     items {
       _id dataNodeID value label listType tag
       active notActive sortOrder
+      type { _id identifier label }
     }
   }
 }`,
-    vars: '{\n  "qualifier": "listType == \\"Function1Level1\\"",\n  "pageable": { "page": 0, "size": 200 }\n}'
+    vars: '{\n  "qualifier": "type.identifier == \\"Function1Level1\\"",\n  "pageable": { "page": 0, "size": 200 }\n}'
   },
   dn_function1_level2: {
     mode: 'gql_explore',
-    label: 'CREmployee function POSITIONS — Level 2 (Captain / First Officer / Mechanic B1 etc).',
+    label: 'CREmployee function POSITIONS — Level 2 (Captain / First Officer / Mechanic B1). Qualified on node type.',
     query: `query FunctionLevel2($qualifier: String, $pageable: Pageable) {
   crDataNodePage(qualifier: $qualifier, pageable: $pageable) {
     totalElements
     items {
       _id dataNodeID value label listType tag
       active notActive sortOrder
-      parentNode { _id dataNodeID value listType }
+      parentNode { _id dataNodeID value }
+      type { _id identifier label }
     }
   }
 }`,
-    vars: '{\n  "qualifier": "listType == \\"Function1Level2\\"",\n  "pageable": { "page": 0, "size": 500 }\n}'
+    vars: '{\n  "qualifier": "type.identifier == \\"Function1Level2\\"",\n  "pageable": { "page": 0, "size": 500 }\n}'
   },
   dn_finance_kinds: {
     mode: 'gql_explore',
-    label: 'Finance/charge kinds — the Carerix expense type catalogue (Daily Allowance, YWC, PerDiem, ...).',
+    label: 'Finance / charge kinds (Daily Allowance, Per Diem, etc). Qualified on node type.',
     query: `query FinanceKinds($qualifier: String, $pageable: Pageable) {
   crDataNodePage(qualifier: $qualifier, pageable: $pageable) {
     totalElements
     items {
       _id dataNodeID value label listType tag
       active notActive sortOrder
+      type { _id identifier label }
     }
   }
 }`,
-    vars: '{\n  "qualifier": "listType == \\"FinanceKind\\"",\n  "pageable": { "page": 0, "size": 200 }\n}'
+    vars: '{\n  "qualifier": "type.identifier == \\"FinanceKind\\"",\n  "pageable": { "page": 0, "size": 200 }\n}'
+  },
+  dn_by_type_identifier: {
+    mode: 'gql_explore',
+    label: 'Generic: all CRDataNode for a given type.identifier — edit the qualifier with the identifier shown by "All node types".',
+    query: `query NodesByTypeIdentifier($qualifier: String, $pageable: Pageable) {
+  crDataNodePage(qualifier: $qualifier, pageable: $pageable) {
+    totalElements
+    items {
+      _id dataNodeID value label listType tag
+      active notActive sortOrder
+      type { _id identifier label }
+    }
+  }
+}`,
+    vars: '{\n  "qualifier": "type.identifier == \\"REPLACE_ME\\"",\n  "pageable": { "page": 0, "size": 500 }\n}'
   },
   dn_by_list_type: {
     mode: 'gql_explore',
-    label: 'Generic: list all CRDataNode for a given listType — edit the qualifier.',
+    label: 'Generic: list all CRDataNode for a given listType — only works if the tenant actually populates listType.',
     query: `query NodesByListType($qualifier: String, $pageable: Pageable) {
   crDataNodePage(qualifier: $qualifier, pageable: $pageable) {
     totalElements
@@ -294,7 +329,8 @@ const PRESETS = {
     items {
       _id dataNodeID value label listType tag
       active notActive sortOrder
-      parentNode { _id dataNodeID value listType }
+      parentNode { _id dataNodeID value }
+      type { _id identifier label }
     }
   }
 }`,
