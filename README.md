@@ -19,24 +19,42 @@ Supabase DB       Carerix APIs
 
 ## Authentication flows
 
-### Agency users (Atoms Cloud / Supabase)
+All users authenticate against the Carerix **legacy REST API**
+(`api.carerix.com`). The returned `CRUser` XML is inspected to determine the
+platform role, and a Supabase session is then provisioned for the user so the
+rest of the API can authenticate via a Supabase JWT.
+
+### Login
+
 ```
-POST /auth/login/agency
-  { email, password }
-  → Supabase signInWithPassword()
-  → returns { accessToken, refreshToken, user }
+POST /auth/login/agency      (alias: POST /auth/login/carerix)
+  { username, password }
+  → GET  https://api.carerix.com/CRUser/login-with-encrypted-password
+         ?u=<username>&p=<md5(password)>
+         Basic auth: CARERIX_REST_USERNAME : CARERIX_REST_PASSWORD
+  → parse CRUser XML, derive platformRole from toUserRole / toEmployee / toCompany
+  → provisionCarerixSession() creates/syncs the Supabase user
+  → returns { accessToken, refreshToken, expiresAt, user }
 ```
 
-### Placement & Company users (Carerix)
-```
-POST /auth/login/carerix
-  { email, password, roleHint? }
-  → Carerix Graph API mutation Login()
-  → provisionCarerixSession() creates/syncs Supabase user
-  → returns { accessToken, refreshToken, user }
-```
+Both `/auth/login/agency` and `/auth/login/carerix` are thin wrappers around
+the same REST call — there is no separate Supabase-password path today.
 
-All subsequent requests use the same `Authorization: Bearer <accessToken>` header regardless of auth source.
+### Platform role derivation
+
+| Carerix signal                                 | Platform role    |
+|------------------------------------------------|------------------|
+| `toEmployee` linked, or `toUserRole.id = 1`    | `placement`      |
+| `toCompany` linked,  or `toUserRole.id = 11`   | `company_admin`  |
+| otherwise                                      | `agency_admin`   |
+
+### Session usage
+
+All subsequent requests use `Authorization: Bearer <accessToken>` — a Supabase
+JWT — regardless of where the user originated. Data reads (jobs, companies,
+finances) use the Carerix **GraphQL API** at
+`api.carerix.io/graphql/v1/graphql`; only the initial login touches the legacy
+REST endpoint.
 
 ## Setup
 
@@ -72,10 +90,13 @@ npm run dev
 | `SUPABASE_URL` | Supabase → Project Settings → API |
 | `SUPABASE_ANON_KEY` | Supabase → Project Settings → API |
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase → Project Settings → API |
-| `CARERIX_GRAPH_API_URL` | Your Carerix account manager |
+| `CARERIX_GRAPH_API_URL` | Your Carerix account manager (GraphQL data API) |
 | `CARERIX_FINANCE_API_URL` | Your Carerix account manager |
 | `CARERIX_API_KEY` | Your Carerix account manager |
 | `CARERIX_TENANT_ID` | Your Carerix account manager |
+| `CARERIX_REST_URL` | Legacy REST base, default `https://api.carerix.com/` |
+| `CARERIX_REST_USERNAME` | Basic-auth user for the legacy REST API |
+| `CARERIX_REST_PASSWORD` | Basic-auth password for the legacy REST API |
 | `JWT_SECRET` | `openssl rand -hex 64` |
 | `ALLOWED_ORIGINS` | Your Vercel frontend URL |
 
@@ -83,8 +104,8 @@ npm run dev
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| POST | `/auth/login/agency` | Public | Agency login (Supabase) |
-| POST | `/auth/login/carerix` | Public | Placement/Company login (Carerix) |
+| POST | `/auth/login/agency` | Public | Login via Carerix REST (alias of `/auth/login/carerix`) |
+| POST | `/auth/login/carerix` | Public | Login via Carerix REST |
 | POST | `/auth/refresh` | Public | Refresh session token |
 | POST | `/auth/logout` | Required | Revoke session |
 | GET | `/auth/me` | Required | Current user profile |
@@ -109,10 +130,13 @@ npm run dev
 
 ## Carerix integration notes
 
-The Carerix GraphQL mutation shape (`mutation Login`) may need adjusting  
-to match your exact Carerix tenant configuration. Update `src/services/carerix.js`  
-with the correct field names from your Carerix API documentation.
+Login uses the legacy REST API (`api.carerix.com`). The
+`CRUser/login-with-encrypted-password` endpoint accepts the password as an
+**MD5 hex digest** in the `p` query parameter, under HTTP Basic auth using
+`CARERIX_REST_USERNAME` / `CARERIX_REST_PASSWORD`. Response is XML; see
+`src/routes/auth.js → loginWithCarerix` for the parsing logic.
 
-Similarly, the Finance API endpoint (`GET /rates`) should be confirmed  
-with your Carerix account manager — request params and response shape  
-may differ per tenant.
+Everything else (jobs, companies, rates, finance) goes through the Carerix
+GraphQL API at `api.carerix.io/graphql/v1/graphql`. The Finance endpoint
+(`GET /rates`) request params and response shape should be confirmed with your
+Carerix account manager — they may differ per tenant.
