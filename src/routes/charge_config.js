@@ -40,6 +40,33 @@ router.get('/role-groups', async (_req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── GET /charge-config/function-groups?companyId=X ───────────────────────────
+// Distinct carerix_function_group values present on placements for a company.
+// Powers the Function group dropdown in Roster & Charges.
+router.get('/function-groups', async (req, res, next) => {
+  try {
+    const { companyId } = req.query;
+    let q = adminSupabase
+      .from('placements')
+      .select('carerix_function_group, carerix_function_group_id')
+      .not('carerix_function_group', 'is', null);
+    if (companyId) q = q.eq('company_id', companyId);
+    const { data, error } = await q;
+    if (error) throw new ApiError(error.message, 500);
+
+    // Deduplicate + sort alphabetically; include a count per value.
+    const counts = new Map();
+    for (const row of data || []) {
+      const key = row.carerix_function_group;
+      const prev = counts.get(key) || { value: key, id: row.carerix_function_group_id, count: 0 };
+      prev.count++;
+      counts.set(key, prev);
+    }
+    const items = [...counts.values()].sort((a, b) => a.value.localeCompare(b.value));
+    res.json({ items });
+  } catch (err) { next(err); }
+});
+
 // ── GET /charge-config?companyId&roleGroup ───────────────────────────────────
 // Returns the full matrix: every charge_type (active) joined to the
 // existing config row (if any). Missing rows are reported as enabled=false.

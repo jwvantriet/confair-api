@@ -28,9 +28,11 @@ router.get('/summary/:periodId', async (req, res, next) => {
     const isAgency = user.role?.startsWith('agency_');
     const requestedCompanyId = (req.query.companyId || '').trim() || null;
 
+    const requestedFunctionGroup = (req.query.functionGroup || '').trim() || null;
+
     let placementsQuery = adminSupabase
       .from('placements')
-      .select('id, crew_id, full_name, qualification, active_roles, crew_group, start_date, end_date, company_id, companies(id, name, carerix_company_id)')
+      .select('id, crew_id, full_name, qualification, active_roles, crew_group, carerix_function_group, carerix_function_group_id, start_date, end_date, company_id, companies(id, name, carerix_company_id)')
       .order('full_name');
 
     if (!isAgency) {
@@ -40,6 +42,9 @@ router.get('/summary/:periodId', async (req, res, next) => {
     }
     if (requestedCompanyId) {
       placementsQuery = placementsQuery.eq('company_id', requestedCompanyId);
+    }
+    if (requestedFunctionGroup) {
+      placementsQuery = placementsQuery.eq('carerix_function_group', requestedFunctionGroup);
     }
 
     const { data: rawPlacements, error: pErr } = await placementsQuery;
@@ -185,6 +190,8 @@ router.get('/summary/:periodId', async (req, res, next) => {
       qualification: p.qualification,
       active_roles:  p.active_roles,
       crew_group:    p.crew_group,
+      functionGroup:    p.carerix_function_group ?? null,
+      functionGroupId:  p.carerix_function_group_id ?? null,
       companyId:             p.company_id,
       companyName:           p.companies?.name ?? null,
       carerixCompanyId:      p.companies?.carerix_company_id ?? null,
