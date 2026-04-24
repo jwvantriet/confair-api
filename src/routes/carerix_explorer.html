@@ -461,6 +461,23 @@ function syntaxHighlight(json) {
   });
 }
 
+// Auto-fill bearer token from URL hash (e.g. #token=eyJhbGci...) then clean
+// up the hash so the token doesn't sit in the URL bar or browser history.
+(function hydrateTokenFromHash() {
+  const hash = window.location.hash || '';
+  const match = hash.match(/(?:^#|&)token=([^&]+)/);
+  if (!match) return;
+  const t = decodeURIComponent(match[1]);
+  const input = document.getElementById('tokenInput');
+  if (input && t) input.value = t;
+  // Strip the token from the URL without reloading
+  try {
+    const rest = hash.replace(/(^#|&)token=[^&]*/, '').replace(/^#?&/, '#');
+    const newHash = rest === '#' ? '' : rest;
+    history.replaceState(null, '', window.location.pathname + window.location.search + newHash);
+  } catch { /* ignore */ }
+})();
+
 // Initialize with probe_eric preset
 loadPreset('probe_eric');
 </script>
