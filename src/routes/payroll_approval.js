@@ -3,7 +3,12 @@ import { Router } from 'express';
 import { requireAuth, requireCompanyOrAbove } from '../middleware/auth.js';
 import { adminSupabase } from '../services/supabase.js';
 import { ApiError } from '../middleware/errorHandler.js';
-import { companyIdsForUser, isPlacementActiveInPeriod } from '../services/access.js';
+import {
+  companyIdsForUser,
+  accessRulesForUser,
+  filterPlacementsByAccessRules,
+  isPlacementActiveInPeriod,
+} from '../services/access.js';
 
 const router = Router();
 router.use(requireAuth, requireCompanyOrAbove);
@@ -41,9 +46,12 @@ router.get('/summary/:periodId', async (req, res, next) => {
       .select('id, crew_id, full_name, qualification, active_roles, crew_group, carerix_function_group, carerix_function_group_id, carerix_status_value, carerix_status_id, carerix_status_tag, carerix_status_active, start_date, end_date, company_id, companies(id, name, carerix_company_id)')
       .order('full_name');
 
+    // Resolve non-agency access rules up front so we can apply both the
+    // company scope and the per-company function-group scope.
+    const accessRules = !isAgency ? await accessRulesForUser(user) : null;
     if (!isAgency) {
-      const companyIds = await companyIdsForUser(user);
-      if (!companyIds?.length) return res.json({ placements: [] });
+      const companyIds = (accessRules || []).map(r => r.company_id);
+      if (!companyIds.length) return res.json({ placements: [] });
       placementsQuery = placementsQuery.in('company_id', companyIds);
     }
     if (requestedCompanyId) {
@@ -57,16 +65,22 @@ router.get('/summary/:periodId', async (req, res, next) => {
     if (pErr) throw new ApiError(pErr.message);
     if (!rawPlacements?.length) return res.json({ placements: [] });
 
+    // Access-rule gate: non-agency users may have per-company function-group
+    // restrictions (e.g. "only Pilots for AAI 7, all groups for AAI 698").
+    const scoped = isAgency
+      ? rawPlacements
+      : filterPlacementsByAccessRules(rawPlacements, accessRules);
+
     // Apply view-layer JobActiveTag gate (default on). Rows with a known
     // status must have tag == "JobActiveTag" AND status.active == 1 to be
     // included. Rows with no ingested status (pre-ingestion) are kept so we
     // don't blind-hide legitimate placements until their next sync.
     const statusFiltered = activeOnly
-      ? rawPlacements.filter(p => {
+      ? scoped.filter(p => {
           if (p.carerix_status_tag == null && p.carerix_status_id == null) return true;
           return p.carerix_status_tag === 'JobActiveTag' && p.carerix_status_active === 1;
         })
-      : rawPlacements;
+      : scoped;
 
     // Only keep placements whose contract overlaps this period
     const placements = statusFiltered.filter(p => isPlacementActiveInPeriod(p, period));
