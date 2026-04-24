@@ -13,6 +13,7 @@ import { adminSupabase } from '../services/supabase.js';
 import { companyIdsForUser } from '../services/access.js';
 import { ApiError } from '../middleware/errorHandler.js';
 import { writeAuditLog } from '../utils/audit.js';
+import { logger } from '../utils/logger.js';
 
 const router = Router();
 router.use(requireAuth);
@@ -118,7 +119,60 @@ router.post('/:id/decline', requireCompanyOrAbove, async (req, res, next) => {
 });
 
 
-// POST /corrections/upload — upload proof attachment to Supabase Storage
+// Attachments bucket should be configured as PRIVATE in Supabase.
+// Signed URLs give per-access control; the bucket must not be public or the
+// signature adds nothing. TTL is long enough for a correction review cycle
+// but finite; clients can call POST /corrections/attachment/sign to refresh.
+const ATTACHMENT_BUCKET = 'attachments';
+const ATTACHMENT_URL_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
+
+async function signAttachmentPath(path) {
+  const { data, error } = await adminSupabase.storage
+    .from(ATTACHMENT_BUCKET)
+    .createSignedUrl(path, ATTACHMENT_URL_TTL_SECONDS);
+  if (error) throw new ApiError(`Could not sign attachment URL: ${error.message}`);
+  return { url: data.signedUrl, expiresIn: ATTACHMENT_URL_TTL_SECONDS };
+}
+
+// Placement id is the first path segment after `corrections/` — see upload path format.
+function placementIdFromPath(path) {
+  const m = /^corrections\/([^/]+)\//.exec(path || '');
+  return m ? m[1] : null;
+}
+
+// Authorize a user to read an attachment identified by its storage path.
+async function assertAttachmentAccess(user, path) {
+  if (!path || !path.startsWith('corrections/')) throw new ApiError('Invalid attachment path', 400);
+  if (user.role?.startsWith('agency_')) return;
+
+  const placementId = placementIdFromPath(path);
+  if (!placementId) throw new ApiError('Forbidden', 403);
+
+  if (user.role === 'placement') {
+    const { data: pl } = await adminSupabase
+      .from('placements').select('id').eq('user_profile_id', user.id).maybeSingle();
+    if (!pl || pl.id !== placementId) throw new ApiError('Forbidden', 403);
+    return;
+  }
+
+  if (user.role === 'company_admin' || user.role === 'company_user') {
+    const companyIds = await companyIdsForUser(user);
+    if (!companyIds?.length) throw new ApiError('Forbidden', 403);
+    const { data: pl } = await adminSupabase
+      .from('placements').select('id')
+      .eq('id', placementId)
+      .in('company_id', companyIds)
+      .maybeSingle();
+    if (!pl) throw new ApiError('Forbidden', 403);
+    return;
+  }
+
+  throw new ApiError('Forbidden', 403);
+}
+
+// POST /corrections/upload — upload proof attachment to Supabase Storage.
+// Returns a short-lived signed URL plus the storage path. Clients should
+// persist `path` (not `url`) and call /corrections/attachment/sign to refresh.
 router.post('/upload', requireAuth, async (req, res, next) => {
   try {
     // Simple base64 upload via request body
@@ -129,13 +183,26 @@ router.post('/upload', requireAuth, async (req, res, next) => {
     const path   = `corrections/${placementId}/${date}/${Date.now()}_${fileName}`;
 
     const { error } = await adminSupabase.storage
-      .from('attachments')
+      .from(ATTACHMENT_BUCKET)
       .upload(path, buffer, { contentType: mimeType || 'application/octet-stream', upsert: false });
 
     if (error) throw new ApiError(error.message);
 
-    const { data: { publicUrl } } = adminSupabase.storage.from('attachments').getPublicUrl(path);
-    res.json({ url: publicUrl, name: fileName, path });
+    const { url, expiresIn } = await signAttachmentPath(path);
+    res.json({ url, name: fileName, path, expiresIn });
+  } catch (err) { next(err); }
+});
+
+// POST /corrections/attachment/sign — mint a fresh signed URL for a stored path.
+// Authorization is checked per user/role; placements can only access their own
+// attachments, company users their company's, agency users anything.
+router.post('/attachment/sign', requireAuth, async (req, res, next) => {
+  try {
+    const { path } = req.body;
+    if (!path) throw new ApiError('path is required', 400);
+    await assertAttachmentAccess(req.user, path);
+    const { url, expiresIn } = await signAttachmentPath(path);
+    res.json({ url, path, expiresIn });
   } catch (err) { next(err); }
 });
 
