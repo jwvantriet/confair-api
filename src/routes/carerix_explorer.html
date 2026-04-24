@@ -233,8 +233,8 @@ const PRESETS = {
   },
   dn_job_statuses: {
     mode: 'gql_explore',
-    label: 'All CRJob status nodes — the options we filter on (toStatusNode). Qualified on the node type identifier.',
-    query: `query JobStatuses($qualifier: String, $pageable: Pageable) {
+    label: 'Placement statuses — the options behind CRJob.toStatusNode. This is what Fernandez needs: each row has active / notActive flags.',
+    query: `query PlacementStatuses($qualifier: String, $pageable: Pageable) {
   crDataNodePage(qualifier: $qualifier, pageable: $pageable) {
     totalElements
     items {
@@ -244,26 +244,27 @@ const PRESETS = {
     }
   }
 }`,
-    vars: '{\n  "qualifier": "type.identifier == \\"JobStatus\\"",\n  "pageable": { "page": 0, "size": 200 }\n}'
+    vars: '{\n  "qualifier": "type.identifier == \\"Placement status\\"",\n  "pageable": { "page": 0, "size": 200 }\n}'
   },
   dn_function1_level1: {
     mode: 'gql_explore',
-    label: 'CREmployee function GROUPS — Level 1 (Pilot / Mechanic / Loadmaster). Qualified on node type.',
+    label: 'CREmployee Function tree 1 — Level 1 (group, parentNode == nil). The tree Carerix maps to toFunction1Level1Node.',
     query: `query FunctionLevel1($qualifier: String, $pageable: Pageable) {
   crDataNodePage(qualifier: $qualifier, pageable: $pageable) {
     totalElements
     items {
       _id dataNodeID value label listType tag
       active notActive sortOrder
+      parentNode { _id dataNodeID value }
       type { _id identifier label }
     }
   }
 }`,
-    vars: '{\n  "qualifier": "type.identifier == \\"Function1Level1\\"",\n  "pageable": { "page": 0, "size": 200 }\n}'
+    vars: '{\n  "qualifier": "type.identifier == \\"Function1\\" AND parentNode == nil",\n  "pageable": { "page": 0, "size": 200 }\n}'
   },
   dn_function1_level2: {
     mode: 'gql_explore',
-    label: 'CREmployee function POSITIONS — Level 2 (Captain / First Officer / Mechanic B1). Qualified on node type.',
+    label: 'CREmployee Function tree 1 — Level 2 (position, parentNode != nil). Each node's parent points at its Level 1 group.',
     query: `query FunctionLevel2($qualifier: String, $pageable: Pageable) {
   crDataNodePage(qualifier: $qualifier, pageable: $pageable) {
     totalElements
@@ -275,12 +276,12 @@ const PRESETS = {
     }
   }
 }`,
-    vars: '{\n  "qualifier": "type.identifier == \\"Function1Level2\\"",\n  "pageable": { "page": 0, "size": 500 }\n}'
+    vars: '{\n  "qualifier": "type.identifier == \\"Function1\\" AND parentNode != nil",\n  "pageable": { "page": 0, "size": 500 }\n}'
   },
   dn_finance_kinds: {
     mode: 'gql_explore',
-    label: 'Finance / charge kinds (Daily Allowance, Per Diem, etc). Qualified on node type.',
-    query: `query FinanceKinds($qualifier: String, $pageable: Pageable) {
+    label: 'Rate nodes — the Carerix list behind CRFinance / placement_rates. (Named "Rate" in this tenant.)',
+    query: `query RateNodes($qualifier: String, $pageable: Pageable) {
   crDataNodePage(qualifier: $qualifier, pageable: $pageable) {
     totalElements
     items {
@@ -290,7 +291,7 @@ const PRESETS = {
     }
   }
 }`,
-    vars: '{\n  "qualifier": "type.identifier == \\"FinanceKind\\"",\n  "pageable": { "page": 0, "size": 200 }\n}'
+    vars: '{\n  "qualifier": "type.identifier == \\"Rate\\"",\n  "pageable": { "page": 0, "size": 500 }\n}'
   },
   dn_by_type_identifier: {
     mode: 'gql_explore',
