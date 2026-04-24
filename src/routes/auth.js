@@ -3,6 +3,7 @@ import axios from 'axios';
 import crypto from 'crypto';
 import { XMLParser } from 'fast-xml-parser';
 import { adminSupabase, provisionCarerixSession } from '../services/supabase.js';
+import { syncUserCompanyAccessFromCarerix } from '../services/access.js';
 import { requireAuth } from '../middleware/auth.js';
 import { ApiError } from '../middleware/errorHandler.js';
 import { writeAuditLog } from '../utils/audit.js';
@@ -78,12 +79,30 @@ async function loginWithCarerix(username, password) {
   };
 }
 
+// Refresh user_company_access from Carerix for company-scoped roles.
+// Failures here must not block login — the legacy accessRulesForUser fallback
+// still grants access, just without function-group precision.
+async function refreshUserAccessOnLogin(session, identity) {
+  if (!identity?.carerixUserId) return;
+  if (identity.platformRole === 'agency_admin') return;
+  try {
+    await syncUserCompanyAccessFromCarerix(session.userId, identity.carerixUserId);
+  } catch (err) {
+    logger.warn('user_company_access sync failed on login (continuing)', {
+      userId: session.userId,
+      crUserId: identity.carerixUserId,
+      error: err.message,
+    });
+  }
+}
+
 router.post('/login/agency', async (req, res, next) => {
   try {
     const user = req.body.username || req.body.email;
     if (!user || !req.body.password) throw new ApiError('Username and password are required', 400);
     const identity = await loginWithCarerix(user, req.body.password);
     const session  = await provisionCarerixSession(identity);
+    await refreshUserAccessOnLogin(session, identity);
     await writeAuditLog({ eventType: 'login', actorUserId: session.userId, actorRole: identity.platformRole, payload: { user }, ipAddress: req.ip });
     res.json({ accessToken: session.accessToken, refreshToken: session.refreshToken, expiresAt: session.expiresAt,
       user: { id: session.userId, email: identity.email, displayName: identity.fullName, role: identity.platformRole, authSource: 'carerix', carerixUserId: identity.carerixUserId, carerixCompanyId: identity.carerixCompanyId } });
@@ -96,6 +115,7 @@ router.post('/login/carerix', async (req, res, next) => {
     if (!username || !password) throw new ApiError('Username and password are required', 400);
     const identity = await loginWithCarerix(username, password);
     const session  = await provisionCarerixSession(identity);
+    await refreshUserAccessOnLogin(session, identity);
     await writeAuditLog({ eventType: 'login', actorUserId: session.userId, actorRole: identity.platformRole, payload: { username }, ipAddress: req.ip });
     res.json({ accessToken: session.accessToken, refreshToken: session.refreshToken, expiresAt: session.expiresAt,
       user: { id: session.userId, email: identity.email, displayName: identity.fullName, role: identity.platformRole, authSource: 'carerix', carerixUserId: identity.carerixUserId, carerixCompanyId: identity.carerixCompanyId } });
