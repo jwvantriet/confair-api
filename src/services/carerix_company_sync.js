@@ -43,6 +43,7 @@ const CR_JOBS_Q = `
         toEmployee {
           _id employeeID firstName lastName emailAddress
           paymentIbanCode paymentBicCode paymentAccountName
+          toFunction1Level2Node { _id dataNodeID value label }
         }
       }
     }
@@ -135,18 +136,27 @@ async function upsertPlacement(companyId, crJob) {
   const emp = crJob.toEmployee || {};
   const fullName = [emp.firstName, emp.lastName].filter(Boolean).join(' ') || crJob.name || crewId || 'Unknown';
 
+  // Function group from CREmployee.toFunction1Level2Node (Carerix data node).
+  // We take the raw value (e.g. "Captain", "Mechanic B1", "Loadmaster") as
+  // the display/filter value, plus the dataNodeID for rate-table linking.
+  const fn = emp?.toFunction1Level2Node || null;
+  const carerixFunctionGroup = fn?.value || fn?.label || null;
+  const carerixFunctionGroupId = fn?.dataNodeID != null ? Number(fn.dataNodeID) : null;
+
   const fields = {
-    company_id:           companyId,
-    carerix_job_id:       carerixJobId,
-    carerix_placement_id: carerixPlacementId,
-    full_name:            fullName,
-    email:                emp.emailAddress || null,
-    crew_id:              crewId,
-    start_date:           isoDateOrNull(crJob.startDate),
-    end_date:             isoDateOrNull(crJob.endDate),
-    inv_iban:             emp.paymentIbanCode || null,
-    inv_bic:              emp.paymentBicCode || null,
-    inv_account_name:     emp.paymentAccountName || null,
+    company_id:                 companyId,
+    carerix_job_id:             carerixJobId,
+    carerix_placement_id:       carerixPlacementId,
+    full_name:                  fullName,
+    email:                      emp.emailAddress || null,
+    crew_id:                    crewId,
+    start_date:                 isoDateOrNull(crJob.startDate),
+    end_date:                   isoDateOrNull(crJob.endDate),
+    inv_iban:                   emp.paymentIbanCode || null,
+    inv_bic:                    emp.paymentBicCode || null,
+    inv_account_name:           emp.paymentAccountName || null,
+    carerix_function_group:     carerixFunctionGroup,
+    carerix_function_group_id:  carerixFunctionGroupId,
   };
 
   // 1. Match by carerix_job_id (strongest)
