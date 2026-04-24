@@ -264,7 +264,7 @@ const PRESETS = {
   },
   dn_function1_level2: {
     mode: 'gql_explore',
-    label: 'CREmployee Function tree 1 — Level 2 (position, parentNode != nil). Each node's parent points at its Level 1 group.',
+    label: 'CREmployee Function tree 1 — Level 2 (position, parentNode != nil). Each node.parentNode points at its Level 1 group.',
     query: `query FunctionLevel2($qualifier: String, $pageable: Pageable) {
   crDataNodePage(qualifier: $qualifier, pageable: $pageable) {
     totalElements
