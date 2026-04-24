@@ -104,6 +104,7 @@
       <button class="preset-btn" onclick="loadPreset('cr_user_companies_42')">CRUserCompany for userID 42 <span class="tag">auth</span></button>
       <button class="preset-btn" onclick="loadPreset('cr_user_by_id_param')">CRUser by userID (param) <span class="tag">auth</span></button>
       <button class="preset-btn" onclick="loadPreset('cr_contact_by_id_param')">CRContact by _id (param) <span class="tag">auth</span></button>
+      <button class="preset-btn" onclick="loadPreset('cr_user_attrs')">User attributes 11074/12452-4/11061 <span class="tag">auth</span></button>
     </div>
     <div class="sidebar-section">
       <h2>📝 Custom Query</h2>
@@ -462,6 +463,22 @@ const PRESETS = {
   }
 }`,
     vars: '{\n  "qualifier": "_id == \\"42\\""\n}'
+  },
+  cr_user_attrs: {
+    mode: 'gql_explore',
+    label: 'Fetch the CRDataNode records for the five attribute-user keys present on CRUser 42 (11074, 12452, 12453, 12454, 11061). Shows value/label/tag so we can map each _XXXXX key to a function group.',
+    query: `query UserAttrDefs($qualifier: String, $pageable: Pageable) {
+  crDataNodePage(qualifier: $qualifier, pageable: $pageable) {
+    totalElements
+    items {
+      _id dataNodeID value label listType tag
+      active notActive sortOrder
+      parentNode { _id dataNodeID value }
+      type { _id identifier label }
+    }
+  }
+}`,
+    vars: '{\n  "qualifier": "dataNodeID == 11074 OR dataNodeID == 12452 OR dataNodeID == 12453 OR dataNodeID == 12454 OR dataNodeID == 11061 OR dataNodeID == 11059",\n  "pageable": { "page": 0, "size": 50 }\n}'
   },
   introspect: {
     mode: 'gql_explore',
