@@ -29,10 +29,16 @@ router.get('/summary/:periodId', async (req, res, next) => {
     const requestedCompanyId = (req.query.companyId || '').trim() || null;
 
     const requestedFunctionGroup = (req.query.functionGroup || '').trim() || null;
+    // Status filter — on by default: only show placements tagged JobActiveTag
+    // on the Carerix status node, and whose status itself is still in active
+    // use. Opt-out with ?activeOnly=false. Placements with no ingested status
+    // (carerix_status_tag IS NULL) are shown regardless — those haven't been
+    // touched by a status-aware sync yet, we don't want to hide them blindly.
+    const activeOnly = String(req.query.activeOnly ?? 'true').toLowerCase() !== 'false';
 
     let placementsQuery = adminSupabase
       .from('placements')
-      .select('id, crew_id, full_name, qualification, active_roles, crew_group, carerix_function_group, carerix_function_group_id, start_date, end_date, company_id, companies(id, name, carerix_company_id)')
+      .select('id, crew_id, full_name, qualification, active_roles, crew_group, carerix_function_group, carerix_function_group_id, carerix_status_value, carerix_status_id, carerix_status_tag, carerix_status_active, start_date, end_date, company_id, companies(id, name, carerix_company_id)')
       .order('full_name');
 
     if (!isAgency) {
@@ -51,8 +57,19 @@ router.get('/summary/:periodId', async (req, res, next) => {
     if (pErr) throw new ApiError(pErr.message);
     if (!rawPlacements?.length) return res.json({ placements: [] });
 
+    // Apply view-layer JobActiveTag gate (default on). Rows with a known
+    // status must have tag == "JobActiveTag" AND status.active == 1 to be
+    // included. Rows with no ingested status (pre-ingestion) are kept so we
+    // don't blind-hide legitimate placements until their next sync.
+    const statusFiltered = activeOnly
+      ? rawPlacements.filter(p => {
+          if (p.carerix_status_tag == null && p.carerix_status_id == null) return true;
+          return p.carerix_status_tag === 'JobActiveTag' && p.carerix_status_active === 1;
+        })
+      : rawPlacements;
+
     // Only keep placements whose contract overlaps this period
-    const placements = rawPlacements.filter(p => isPlacementActiveInPeriod(p, period));
+    const placements = statusFiltered.filter(p => isPlacementActiveInPeriod(p, period));
     if (!placements.length) return res.json({ placements: [] });
 
     const placementIds = placements.map(p => p.id);
@@ -192,6 +209,10 @@ router.get('/summary/:periodId', async (req, res, next) => {
       crew_group:    p.crew_group,
       functionGroup:    p.carerix_function_group ?? null,
       functionGroupId:  p.carerix_function_group_id ?? null,
+      statusValue:      p.carerix_status_value ?? null,
+      statusId:         p.carerix_status_id ?? null,
+      statusTag:        p.carerix_status_tag ?? null,
+      statusActive:     p.carerix_status_active ?? null,
       companyId:             p.company_id,
       companyName:           p.companies?.name ?? null,
       carerixCompanyId:      p.companies?.carerix_company_id ?? null,
