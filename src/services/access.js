@@ -196,69 +196,31 @@ export async function syncUserCompanyAccessFromCarerix(userProfileId, crUserId) 
     return { synced: 0, unknown: [], functionGroups };
   }
 
-  const { data: companies } = await adminSupabase
-    .from('companies')
-    .select('id, carerix_company_id')
-    .in('carerix_company_id', carerixCompanyIds);
+  // Delegate the platform-side write to a SECURITY DEFINER RPC. Direct
+  // adminSupabase writes can fail under RLS if the env-var key is wrong;
+  // SECURITY DEFINER runs with the function owner's privileges and bypasses
+  // RLS entirely. Same trick used by `upsert_user_profile`.
+  const { data: rpcResult, error: rpcErr } = await adminSupabase.rpc(
+    'sync_user_company_access',
+    {
+      p_user_profile_id:     userProfileId,
+      p_carerix_company_ids: carerixCompanyIds,
+      p_function_groups:     functionGroups,
+    },
+  );
+  if (rpcErr) throw new Error(`sync_user_company_access rpc: ${rpcErr.message}`);
 
-  const byCarerixId = new Map((companies || []).map(c => [String(c.carerix_company_id), c.id]));
-  const resolved = [];
-  const unknown  = [];
-  for (const cid of carerixCompanyIds) {
-    const uuid = byCarerixId.get(cid);
-    if (uuid) resolved.push(uuid);
-    else unknown.push(cid);
-  }
-  if (unknown.length) {
-    logger.warn('syncUserCompanyAccessFromCarerix: Carerix companies not yet imported — skipping', {
-      userProfileId, crUserId: crUserIdNum, unknown,
-    });
-  }
-
-  logger.info('syncUserCompanyAccessFromCarerix: resolved platform companies', {
+  logger.info('syncUserCompanyAccessFromCarerix: rpc result', {
     userProfileId,
     crUserId: crUserIdNum,
-    resolved,
-    stored:   resolved.length,
+    rpcResult,
   });
 
-  const fgPayload = functionGroups.length ? functionGroups : null;
-  const rows = resolved.map(companyId => ({
-    user_profile_id: userProfileId,
-    company_id:      companyId,
-    function_groups: fgPayload,
-  }));
-
-  if (rows.length) {
-    const { error: upsertErr } = await adminSupabase
-      .from('user_company_access')
-      .upsert(rows, { onConflict: 'user_profile_id,company_id' });
-    if (upsertErr) throw new Error(`user_company_access upsert: ${upsertErr.message}`);
-  }
-
-  // User-scoped orphan cleanup: remove rows for THIS user that are no longer
-  // in the fresh company set. Never deletes rows for other users, so a bad
-  // Carerix response can at worst strip the logging user's own access.
-  const { data: existingRows } = await adminSupabase
-    .from('user_company_access')
-    .select('company_id')
-    .eq('user_profile_id', userProfileId);
-
-  const resolvedSet = new Set(resolved);
-  const stale = (existingRows || [])
-    .map(r => r.company_id)
-    .filter(id => !resolvedSet.has(id));
-
-  if (stale.length) {
-    const { error: delErr } = await adminSupabase
-      .from('user_company_access')
-      .delete()
-      .eq('user_profile_id', userProfileId)
-      .in('company_id', stale);
-    if (delErr) logger.warn('user_company_access orphan cleanup failed', { error: delErr.message, userProfileId });
-  }
-
-  return { synced: rows.length, unknown, functionGroups };
+  return {
+    synced:         rpcResult?.synced   ?? 0,
+    unknown:        rpcResult?.unknown  ?? [],
+    functionGroups,
+  };
 }
 
 /**
