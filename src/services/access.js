@@ -128,7 +128,16 @@ export async function syncUserCompanyAccessFromCarerix(userProfileId, crUserId) 
     return { synced: 0, unknown: [], functionGroups: [] };
   }
 
-  const crUserIdStr = String(crUserId);
+  // Carerix's qualifier engine for CRUser / CRUserCompany indexes `userID`
+  // (integer), not `_id`. Using `_id == "42"` returns zero rows — verified
+  // against a live Bergur login that wrote no user_company_access rows.
+  const crUserIdNum = Number(crUserId);
+  if (!Number.isFinite(crUserIdNum)) {
+    logger.warn('syncUserCompanyAccessFromCarerix: non-numeric carerix user id — skipping', {
+      userProfileId, crUserId,
+    });
+    return { synced: 0, unknown: [], functionGroups: [] };
+  }
 
   const [userResp, linksResp, registry] = await Promise.all([
     queryGraphQL(`
@@ -137,7 +146,7 @@ export async function syncUserCompanyAccessFromCarerix(userProfileId, crUserId) 
           items { _id userID additionalInfo }
         }
       }
-    `, { qualifier: `_id == "${crUserIdStr}"` }),
+    `, { qualifier: `userID == ${crUserIdNum}` }),
     queryGraphQL(`
       query UserCompanies($qualifier: String, $pageable: Pageable) {
         crUserCompanyPage(qualifier: $qualifier, pageable: $pageable) {
@@ -146,7 +155,7 @@ export async function syncUserCompanyAccessFromCarerix(userProfileId, crUserId) 
         }
       }
     `, {
-      qualifier: `toUser._id == "${crUserIdStr}"`,
+      qualifier: `toUser.userID == ${crUserIdNum}`,
       pageable:  { page: 0, size: 100 },
     }),
     getCarerixCheckboxRegistry(),
@@ -171,9 +180,18 @@ export async function syncUserCompanyAccessFromCarerix(userProfileId, crUserId) 
       .map(String)
   ));
 
+  logger.info('syncUserCompanyAccessFromCarerix: carerix state', {
+    userProfileId,
+    crUserId:              crUserIdNum,
+    registryEntries:       Object.keys(registry).length,
+    additionalInfoKeys:    Object.keys(additionalInfo).length,
+    decodedFunctionGroups: functionGroups,
+    carerixCompanyIds,
+  });
+
   if (carerixCompanyIds.length === 0) {
-    logger.info('syncUserCompanyAccessFromCarerix: no Carerix company links', {
-      userProfileId, crUserId: crUserIdStr,
+    logger.warn('syncUserCompanyAccessFromCarerix: no Carerix company links', {
+      userProfileId, crUserId: crUserIdNum,
     });
     return { synced: 0, unknown: [], functionGroups };
   }
@@ -193,9 +211,16 @@ export async function syncUserCompanyAccessFromCarerix(userProfileId, crUserId) 
   }
   if (unknown.length) {
     logger.warn('syncUserCompanyAccessFromCarerix: Carerix companies not yet imported — skipping', {
-      userProfileId, crUserId: crUserIdStr, unknown,
+      userProfileId, crUserId: crUserIdNum, unknown,
     });
   }
+
+  logger.info('syncUserCompanyAccessFromCarerix: resolved platform companies', {
+    userProfileId,
+    crUserId: crUserIdNum,
+    resolved,
+    stored:   resolved.length,
+  });
 
   const fgPayload = functionGroups.length ? functionGroups : null;
   const rows = resolved.map(companyId => ({
