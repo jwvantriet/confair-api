@@ -98,6 +98,14 @@
       <button class="preset-btn" onclick="loadPreset('dn_by_id')">Node by dataNodeID (param) <span class="tag">auth</span></button>
     </div>
     <div class="sidebar-section">
+      <h2>👤 User + Contact (userID 42)</h2>
+      <button class="preset-btn" onclick="loadPreset('cr_user_42')">CRUser 42 with additionalInfo <span class="tag">auth</span></button>
+      <button class="preset-btn" onclick="loadPreset('cr_contact_42')">CRContact 42 with additionalInfo <span class="tag">auth</span></button>
+      <button class="preset-btn" onclick="loadPreset('cr_user_companies_42')">CRUserCompany for userID 42 <span class="tag">auth</span></button>
+      <button class="preset-btn" onclick="loadPreset('cr_user_by_id_param')">CRUser by userID (param) <span class="tag">auth</span></button>
+      <button class="preset-btn" onclick="loadPreset('cr_contact_by_id_param')">CRContact by _id (param) <span class="tag">auth</span></button>
+    </div>
+    <div class="sidebar-section">
       <h2>📝 Custom Query</h2>
       <button class="preset-btn" onclick="loadPreset('blank')">Blank canvas</button>
       <button class="preset-btn" onclick="loadPreset('introspect')">Introspect schema</button>
@@ -380,6 +388,80 @@ const PRESETS = {
   }
 }`,
     vars: '{\n  "qualifier": "dataNodeID == 10000"\n}'
+  },
+  cr_user_42: {
+    mode: 'gql_explore',
+    label: 'CRUser 42 (Bergur Jonasson) with full additionalInfo so we can see the 3 function-group checkboxes.',
+    query: `query CRUser42($qualifier: String) {
+  crUserPage(qualifier: $qualifier, pageable: { page: 0, size: 1 }) {
+    items {
+      _id userID userName firstName lastName
+      emailAddress emailAddressBusiness isActive deleted
+      additionalInfo additionalInfoTextValues
+    }
+  }
+}`,
+    vars: '{\n  "qualifier": "userID == 42"\n}'
+  },
+  cr_contact_42: {
+    mode: 'gql_explore',
+    label: 'CRContact _id == 42 — returns the contact record with additionalInfo. Use if the 3 checkboxes are on CRContact, not CRUser.',
+    query: `query CRContact42($qualifier: String) {
+  crContactPage(qualifier: $qualifier, pageable: { page: 0, size: 1 }) {
+    items {
+      _id contactID firstName lastName
+      emailAddress emailAddressBusiness
+      additionalInfo additionalInfoTextValues
+      toCompany { _id companyID name }
+      toEmployee { _id employeeID }
+    }
+  }
+}`,
+    vars: '{\n  "qualifier": "_id == \\"42\\""\n}'
+  },
+  cr_user_companies_42: {
+    mode: 'gql_explore',
+    label: 'All CRUserCompany rows for userID == 42 — confirms which CRCompanies Bergur is linked to in Carerix. Expecting rows for both 7 and 698.',
+    query: `query UserCompanies42($qualifier: String, $pageable: Pageable) {
+  crUserCompanyPage(qualifier: $qualifier, pageable: $pageable) {
+    totalElements
+    items {
+      _id
+      toUser    { _id userID userName firstName lastName }
+      toCompany { _id companyID name }
+    }
+  }
+}`,
+    vars: '{\n  "qualifier": "toUser.userID == 42",\n  "pageable": { "page": 0, "size": 50 }\n}'
+  },
+  cr_user_by_id_param: {
+    mode: 'gql_explore',
+    label: 'Generic CRUser lookup — edit userID in the qualifier.',
+    query: `query CRUserByID($qualifier: String) {
+  crUserPage(qualifier: $qualifier, pageable: { page: 0, size: 1 }) {
+    items {
+      _id userID userName firstName lastName
+      emailAddress emailAddressBusiness isActive deleted
+      additionalInfo additionalInfoTextValues
+    }
+  }
+}`,
+    vars: '{\n  "qualifier": "userID == 42"\n}'
+  },
+  cr_contact_by_id_param: {
+    mode: 'gql_explore',
+    label: 'Generic CRContact lookup — edit _id in the qualifier. Contact IDs in Carerix are the _id of the CRContact record.',
+    query: `query CRContactByID($qualifier: String) {
+  crContactPage(qualifier: $qualifier, pageable: { page: 0, size: 1 }) {
+    items {
+      _id contactID firstName lastName
+      emailAddress emailAddressBusiness
+      additionalInfo additionalInfoTextValues
+      toCompany { _id companyID name }
+    }
+  }
+}`,
+    vars: '{\n  "qualifier": "_id == \\"42\\""\n}'
   },
   introspect: {
     mode: 'gql_explore',
