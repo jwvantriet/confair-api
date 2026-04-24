@@ -90,6 +90,54 @@ export async function queryGraphQL(query, variables = {}, options = {}) {
   return carerixGQL(query, variables, options);
 }
 
+// ── Checkbox registry (Attribute contact → function_group_id) ────────────────
+// CRUser.additionalInfo carries boolean-like entries keyed by the dataNodeID of
+// a CRDataNode of type "Attribute contact" and tag "checkboxType". Carerix
+// administrators map each checkbox to a function_group via the node's
+// exportCode. Decoding a user's function groups therefore needs this registry:
+//
+//   { [dataNodeID]: exportCode }  e.g. { "12452": "9590", "12453": "9592" }
+//
+// The set changes rarely, so we cache it in-memory for 15 minutes.
+let _checkboxRegistry     = null;
+let _checkboxRegistryExp  = 0;
+
+export async function getCarerixCheckboxRegistry({ ttlMs = 15 * 60 * 1000 } = {}) {
+  const now = Date.now();
+  if (_checkboxRegistry && now < _checkboxRegistryExp) return _checkboxRegistry;
+
+  try {
+    const result = await carerixGQL(`
+      query CheckboxRegistry($qualifier: String, $pageable: Pageable) {
+        crDataNodePage(qualifier: $qualifier, pageable: $pageable) {
+          totalElements
+          items { _id dataNodeID tag exportCode }
+        }
+      }
+    `, {
+      qualifier: 'type.identifier == "Attribute contact"',
+      pageable:  { page: 0, size: 500 },
+    });
+
+    const items = result?.data?.crDataNodePage?.items || [];
+    const registry = {};
+    for (const node of items) {
+      if (node?.tag !== 'checkboxType') continue;
+      if (node?.exportCode == null) continue;
+      if (node?.dataNodeID == null) continue;
+      registry[String(node.dataNodeID)] = String(node.exportCode);
+    }
+
+    _checkboxRegistry    = registry;
+    _checkboxRegistryExp = now + ttlMs;
+    logger.info('Carerix checkbox registry loaded', { entries: Object.keys(registry).length });
+    return registry;
+  } catch (err) {
+    logger.warn('Carerix checkbox registry fetch failed', { error: err.message });
+    return {};
+  }
+}
+
 async function carerixGQL(query, variables = {}, { timeoutMs = 30_000 } = {}) {
   const token = await getServiceToken();
   const res = await axios.post(config.carerix.graphApiUrl, { query, variables }, {
