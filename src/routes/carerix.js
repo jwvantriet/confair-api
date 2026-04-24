@@ -21,10 +21,24 @@ const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: 
 const parseXml = (xml) => { try { return xmlParser.parse(xml); } catch { return null; } };
 
 // ── GET /carerix/explorer — GraphQL explorer UI (no auth) ───────────────────
+// Explorer uses inline onclick handlers + inline <script>, so the default
+// helmet CSP blocks every interaction. Relax the CSP for this single debug
+// page (allow 'unsafe-inline' + 'unsafe-eval') so clicks / scripts work.
 router.get('/explorer', (req, res) => {
   try {
     const html = readFileSync(join(__dirname, 'carerix_explorer.html'), 'utf8');
     res.setHeader('Content-Type', 'text/html');
+    res.setHeader(
+      'Content-Security-Policy',
+      [
+        "default-src 'self' 'unsafe-inline' 'unsafe-eval'",
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+        "style-src 'self' 'unsafe-inline'",
+        "connect-src *",
+        "img-src * data:",
+        "font-src * data:",
+      ].join('; '),
+    );
     res.send(html);
   } catch(e) {
     res.status(500).send('Explorer file not found: ' + e.message);
