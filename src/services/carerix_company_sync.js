@@ -145,6 +145,17 @@ async function upsertPlacement(companyId, crJob) {
   const carerixFunctionGroup = fn?.value || fn?.label || null;
   const carerixFunctionGroupId = fn?.dataNodeID != null ? Number(fn.dataNodeID) : null;
 
+  // Placement status from CRJob.toStatusNode. The 'tag' field carries the
+  // business marker ("JobActiveTag" for statuses that mean the placement is
+  // operational). The active / notActive ints indicate whether the status is
+  // still in active use in Carerix (vs deprecated).
+  const st = crJob?.toStatusNode || null;
+  const carerixStatusValue     = st?.value ?? null;
+  const carerixStatusId        = st?.dataNodeID != null ? Number(st.dataNodeID) : null;
+  const carerixStatusTag       = st?.tag ?? null;
+  const carerixStatusActive    = st?.active != null ? Number(st.active) : null;
+  const carerixStatusNotActive = st?.notActive != null ? Number(st.notActive) : null;
+
   const fields = {
     company_id:                 companyId,
     carerix_job_id:             carerixJobId,
@@ -159,6 +170,11 @@ async function upsertPlacement(companyId, crJob) {
     inv_account_name:           emp.paymentAccountName || null,
     carerix_function_group:     carerixFunctionGroup,
     carerix_function_group_id:  carerixFunctionGroupId,
+    carerix_status_value:       carerixStatusValue,
+    carerix_status_id:          carerixStatusId,
+    carerix_status_tag:         carerixStatusTag,
+    carerix_status_active:      carerixStatusActive,
+    carerix_status_notactive:   carerixStatusNotActive,
   };
 
   // 1. Match by carerix_job_id (strongest)
