@@ -7,6 +7,7 @@ import { Router } from 'express';
 import { adminSupabase } from '../services/supabase.js';
 import { requireAuth, requireAgency } from '../middleware/auth.js';
 import { fetchRosters, rosterItemsList, mapRosterToRows, buildDailySummary, fetchActiveRolesForPeriod } from '../services/raido.js';
+import { queryGraphQL, getCarerixCheckboxRegistry } from '../services/carerix.js';
 
 const router = Router();
 router.use(requireAuth);
@@ -202,6 +203,134 @@ router.get('/raido-crew/:crewId?', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message, status: err.response?.status, body: err.response?.data });
+  }
+});
+
+// ── GET /diagnostics/user-access/:userProfileId ──────────────────────────────
+// Dumps everything we need to debug why a user's user_company_access isn't
+// populated after a login: the Carerix side (raw additionalInfo, linked
+// CRUserCompany rows), the registry (dataNodeID → exportCode), the DB
+// lookups (companies by carerix_company_id, existing user_company_access
+// rows), and the final upsert error if any.
+//
+// Call this after the user has logged in at least once.
+router.get('/user-access/:userProfileId', async (req, res) => {
+  const out = { userProfileId: req.params.userProfileId, ts: new Date().toISOString() };
+  try {
+    const userProfileId = req.params.userProfileId;
+
+    // 1. user_profiles row
+    const { data: up, error: upErr } = await adminSupabase
+      .from('user_profiles')
+      .select('id, email, role, carerix_user_id, carerix_company_id')
+      .eq('id', userProfileId)
+      .maybeSingle();
+    out.user_profile = up || null;
+    if (upErr) out.user_profile_error = upErr.message;
+    if (!up) return res.json(out);
+
+    const crUserIdNum = Number(up.carerix_user_id);
+    if (!Number.isFinite(crUserIdNum)) {
+      out.warning = 'user has no numeric carerix_user_id';
+      return res.json(out);
+    }
+
+    // 2. Live Carerix state
+    const [userResp, linksResp, registry] = await Promise.all([
+      queryGraphQL(`
+        query CRUser($qualifier: String) {
+          crUserPage(qualifier: $qualifier, pageable: { page: 0, size: 1 }) {
+            items { _id userID userName firstName lastName additionalInfo }
+          }
+        }
+      `, { qualifier: `userID == ${crUserIdNum}` }),
+      queryGraphQL(`
+        query UserCompanies($qualifier: String, $pageable: Pageable) {
+          crUserCompanyPage(qualifier: $qualifier, pageable: $pageable) {
+            totalElements
+            items { _id toCompany { _id companyID name } }
+          }
+        }
+      `, { qualifier: `toUser.userID == ${crUserIdNum}`, pageable: { page: 0, size: 100 } }),
+      getCarerixCheckboxRegistry(),
+    ]);
+
+    const crUser = userResp?.data?.crUserPage?.items?.[0] || null;
+    const additionalInfo = crUser?.additionalInfo || {};
+    out.carerix_user = crUser;
+    out.carerix_user_graphql_errors = userResp?.errors || null;
+    out.carerix_user_links = linksResp?.data?.crUserCompanyPage?.items || [];
+    out.carerix_links_graphql_errors = linksResp?.errors || null;
+
+    // 3. Registry
+    out.registry = {
+      entries: Object.keys(registry).length,
+      sample: Object.fromEntries(Object.entries(registry).slice(0, 10)),
+    };
+
+    // 4. Decoded function groups
+    const decoded = [];
+    for (const [key, value] of Object.entries(additionalInfo)) {
+      const rawKey = key.startsWith('_') ? key.slice(1) : key;
+      const code = registry[rawKey];
+      if (!code) continue;
+      if (String(value).trim() !== '1') continue;
+      decoded.push({ key: rawKey, exportCode: code });
+    }
+    out.decoded_function_groups = decoded;
+    out.additional_info_all = additionalInfo;
+
+    // 5. Platform companies lookup
+    const carerixCompanyIds = Array.from(new Set(
+      out.carerix_user_links
+        .map(l => l?.toCompany?.companyID)
+        .filter(v => v != null)
+        .map(String)
+    ));
+    out.carerix_company_ids = carerixCompanyIds;
+
+    if (carerixCompanyIds.length) {
+      const { data: companies, error: cErr } = await adminSupabase
+        .from('companies')
+        .select('id, carerix_company_id, name')
+        .in('carerix_company_id', carerixCompanyIds);
+      out.companies_lookup = companies || [];
+      if (cErr) out.companies_lookup_error = cErr.message;
+      const byCid = new Map((companies || []).map(c => [String(c.carerix_company_id), c]));
+      out.resolved_uuids = carerixCompanyIds.map(cid => byCid.get(cid)?.id).filter(Boolean);
+      out.unknown_carerix_ids = carerixCompanyIds.filter(cid => !byCid.has(cid));
+    }
+
+    // 6. Current user_company_access rows for this user
+    const { data: access, error: accErr } = await adminSupabase
+      .from('user_company_access')
+      .select('company_id, function_groups')
+      .eq('user_profile_id', userProfileId);
+    out.user_company_access = access || [];
+    if (accErr) out.user_company_access_error = accErr.message;
+
+    // 7. Try a write to see the exact error (if any)
+    if (out.resolved_uuids?.length) {
+      const testRow = {
+        user_profile_id: userProfileId,
+        company_id:      out.resolved_uuids[0],
+        function_groups: decoded.map(d => d.exportCode).length
+          ? decoded.map(d => d.exportCode)
+          : null,
+      };
+      const { error: upsertErr } = await adminSupabase
+        .from('user_company_access')
+        .upsert([testRow], { onConflict: 'user_profile_id,company_id' });
+      out.probe_upsert = {
+        row:   testRow,
+        error: upsertErr ? { code: upsertErr.code, message: upsertErr.message, details: upsertErr.details, hint: upsertErr.hint } : null,
+      };
+    }
+
+    res.json(out);
+  } catch (err) {
+    out.fatal = { message: err.message, stack: err.stack };
+    res.status(500).json(out);
   }
 });
 
