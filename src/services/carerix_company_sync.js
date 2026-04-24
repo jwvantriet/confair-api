@@ -43,7 +43,7 @@ const CR_JOBS_Q = `
         toEmployee {
           _id employeeID firstName lastName emailAddress
           paymentIbanCode paymentBicCode paymentAccountName
-          toFunction1Level2Node { _id dataNodeID value label }
+          toFunction1Level1Node { _id dataNodeID value label }
         }
       }
     }
@@ -136,10 +136,12 @@ async function upsertPlacement(companyId, crJob) {
   const emp = crJob.toEmployee || {};
   const fullName = [emp.firstName, emp.lastName].filter(Boolean).join(' ') || crJob.name || crewId || 'Unknown';
 
-  // Function group from CREmployee.toFunction1Level2Node (Carerix data node).
-  // We take the raw value (e.g. "Captain", "Mechanic B1", "Loadmaster") as
-  // the display/filter value, plus the dataNodeID for rate-table linking.
-  const fn = emp?.toFunction1Level2Node || null;
+  // Function GROUP from CREmployee.toFunction1Level1Node (Carerix data node).
+  // Level 1 is the group (e.g. "Pilot", "Mechanic", "Loadmaster") — the level
+  // we use to scope charges. Level 2 (specific position like "Captain" /
+  // "First Officer" / "Mechanic B1") may be added later in a separate column
+  // if we need position-aware rates.
+  const fn = emp?.toFunction1Level1Node || null;
   const carerixFunctionGroup = fn?.value || fn?.label || null;
   const carerixFunctionGroupId = fn?.dataNodeID != null ? Number(fn.dataNodeID) : null;
 
