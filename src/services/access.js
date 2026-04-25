@@ -17,7 +17,7 @@ import { adminSupabase } from './supabase.js';
 import {
   queryGraphQL,
   getCarerixCheckboxRegistry,
-  fetchEmployeeFunctionGroupLevel1,
+  fetchPlacementIdentityByCrUserId,
 } from './carerix.js';
 import { logger } from '../utils/logger.js';
 
@@ -251,15 +251,17 @@ export async function syncUserCompanyAccessFromCarerix(userProfileId, crUserId) 
 
 /**
  * Sync a placement's identity (carerix_employee_id + function group level 1)
- * from Carerix at login time. Idempotent.
+ * from Carerix at login time. Looks up the employee by CRUser userID — the
+ * legacy XML login response doesn't always carry the toEmployee link, so
+ * the GraphQL CRUser→toEmployee path is the reliable one.
  *
- * Same status union as syncUserCompanyAccessFromCarerix.
+ * Idempotent. Same status union as syncUserCompanyAccessFromCarerix.
  */
-export async function syncPlacementIdentityFromCarerix(userProfileId, crEmployeeId) {
-  if (!userProfileId || !crEmployeeId) {
+export async function syncPlacementIdentityFromCarerix(userProfileId, crUserId) {
+  if (!userProfileId || !crUserId) {
     return { status: 'aborted', reason: 'missing_inputs' };
   }
-  const fg = await fetchEmployeeFunctionGroupLevel1(crEmployeeId);
+  const fg = await fetchPlacementIdentityByCrUserId(crUserId);
   if (!fg) {
     return { status: 'aborted', reason: 'employee_lookup_failed' };
   }
@@ -273,7 +275,7 @@ export async function syncPlacementIdentityFromCarerix(userProfileId, crEmployee
   if (error) {
     return { status: 'aborted', reason: 'rpc_failure', error: error.message };
   }
-  logger.info('syncPlacementIdentityFromCarerix: rpc result', { userProfileId, crEmployeeId, data });
+  logger.info('syncPlacementIdentityFromCarerix: rpc result', { userProfileId, crUserId, data });
   return {
     status:       'synced',
     employeeID:   fg.employeeID,
