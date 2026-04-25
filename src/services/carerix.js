@@ -99,6 +99,11 @@ export async function queryGraphQL(query, variables = {}, options = {}) {
 //   { [dataNodeID]: exportCode }  e.g. { "12452": "9590", "12453": "9592" }
 //
 // The set changes rarely, so we cache it in-memory for 15 minutes.
+//
+// IMPORTANT: returns NULL on fetch failure (not {}). Callers MUST distinguish:
+//   - registry === null → Carerix unreachable, do NOT decode (fail-closed)
+//   - registry === {}   → Carerix reachable but no checkbox nodes exist
+//   - registry === {…}  → normal case
 let _checkboxRegistry     = null;
 let _checkboxRegistryExp  = 0;
 
@@ -133,8 +138,52 @@ export async function getCarerixCheckboxRegistry({ ttlMs = 15 * 60 * 1000 } = {}
     logger.info('Carerix checkbox registry loaded', { entries: Object.keys(registry).length });
     return registry;
   } catch (err) {
-    logger.warn('Carerix checkbox registry fetch failed', { error: err.message });
-    return {};
+    logger.warn('Carerix checkbox registry fetch failed — returning null so callers fail-closed', { error: err.message });
+    return null;
+  }
+}
+
+/**
+ * Fetches the function group level 1 of a Carerix employee (placement).
+ *
+ * The CREmployee field is `toFunction1Level1Node`, a CRDataNode reference.
+ * Returns `null` on lookup failure; callers MUST treat that as "do not write".
+ *
+ * Shape on success:
+ *   { employeeID, fgLevel1Id, fgLevel1Code, fgLevel1Name }
+ *
+ *   - employeeID   = the human-readable employeeID (or _id fallback)
+ *   - fgLevel1Id   = CRDataNode.dataNodeID of the function group
+ *   - fgLevel1Code = CRDataNode.exportCode  → matches placements.carerix_function_group_id
+ *   - fgLevel1Name = CRDataNode.value       → human label for UI
+ */
+export async function fetchEmployeeFunctionGroupLevel1(crEmployeeId) {
+  if (!crEmployeeId) return null;
+  try {
+    const resp = await carerixGQL(`
+      query EmployeeFG($id: String!) {
+        crEmployee(_id: $id) {
+          _id
+          employeeID
+          toFunction1Level1Node { dataNodeID exportCode value }
+        }
+      }
+    `, { id: String(crEmployeeId) });
+    const emp = resp?.data?.crEmployee;
+    if (!emp) {
+      logger.warn('fetchEmployeeFunctionGroupLevel1: employee not found', { crEmployeeId });
+      return null;
+    }
+    const fg = emp.toFunction1Level1Node || null;
+    return {
+      employeeID:   emp.employeeID != null ? String(emp.employeeID) : String(emp._id),
+      fgLevel1Id:   fg?.dataNodeID != null ? String(fg.dataNodeID) : null,
+      fgLevel1Code: fg?.exportCode != null ? String(fg.exportCode) : null,
+      fgLevel1Name: fg?.value || null,
+    };
+  } catch (err) {
+    logger.warn('fetchEmployeeFunctionGroupLevel1 failed', { crEmployeeId, error: err.message });
+    return null;
   }
 }
 
