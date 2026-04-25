@@ -58,6 +58,36 @@
   .info-box strong { display: block; margin-bottom: 4px; color: #60a5fa; }
   .divider { height: 1px; background: var(--border); margin: 4px 0; }
   .field-highlight { background: #2a1a0a; border: 1px solid #f59e0b; border-radius: 6px; padding: 8px 12px; margin: 8px 12px; font-family: var(--mono); font-size: 12px; color: var(--amber); }
+
+  /* ── Login probe summary ─────────────────────────────────────────────── */
+  #summaryCard { margin: 12px; }
+  .probe-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+  .probe-card.approved { border-color: rgba(34,197,94,0.35); }
+  .probe-card.rejected { border-color: rgba(239,68,68,0.35); }
+  .probe-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+  .probe-row:last-child { margin-bottom: 0; }
+  .probe-pill { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 11px; font-weight: 600; font-family: var(--mono); border: 1px solid; }
+  .probe-pill.green { color: var(--green); background: rgba(34,197,94,0.10); border-color: rgba(34,197,94,0.35); }
+  .probe-pill.red   { color: var(--red);   background: rgba(239,68,68,0.10); border-color: rgba(239,68,68,0.35); }
+  .probe-pill.blue  { color: #60a5fa;      background: rgba(59,130,246,0.10); border-color: rgba(59,130,246,0.35); }
+  .probe-pill.amber { color: var(--amber); background: rgba(245,158,11,0.10); border-color: rgba(245,158,11,0.35); }
+  .probe-pill.muted { color: var(--muted); background: rgba(100,116,139,0.10); border-color: rgba(100,116,139,0.35); }
+  .probe-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; margin-bottom: 12px; }
+  .probe-field-label { font-size: 9px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin-bottom: 2px; }
+  .probe-field-value { font-family: var(--mono); font-size: 12px; color: var(--text); word-break: break-all; }
+  .probe-section-title { font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin: 14px 0 8px; }
+  .probe-warning { background: rgba(245,158,11,0.06); border: 1px solid rgba(245,158,11,0.30); border-radius: 6px; padding: 8px 10px; font-size: 11px; color: #fcd34d; margin-bottom: 6px; line-height: 1.5; }
+  .probe-warning:last-child { margin-bottom: 0; }
+  .probe-error { background: rgba(239,68,68,0.06); border: 1px solid rgba(239,68,68,0.30); border-radius: 6px; padding: 8px 10px; font-size: 11px; color: #fca5a5; }
+  .probe-table { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 11px; }
+  .probe-table th { text-align: left; padding: 5px 8px; font-size: 9px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--border); }
+  .probe-table td { padding: 6px 8px; border-bottom: 1px solid rgba(37,43,53,0.5); font-family: var(--mono); }
+  .probe-bar-row { display: flex; align-items: center; gap: 10px; font-size: 11px; margin-bottom: 4px; }
+  .probe-bar-label { width: 170px; color: var(--muted); font-family: var(--mono); }
+  .probe-bar-track { flex: 1; height: 14px; background: var(--bg); border-radius: 3px; overflow: hidden; }
+  .probe-bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent-dim), var(--accent)); border-radius: 3px; }
+  .probe-bar-value { width: 60px; text-align: right; color: var(--text); font-family: var(--mono); }
+  .probe-fg-chips { display: flex; flex-wrap: wrap; gap: 4px; }
 </style>
 </head>
 <body>
@@ -67,6 +97,10 @@
 </header>
 <div class="layout">
   <div class="sidebar">
+    <div class="sidebar-section">
+      <h2>🔐 Login Probe</h2>
+      <button class="preset-btn" onclick="loadPreset('login_probe')">Test credentials end-to-end <span class="tag live">live</span></button>
+    </div>
     <div class="sidebar-section">
       <h2>🔍 Crew Code Debug</h2>
       <button class="preset-btn" onclick="loadPreset('probe_job_sample')">Sample jobs + additionalInfo <span class="tag">no auth</span></button>
@@ -138,6 +172,7 @@
     </div>
     <div id="modeBar" class="info-box" style="display:none"></div>
     <div class="response-area">
+      <div id="summaryCard" style="display:none"></div>
       <pre id="responseOut"><span style="color:var(--muted)">// Response will appear here. Select a preset or run a query.</span></pre>
     </div>
   </div>
@@ -147,6 +182,12 @@
 const BASE = window.location.origin;
 
 const PRESETS = {
+  login_probe: {
+    mode: 'login_probe',
+    label: 'POST /auth/probe — runs the FULL Carerix login flow (REST auth + identity lookup) for the supplied credentials, but creates no session and writes nothing to user_profiles or user_company_access. Returns role, identity, function-group linkage, linked companies, warnings, and per-phase timings. Bearer token (agency role) required for the probe call. Username/password go in the variables panel.',
+    query: '// Tests credentials by running the full login flow without creating a session.\n//\n// Required: Bearer token from an agency-role login (paste in toolbar above).\n// Required: { "username": "...", "password": "..." } in the variables panel.\n//\n// Returns:\n//   approved             — did Carerix accept the credentials\n//   platformRole         — agency_admin / company_admin / placement / etc\n//   placement            — for placements: linked CREmployee + function group level 1\n//   company              — for company users: registry, decoded function groups, linked companies\n//   agency               — for agency users: note about scope\n//   warnings             — flags misconfigurations (unimported companies, missing fg, etc)\n//   timings              — per-phase ms timings (REST login, lookup, total)\n//\n// Audit: writes one login_probe row to public.audit_log per call.',
+    vars: '{\n  "username": "user@example.com",\n  "password": "..."\n}'
+  },
   probe_job_sample: {
     mode: 'probe_raw',
     label: 'Sample jobs — confirms additionalInfo structure and field 10189',
@@ -519,6 +560,7 @@ async function runQuery() {
     else if (mode.mode === 'url_get') await runUrlGet(mode.url);
     else if (mode.mode === 'url_post') await runUrlPost(mode.url);
     else if (mode.mode === 'gql_explore') await runGqlExplore();
+    else if (mode.mode === 'login_probe') await runLoginProbe();
   } catch (e) {
     showResponse({ error: e.message });
     setStatus('Error', 'err');
@@ -577,6 +619,207 @@ async function runGqlExplore() {
   setStatus(`${r.status} ${r.statusText}`, r.ok ? 'ok' : 'err');
 }
 
+async function runLoginProbe() {
+  const token = document.getElementById('tokenInput').value.trim();
+  if (!token) { setStatus('Token required', 'err'); showResponse({ error: 'Paste an agency-role Bearer token in the toolbar above. /auth/probe is agency-only.' }); return; }
+  const vars  = safeParseVars(document.getElementById('varsEditor').value);
+  const username = (vars.username || '').trim();
+  const password = vars.password || '';
+  if (!username || !password) {
+    setStatus('Need username + password in vars', 'err');
+    showResponse({ error: 'Set { "username": "...", "password": "..." } in the variables panel.' });
+    return;
+  }
+  const t0 = performance.now();
+  let r, data, wallMs;
+  try {
+    r = await fetch(`${BASE}/auth/probe`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeader() },
+      body: JSON.stringify({ username, password }),
+    });
+    wallMs = Math.round(performance.now() - t0);
+    try { data = await r.json(); } catch { data = { rawBody: await r.text() }; }
+  } catch (e) {
+    showResponse({ error: 'Network error: ' + e.message });
+    setStatus('Error', 'err');
+    return;
+  }
+  if (r.status === 401) {
+    showResponse(data);
+    setStatus('401 — token rejected. Re-login as agency and paste a fresh token.', 'err');
+    return;
+  }
+  if (r.status === 403) {
+    showResponse(data);
+    setStatus('403 — token is not an agency token.', 'err');
+    return;
+  }
+  showProbeSummary(data, wallMs);
+  showResponse(data);
+  setStatus(`${r.status} ${r.statusText} · ${wallMs}ms wall`, r.ok ? 'ok' : 'err');
+}
+
+function showProbeSummary(data, wallMs) {
+  const card = document.getElementById('summaryCard');
+  card.style.display = 'block';
+
+  // ── Rejected ─────────────────────────────────────────────────────────────
+  if (data && data.approved === false) {
+    const err = data.error || {};
+    card.innerHTML =
+      `<div class="probe-card rejected">
+         <div class="probe-row">
+           <span class="probe-pill red">Login rejected</span>
+           <span class="probe-pill muted">HTTP ${esc(err.status ?? '?')}</span>
+         </div>
+         <div class="probe-error">${esc(err.message || 'Unknown error')}</div>
+         ${timingBars(data.timings, wallMs)}
+       </div>`;
+    return;
+  }
+
+  if (!data || data.approved !== true) {
+    // Some unexpected shape (auth error, etc) — let the JSON below tell the story
+    card.style.display = 'none';
+    card.innerHTML = '';
+    return;
+  }
+
+  // ── Approved ─────────────────────────────────────────────────────────────
+  const role = data.platformRole || 'unknown';
+  const roleTone = role === 'placement' ? 'blue' : (role.startsWith('agency') ? 'green' : 'muted');
+
+  let detailHtml = '';
+  if (data.placement) {
+    detailHtml = renderPlacement(data.placement);
+  } else if (data.company) {
+    detailHtml = renderCompany(data.company);
+  } else if (data.agency) {
+    detailHtml =
+      `<div class="probe-section-title">Agency access</div>
+       <div style="font-size:11px;color:var(--text);line-height:1.5">${esc(data.agency.note || '')}</div>`;
+  }
+
+  const warningsHtml = (data.warnings && data.warnings.length)
+    ? `<div class="probe-section-title">Warnings (${data.warnings.length})</div>
+       ${data.warnings.map(w => `<div class="probe-warning">${esc(w)}</div>`).join('')}`
+    : `<div class="probe-section-title">Warnings</div>
+       <div style="font-size:11px;color:var(--green)">No warnings — configuration looks healthy.</div>`;
+
+  card.innerHTML =
+    `<div class="probe-card approved">
+       <div class="probe-row">
+         <span class="probe-pill green">Approved</span>
+         <span class="probe-pill ${roleTone}">${esc(role)}</span>
+         ${data.userRoleIdInCarerix != null ? `<span class="probe-pill muted">CRUserRole id=${esc(data.userRoleIdInCarerix)}</span>` : ''}
+       </div>
+       <div class="probe-grid">
+         ${field('Display name',       data.fullName)}
+         ${field('Email',              data.email)}
+         ${field('Carerix user ID',    data.carerixUserId)}
+         ${field('Carerix company ID', data.carerixCompanyId)}
+       </div>
+       ${detailHtml}
+       ${warningsHtml}
+       <div class="probe-section-title">Timings</div>
+       ${timingBars(data.timings, wallMs)}
+     </div>`;
+}
+
+function renderPlacement(p) {
+  if (!p.found) return `<div class="probe-section-title">Placement identity</div><div class="probe-error">No CREmployee linked to this CRUser — placement-scoped queries will return nothing.</div>`;
+  const fg = p.functionGroupLevel1 || {};
+  return `<div class="probe-section-title">Placement identity</div>
+          <div class="probe-grid">
+            ${field('Employee ID',         p.carerixEmployeeId)}
+            ${field('Function group code', fg.code || '—')}
+            ${field('Function group name', fg.name || '—')}
+            ${field('Function group node', fg.id   || '—')}
+          </div>`;
+}
+
+function renderCompany(c) {
+  if (c.error) {
+    return `<div class="probe-section-title">Company access</div><div class="probe-error">${esc(c.error)}</div>`;
+  }
+  const fgChips = (c.decodedFunctionGroups || []).length
+    ? c.decodedFunctionGroups.map(g => `<span class="probe-pill blue">${esc(g)}</span>`).join('')
+    : `<span style="font-size:11px;color:var(--muted)">none ticked</span>`;
+  const tableRows = (c.linkedCompanies || []).map(co => {
+    const tone = co.imported ? 'green' : 'amber';
+    const status = co.imported ? 'imported' : 'NOT imported';
+    return `<tr>
+              <td>${esc(co.carerixCompanyId)}</td>
+              <td style="font-family:system-ui">${esc(co.nameInCarerix || '—')}</td>
+              <td style="font-family:system-ui">${esc(co.platformCompanyName || '—')}</td>
+              <td><span class="probe-pill ${tone}">${status}</span></td>
+            </tr>`;
+  }).join('');
+  return `<div class="probe-section-title">Company access</div>
+          <div class="probe-grid">
+            ${field('Registry available',  String(c.registryAvailable))}
+            ${field('Registry entries',    String(c.registryEntries))}
+            ${field('Checkboxes ticked',   String((c.additionalInfoKeysSet || []).length))}
+            ${field('Linked companies',    String((c.linkedCompanies || []).length))}
+          </div>
+          <div class="probe-section-title">Decoded function groups</div>
+          <div class="probe-fg-chips">${fgChips}</div>
+          ${(c.linkedCompanies || []).length ? `
+            <div class="probe-section-title">Linked companies</div>
+            <table class="probe-table">
+              <thead>
+                <tr><th>Carerix ID</th><th>Name in Carerix</th><th>Platform company</th><th>Status</th></tr>
+              </thead>
+              <tbody>${tableRows}</tbody>
+            </table>` : ''}`;
+}
+
+function field(label, value) {
+  return `<div>
+            <div class="probe-field-label">${esc(label)}</div>
+            <div class="probe-field-value">${esc(value ?? '—')}</div>
+          </div>`;
+}
+
+function timingBars(timings, wallMs) {
+  if (!timings) return '';
+  const total = timings.total || 1;
+  const phaseRows = Object.entries(timings)
+    .filter(([k]) => k !== 'total')
+    .map(([k, v]) => {
+      const pct = Math.max(2, Math.round((v / total) * 100));
+      return `<div class="probe-bar-row">
+                <div class="probe-bar-label">${esc(k)}</div>
+                <div class="probe-bar-track"><div class="probe-bar-fill" style="width:${pct}%"></div></div>
+                <div class="probe-bar-value">${v} ms</div>
+              </div>`;
+    }).join('');
+  const networkMs = Math.max(0, (wallMs ?? 0) - total);
+  return `<div>${phaseRows}
+            <div class="probe-bar-row" style="border-top:1px solid var(--border);padding-top:6px;margin-top:6px">
+              <div class="probe-bar-label">total (server)</div>
+              <div class="probe-bar-track"></div>
+              <div class="probe-bar-value" style="color:var(--text);font-weight:600">${total} ms</div>
+            </div>
+            ${wallMs != null ? `
+              <div class="probe-bar-row">
+                <div class="probe-bar-label" style="color:var(--muted)">network roundtrip</div>
+                <div class="probe-bar-track"></div>
+                <div class="probe-bar-value" style="color:var(--muted)">~${networkMs} ms</div>
+              </div>
+              <div class="probe-bar-row">
+                <div class="probe-bar-label" style="color:var(--muted)">wall (browser)</div>
+                <div class="probe-bar-track"></div>
+                <div class="probe-bar-value" style="color:var(--muted)">${wallMs} ms</div>
+              </div>` : ''}
+          </div>`;
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+
 function authHeader() {
   const token = document.getElementById('tokenInput').value.trim();
   return token ? { 'Authorization': `Bearer ${token}` } : {};
@@ -593,6 +836,8 @@ function setStatus(msg, cls = '') {
 }
 
 function clearResponse() {
+  const card = document.getElementById('summaryCard');
+  if (card) { card.style.display = 'none'; card.innerHTML = ''; }
   document.getElementById('responseOut').innerHTML = '<span style="color:var(--muted)">// Loading...</span>';
 }
 
@@ -641,8 +886,8 @@ function syntaxHighlight(json) {
   } catch { /* ignore */ }
 })();
 
-// Initialize with probe_eric preset
-loadPreset('probe_eric');
+// Initialize with login probe preset
+loadPreset('login_probe');
 </script>
 </body>
 </html>
