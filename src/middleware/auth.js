@@ -12,7 +12,15 @@ export async function requireAuth(req, res, next) {
 
     const { data: profile, error: pErr } = await adminSupabase
       .from('user_profiles')
-      .select('id, role, auth_source, carerix_user_id, carerix_company_id, display_name, is_active')
+      .select(`
+        id, role, auth_source,
+        carerix_user_id, carerix_company_id, carerix_employee_id,
+        carerix_function_group_level1_id,
+        carerix_function_group_level1_code,
+        carerix_function_group_level1_name,
+        display_name, is_active,
+        access_sync_status, access_sync_last_ok_at
+      `)
       .eq('id', user.id).single();
 
     if (pErr || !profile) throw new ApiError('User profile not found', 401);
