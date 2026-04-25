@@ -144,10 +144,13 @@ export async function getCarerixCheckboxRegistry({ ttlMs = 15 * 60 * 1000 } = {}
 }
 
 /**
- * Fetches the function group level 1 of a Carerix employee (placement).
+ * Fetches a placement's identity (linked employee + function group level 1)
+ * starting from their CRUser numeric userID.
  *
- * The CREmployee field is `toFunction1Level1Node`, a CRDataNode reference.
- * Returns `null` on lookup failure; callers MUST treat that as "do not write".
+ * The legacy XML login response sometimes omits the toEmployee link, so this
+ * GraphQL-based lookup is the reliable way to find the employee record.
+ *
+ * Returns null on lookup failure or when no employee is linked.
  *
  * Shape on success:
  *   { employeeID, fgLevel1Id, fgLevel1Code, fgLevel1Name }
@@ -157,21 +160,30 @@ export async function getCarerixCheckboxRegistry({ ttlMs = 15 * 60 * 1000 } = {}
  *   - fgLevel1Code = CRDataNode.exportCode  → matches placements.carerix_function_group_id
  *   - fgLevel1Name = CRDataNode.value       → human label for UI
  */
-export async function fetchEmployeeFunctionGroupLevel1(crEmployeeId) {
-  if (!crEmployeeId) return null;
+export async function fetchPlacementIdentityByCrUserId(crUserId) {
+  if (!crUserId) return null;
+  const crUserIdNum = Number(crUserId);
+  if (!Number.isFinite(crUserIdNum)) return null;
   try {
     const resp = await carerixGQL(`
-      query EmployeeFG($id: String!) {
-        crEmployee(_id: $id) {
-          _id
-          employeeID
-          toFunction1Level1Node { dataNodeID exportCode value }
+      query CRUserEmployee($qualifier: String) {
+        crUserPage(qualifier: $qualifier, pageable: { page: 0, size: 1 }) {
+          items {
+            _id
+            userID
+            toEmployee {
+              _id
+              employeeID
+              toFunction1Level1Node { dataNodeID exportCode value }
+            }
+          }
         }
       }
-    `, { id: String(crEmployeeId) });
-    const emp = resp?.data?.crEmployee;
+    `, { qualifier: `userID == ${crUserIdNum}` });
+    const item = resp?.data?.crUserPage?.items?.[0];
+    const emp = item?.toEmployee;
     if (!emp) {
-      logger.warn('fetchEmployeeFunctionGroupLevel1: employee not found', { crEmployeeId });
+      logger.warn('fetchPlacementIdentityByCrUserId: no linked employee', { crUserId: crUserIdNum });
       return null;
     }
     const fg = emp.toFunction1Level1Node || null;
@@ -182,7 +194,7 @@ export async function fetchEmployeeFunctionGroupLevel1(crEmployeeId) {
       fgLevel1Name: fg?.value || null,
     };
   } catch (err) {
-    logger.warn('fetchEmployeeFunctionGroupLevel1 failed', { crEmployeeId, error: err.message });
+    logger.warn('fetchPlacementIdentityByCrUserId failed', { crUserId, error: err.message });
     return null;
   }
 }
