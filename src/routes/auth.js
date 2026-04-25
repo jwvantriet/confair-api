@@ -378,13 +378,20 @@ async function runLoginProbe(username, password) {
         found:                true,
         carerixEmployeeId:    fg.employeeID,
         functionGroupLevel1:  {
+          // dataNodeID is the canonical match key — placements.carerix_function_group_id
+          // stores this exact value, and company users' decoded function_groups[] also
+          // hold dataNodeIDs (via checkbox exportCodes that point at function group nodes).
           id:   fg.fgLevel1Id,
+          // exportCode: kept in the response for completeness, but Function1 nodes in this
+          // tenant don't populate it — so it's expected to be null and is NOT a problem.
           code: fg.fgLevel1Code,
           name: fg.fgLevel1Name,
         },
       };
-      if (!fg.fgLevel1Code) {
-        warnings.push('Placement has no toFunction1Level1Node set in Carerix — function-group linking will not work for them.');
+      // Only warn if the dataNodeID itself is missing — that's the truly broken case
+      // (no toFunction1Level1Node link on the CREmployee). A null exportCode is fine.
+      if (!fg.fgLevel1Id) {
+        warnings.push('Placement has no toFunction1Level1Node linked in Carerix — function-group scoping cannot match this user to any placements.');
       }
     }
   } else if (identity.platformRole === 'agency_admin' || identity.platformRole === 'agency_operations') {
