@@ -75,6 +75,7 @@
   .probe-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; margin-bottom: 12px; }
   .probe-field-label { font-size: 9px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin-bottom: 2px; }
   .probe-field-value { font-family: var(--mono); font-size: 12px; color: var(--text); word-break: break-all; }
+  .probe-field-hint  { font-size: 10px; color: var(--muted); margin-top: 2px; font-family: system-ui; }
   .probe-section-title { font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin: 14px 0 8px; }
   .probe-warning { background: rgba(245,158,11,0.06); border: 1px solid rgba(245,158,11,0.30); border-radius: 6px; padding: 8px 10px; font-size: 11px; color: #fcd34d; margin-bottom: 6px; line-height: 1.5; }
   .probe-warning:last-child { margin-bottom: 0; }
@@ -185,7 +186,7 @@ const PRESETS = {
   login_probe: {
     mode: 'login_probe',
     label: 'POST /auth/probe — runs the FULL Carerix login flow (REST auth + identity lookup) for the supplied credentials, but creates no session and writes nothing to user_profiles or user_company_access. Returns role, identity, function-group linkage, linked companies, warnings, and per-phase timings. Bearer token (agency role) required for the probe call. Username/password go in the variables panel.',
-    query: '// Tests credentials by running the full login flow without creating a session.\n//\n// Required: Bearer token from an agency-role login (paste in toolbar above).\n// Required: { "username": "...", "password": "..." } in the variables panel.\n//\n// Returns:\n//   approved             — did Carerix accept the credentials\n//   platformRole         — agency_admin / company_admin / placement / etc\n//   placement            — for placements: linked CREmployee + function group level 1\n//   company              — for company users: registry, decoded function groups, linked companies\n//   agency               — for agency users: note about scope\n//   warnings             — flags misconfigurations (unimported companies, missing fg, etc)\n//   timings              — per-phase ms timings (REST login, lookup, total)\n//\n// Audit: writes one login_probe row to public.audit_log per call.',
+    query: '// Tests credentials by running the full login flow without creating a session.\n//\n// Required: Bearer token from an agency-role login (paste in toolbar above).\n// Required: { "username": "...", "password": "..." } in the variables panel.\n//\n// Returns:\n//   approved             — did Carerix accept the credentials\n//   platformRole         — agency_admin / company_admin / placement / etc\n//   placement            — for placements: linked CREmployee + function group level 1\n//                          (the dataNodeID is the canonical match key; exportCode is\n//                          unused on Function1 nodes in this tenant and is expected null)\n//   company              — for company users: registry, decoded function groups, linked companies\n//   agency               — for agency users: note about scope\n//   warnings             — flags misconfigurations (unimported companies, missing fg, etc)\n//   timings              — per-phase ms timings (REST login, lookup, total)\n//\n// Audit: writes one login_probe row to public.audit_log per call.',
     vars: '{\n  "username": "user@example.com",\n  "password": "..."\n}'
   },
   probe_job_sample: {
@@ -732,10 +733,13 @@ function renderPlacement(p) {
   const fg = p.functionGroupLevel1 || {};
   return `<div class="probe-section-title">Placement identity</div>
           <div class="probe-grid">
-            ${field('Employee ID',         p.carerixEmployeeId)}
-            ${field('Function group code', fg.code || '—')}
-            ${field('Function group name', fg.name || '—')}
-            ${field('Function group node', fg.id   || '—')}
+            ${field('Carerix employee ID', p.carerixEmployeeId)}
+            ${field('Function group',      fg.name || '—')}
+            ${fieldWithHint(
+                'Function group dataNodeID',
+                fg.id || '—',
+                'Match key — equals placements.carerix_function_group_id and the codes in user_company_access.function_groups.'
+              )}
           </div>`;
 }
 
@@ -779,6 +783,14 @@ function field(label, value) {
   return `<div>
             <div class="probe-field-label">${esc(label)}</div>
             <div class="probe-field-value">${esc(value ?? '—')}</div>
+          </div>`;
+}
+
+function fieldWithHint(label, value, hint) {
+  return `<div>
+            <div class="probe-field-label">${esc(label)}</div>
+            <div class="probe-field-value">${esc(value ?? '—')}</div>
+            <div class="probe-field-hint">${esc(hint)}</div>
           </div>`;
 }
 
