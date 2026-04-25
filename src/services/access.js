@@ -8,47 +8,58 @@
  *
  * Return semantics:
  *   null  → agency role, no filter (sees every company)
- *   []    → authenticated non-agency with zero companies linked (show nothing)
+ *   []    → authenticated non-agency with zero companies linked, OR
+ *           user's access has not been successfully synced from Carerix
+ *           ('never' / 'failed') — fail-closed default
  *   [...] → concrete list of company uuids
  */
 import { adminSupabase } from './supabase.js';
-import { queryGraphQL, getCarerixCheckboxRegistry } from './carerix.js';
+import {
+  queryGraphQL,
+  getCarerixCheckboxRegistry,
+  fetchEmployeeFunctionGroupLevel1,
+} from './carerix.js';
 import { logger } from '../utils/logger.js';
 
-/** @returns {Promise<null | string[]>} */
+/**
+ * @returns {Promise<null | string[]>}
+ *
+ * Watertight: a user whose access has never been successfully synced from
+ * Carerix (status='never') or who is currently in the failed-first-sync
+ * state ('failed') gets zero access. Stale and synced states use the rows
+ * in user_company_access verbatim — last-known-good for stale, fresh for
+ * synced.
+ */
 export async function companyIdsForUser(user) {
   if (!user) return [];
   if (user.role?.startsWith('agency_')) return null;
 
-  // Primary: the junction table
+  if (user.access_sync_status === 'never' || user.access_sync_status === 'failed') {
+    return [];
+  }
+
   const { data: access } = await adminSupabase
     .from('user_company_access')
     .select('company_id')
     .eq('user_profile_id', user.id);
-  const ids = (access || []).map(r => r.company_id);
-  if (ids.length) return ids;
-
-  // Fallback for users whose access isn't filled in yet (pre-migration state)
-  if (user.carerix_company_id) {
-    const { data: c } = await adminSupabase
-      .from('companies').select('id')
-      .eq('carerix_company_id', user.carerix_company_id)
-      .maybeSingle();
-    if (c) return [c.id];
-  }
-  return [];
+  return (access || []).map(r => r.company_id);
 }
 
 /**
  * Returns the full access rule set for a non-agency user:
  *   [{ company_id, function_groups }]
- * function_groups is null = "all groups", or an array of group names.
+ *
+ * function_groups semantics:
+ *   null  → "all groups allowed" (admin override only — Carerix sync never writes this)
+ *   []    → "no groups" (explicit deny)
+ *   [...] → specific groups
  *
  * For agency roles returns null (= no restriction).
  *
- * When a user has only the legacy `carerix_company_id` on their profile and
- * no user_company_access rows yet, we synthesize a single rule with
- * function_groups=null (all groups) for that company.
+ * Watertight: same status gating as companyIdsForUser. The previous
+ * "synthesise an unrestricted rule from legacy carerix_company_id" fallback
+ * has been removed — that path silently granted all-groups to any user
+ * whose user_company_access table was empty.
  *
  * @returns {Promise<null | Array<{company_id: string, function_groups: string[] | null}>>}
  */
@@ -56,21 +67,15 @@ export async function accessRulesForUser(user) {
   if (!user) return [];
   if (user.role?.startsWith('agency_')) return null;
 
+  if (user.access_sync_status === 'never' || user.access_sync_status === 'failed') {
+    return [];
+  }
+
   const { data: rows } = await adminSupabase
     .from('user_company_access')
     .select('company_id, function_groups')
     .eq('user_profile_id', user.id);
-  if (rows && rows.length) return rows;
-
-  // Legacy fallback — single company, unrestricted.
-  if (user.carerix_company_id) {
-    const { data: c } = await adminSupabase
-      .from('companies').select('id')
-      .eq('carerix_company_id', user.carerix_company_id)
-      .maybeSingle();
-    if (c) return [{ company_id: c.id, function_groups: null }];
-  }
-  return [];
+  return rows || [];
 }
 
 /**
@@ -81,8 +86,10 @@ export async function accessRulesForUser(user) {
  * the Carerix CRDataNode exportCode decoded at login.
  *
  * If rules is null (agency), returns the list unchanged.
- * If a placement's company has function_groups=null in rules, all groups pass.
- * If function_groups is an array, only matching group IDs pass.
+ * If a placement's company has function_groups=null in rules, all groups pass
+ *   (admin "grant all" override).
+ * If function_groups is an empty array, NO groups pass for that company.
+ * If function_groups is a non-empty array, only matching group IDs pass.
  * Placements whose company is not in the ruleset are filtered out.
  */
 export function filterPlacementsByAccessRules(placements, rules) {
@@ -93,8 +100,8 @@ export function filterPlacementsByAccessRules(placements, rules) {
   return placements.filter(p => {
     if (!byCompany.has(p.company_id)) return false;
     const groups = byCompany.get(p.company_id);
-    if (groups === null || groups === undefined) return true;
-    if (!Array.isArray(groups) || groups.length === 0) return false;
+    if (groups === null || groups === undefined) return true;     // admin grant-all
+    if (!Array.isArray(groups) || groups.length === 0) return false; // explicit deny
     return groups.includes(String(p.carerix_function_group_id));
   });
 }
@@ -102,30 +109,27 @@ export function filterPlacementsByAccessRules(placements, rules) {
 /**
  * Sync a user's `user_company_access` rows from their live Carerix state.
  *
+ * Watertight semantics:
+ *   - If we cannot reach Carerix (registry null, GraphQL error), abort
+ *     without touching DB. Return status so the login flow can decide
+ *     to block (first-ever login) or degrade gracefully (subsequent login
+ *     with a prior successful sync).
+ *   - An empty function_groups array means "explicit zero access", NOT
+ *     "all groups granted". The v2 RPC stores it verbatim.
+ *
  * Runs three queries in parallel:
  *   1. crUserPage        — for CRUser.additionalInfo (checkbox values)
  *   2. crUserCompanyPage — for linked CRCompanies
  *   3. getCarerixCheckboxRegistry — dataNodeID → exportCode map
  *
- * Decodes additionalInfo keys whose value is "1" via the registry into a
- * function_groups array (the exportCode matches a placement's
- * carerix_function_group_id). Upserts one user_company_access row per linked
- * company with that same array. Companies that Carerix no longer links to
- * this user are deleted (user-scoped orphan cleanup — never touches other
- * users' rows).
- *
- * Carerix companies that have not yet been imported into our `companies`
- * table are logged and skipped — admins must run syncCarerixCompany for them.
- *
- * @returns {Promise<{
- *   synced:         number,
- *   unknown:        string[],
- *   functionGroups: string[]
- * }>}
+ * Returns a status union — callers MUST inspect `status`:
+ *   { status: 'synced',    synced, unknown, functionGroups }   happy path
+ *   { status: 'unchanged', reason, functionGroups }            no Carerix links yet
+ *   { status: 'aborted',   reason, error? }                    transient failure
  */
 export async function syncUserCompanyAccessFromCarerix(userProfileId, crUserId) {
   if (!userProfileId || !crUserId) {
-    return { synced: 0, unknown: [], functionGroups: [] };
+    return { status: 'aborted', reason: 'missing_inputs' };
   }
 
   // Carerix's qualifier engine for CRUser / CRUserCompany indexes `userID`
@@ -136,30 +140,44 @@ export async function syncUserCompanyAccessFromCarerix(userProfileId, crUserId) 
     logger.warn('syncUserCompanyAccessFromCarerix: non-numeric carerix user id — skipping', {
       userProfileId, crUserId,
     });
-    return { synced: 0, unknown: [], functionGroups: [] };
+    return { status: 'aborted', reason: 'non_numeric_carerix_user_id' };
   }
 
-  const [userResp, linksResp, registry] = await Promise.all([
-    queryGraphQL(`
-      query CRUser($qualifier: String) {
-        crUserPage(qualifier: $qualifier, pageable: { page: 0, size: 1 }) {
-          items { _id userID additionalInfo }
+  let userResp, linksResp, registry;
+  try {
+    [userResp, linksResp, registry] = await Promise.all([
+      queryGraphQL(`
+        query CRUser($qualifier: String) {
+          crUserPage(qualifier: $qualifier, pageable: { page: 0, size: 1 }) {
+            items { _id userID additionalInfo }
+          }
         }
-      }
-    `, { qualifier: `userID == ${crUserIdNum}` }),
-    queryGraphQL(`
-      query UserCompanies($qualifier: String, $pageable: Pageable) {
-        crUserCompanyPage(qualifier: $qualifier, pageable: $pageable) {
-          totalElements
-          items { _id toCompany { _id companyID } }
+      `, { qualifier: `userID == ${crUserIdNum}` }),
+      queryGraphQL(`
+        query UserCompanies($qualifier: String, $pageable: Pageable) {
+          crUserCompanyPage(qualifier: $qualifier, pageable: $pageable) {
+            totalElements
+            items { _id toCompany { _id companyID } }
+          }
         }
-      }
-    `, {
-      qualifier: `toUser.userID == ${crUserIdNum}`,
-      pageable:  { page: 0, size: 100 },
-    }),
-    getCarerixCheckboxRegistry(),
-  ]);
+      `, {
+        qualifier: `toUser.userID == ${crUserIdNum}`,
+        pageable:  { page: 0, size: 100 },
+      }),
+      getCarerixCheckboxRegistry(),
+    ]);
+  } catch (err) {
+    return { status: 'aborted', reason: 'carerix_unreachable', error: err.message };
+  }
+
+  // Registry null = Carerix unreachable. Without the registry we cannot decode
+  // additionalInfo, so we must NOT write — a written-but-empty function_groups
+  // would either deny all access (if Carerix is the source of truth) or
+  // silently widen it under the legacy v1 RPC. Either way, fail-closed and
+  // let the caller decide.
+  if (registry === null) {
+    return { status: 'aborted', reason: 'registry_unavailable' };
+  }
 
   const additionalInfo = userResp?.data?.crUserPage?.items?.[0]?.additionalInfo || {};
   const functionGroups = [];
@@ -193,22 +211,29 @@ export async function syncUserCompanyAccessFromCarerix(userProfileId, crUserId) 
     logger.warn('syncUserCompanyAccessFromCarerix: no Carerix company links', {
       userProfileId, crUserId: crUserIdNum,
     });
-    return { synced: 0, unknown: [], functionGroups };
+    return {
+      status: 'unchanged',
+      reason: 'no_carerix_company_links',
+      functionGroups,
+    };
   }
 
-  // Delegate the platform-side write to a SECURITY DEFINER RPC. Direct
+  // Delegate the platform-side write to the v2 SECURITY DEFINER RPC. Direct
   // adminSupabase writes can fail under RLS if the env-var key is wrong;
   // SECURITY DEFINER runs with the function owner's privileges and bypasses
   // RLS entirely. Same trick used by `upsert_user_profile`.
   const { data: rpcResult, error: rpcErr } = await adminSupabase.rpc(
-    'sync_user_company_access',
+    'sync_user_company_access_v2',
     {
       p_user_profile_id:     userProfileId,
       p_carerix_company_ids: carerixCompanyIds,
       p_function_groups:     functionGroups,
+      p_grant_all:           false,
     },
   );
-  if (rpcErr) throw new Error(`sync_user_company_access rpc: ${rpcErr.message}`);
+  if (rpcErr) {
+    return { status: 'aborted', reason: 'rpc_failure', error: rpcErr.message };
+  }
 
   logger.info('syncUserCompanyAccessFromCarerix: rpc result', {
     userProfileId,
@@ -217,9 +242,44 @@ export async function syncUserCompanyAccessFromCarerix(userProfileId, crUserId) 
   });
 
   return {
+    status:         'synced',
     synced:         rpcResult?.synced   ?? 0,
     unknown:        rpcResult?.unknown  ?? [],
     functionGroups,
+  };
+}
+
+/**
+ * Sync a placement's identity (carerix_employee_id + function group level 1)
+ * from Carerix at login time. Idempotent.
+ *
+ * Same status union as syncUserCompanyAccessFromCarerix.
+ */
+export async function syncPlacementIdentityFromCarerix(userProfileId, crEmployeeId) {
+  if (!userProfileId || !crEmployeeId) {
+    return { status: 'aborted', reason: 'missing_inputs' };
+  }
+  const fg = await fetchEmployeeFunctionGroupLevel1(crEmployeeId);
+  if (!fg) {
+    return { status: 'aborted', reason: 'employee_lookup_failed' };
+  }
+  const { data, error } = await adminSupabase.rpc('sync_placement_identity_carerix', {
+    p_user_profile_id:     userProfileId,
+    p_carerix_employee_id: fg.employeeID,
+    p_fg_level1_id:        fg.fgLevel1Id,
+    p_fg_level1_code:      fg.fgLevel1Code,
+    p_fg_level1_name:      fg.fgLevel1Name,
+  });
+  if (error) {
+    return { status: 'aborted', reason: 'rpc_failure', error: error.message };
+  }
+  logger.info('syncPlacementIdentityFromCarerix: rpc result', { userProfileId, crEmployeeId, data });
+  return {
+    status:       'synced',
+    employeeID:   fg.employeeID,
+    fgLevel1Id:   fg.fgLevel1Id,
+    fgLevel1Code: fg.fgLevel1Code,
+    fgLevel1Name: fg.fgLevel1Name,
   };
 }
 
