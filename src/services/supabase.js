@@ -7,6 +7,7 @@
 
 import { createClient } from '@supabase/supabase-js';
 import { config } from '../config.js';
+import { ApiError } from '../middleware/errorHandler.js';
 
 export const adminSupabase = createClient(
   config.supabase.url,
@@ -26,42 +27,46 @@ export function userSupabase(accessToken) {
 }
 
 /**
- * Provisions or updates a Supabase user for a Carerix-authenticated identity.
+ * Step 1 of login: ensure a user_profiles row exists for the Carerix
+ * identity and refuse outright if the account is deactivated.
  *
- * Flow:
- *   1. Check if carerix_user_id already exists in user_profiles
- *   2. If yes  → sync profile fields, issue new session
- *   3. If no   → create auth.users entry + user_profiles row, issue session
+ * Splitting profile-upsert from session-issuance lets the auth route park
+ * a freshly-authenticated user at the MFA challenge before any Supabase
+ * tokens are minted. No tokens leave the server until MFA passes (or is
+ * not required).
+ *
+ * @returns {Promise<{ userId: string }>}
  */
-export async function provisionCarerixSession(identity) {
+export async function provisionCarerixUser(identity) {
   let existing = null;
 
-  // Look up by carerix_user_id first (most specific)
   if (identity.carerixUserId) {
     const { data } = await adminSupabase
       .from('user_profiles')
-      .select('id')
+      .select('id, is_active')
       .eq('carerix_user_id', identity.carerixUserId)
       .maybeSingle();
     existing = data;
   }
-
-  // Fallback: look up by email case-insensitively (handles case where carerixUserId was empty on first login)
   if (!existing && identity.email) {
     const { data } = await adminSupabase
       .from('user_profiles')
-      .select('id')
+      .select('id, is_active')
       .ilike('email', identity.email.trim())
       .maybeSingle();
     existing = data;
+  }
+
+  // Refuse early if a profile exists but has been deactivated. New users
+  // (no profile yet) are provisioned with is_active=true below.
+  if (existing && existing.is_active === false) {
+    throw new ApiError('Account is inactive', 403);
   }
 
   let supabaseUserId;
 
   if (existing) {
     supabaseUserId = existing.id;
-    // Update non-role fields — don't overwrite manually assigned roles
-    // Also populate carerix_user_id if it was missing (fixes future lookups)
     await adminSupabase.from('user_profiles').update({
       display_name:           identity.fullName,
       email:                  identity.email,
@@ -75,10 +80,7 @@ export async function provisionCarerixSession(identity) {
       email_confirm: true,
       user_metadata: { full_name: identity.fullName, carerix_user_id: identity.carerixUserId, platform_role: identity.platformRole },
     });
-
     if (error?.message?.includes('already been registered')) {
-      // User exists in auth but not in user_profiles — find and link them
-      // listUsers is paginated; loop to find the user across all pages
       let authUser = null;
       let page = 1;
       while (!authUser) {
@@ -95,7 +97,6 @@ export async function provisionCarerixSession(identity) {
       supabaseUserId = newUser.user.id;
     }
 
-    // Use SECURITY DEFINER RPC to bypass RLS entirely
     const { error: upsertErr } = await adminSupabase.rpc('upsert_user_profile', {
       p_id:                 supabaseUserId,
       p_auth_source:        'carerix',
@@ -110,15 +111,21 @@ export async function provisionCarerixSession(identity) {
     if (upsertErr) throw new Error(`Failed to create user profile: ${upsertErr.message}`);
   }
 
-  // createSession was removed in Supabase JS v2.
-  // Use generateLink to get a magic link, then exchange token_hash for a session.
+  return { userId: supabaseUserId };
+}
+
+/**
+ * Step 2 of login (post-MFA, or no-MFA): mint a Supabase session.
+ *
+ * Uses generateLink → verifyOtp because Supabase v2 removed createSession.
+ */
+export async function issueSupabaseSession({ email, userId, role }) {
   const { data: linkData, error: linkErr } = await adminSupabase.auth.admin.generateLink({
     type:  'magiclink',
-    email: identity.email,
+    email,
   });
   if (linkErr) throw new Error(`Failed to generate session link: ${linkErr.message}`);
 
-  // Use token_hash (not the URL token) — this is the correct v2 approach
   const tokenHash = linkData.properties?.hashed_token;
   if (!tokenHash) throw new Error('No hashed_token in generateLink response');
 
@@ -132,7 +139,22 @@ export async function provisionCarerixSession(identity) {
     accessToken:  otpData.session.access_token,
     refreshToken: otpData.session.refresh_token,
     expiresAt:    otpData.session.expires_at,
-    userId:       supabaseUserId,
-    role:         identity.platformRole,
+    userId,
+    role,
   };
+}
+
+/**
+ * Convenience: run both steps. Used by code paths that don't gate on MFA
+ * (e.g. legacy callers or admin-impersonation flows). New code should call
+ * the two halves explicitly so MFA can be inserted between them.
+ */
+export async function provisionCarerixSession(identity) {
+  const { userId } = await provisionCarerixUser(identity);
+  const session    = await issueSupabaseSession({
+    email:  identity.email,
+    userId,
+    role:   identity.platformRole,
+  });
+  return session;
 }
