@@ -7,6 +7,7 @@ import { config } from './config.js';
 import { logger } from './utils/logger.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import authRoutes        from './routes/auth.js';
+import authMfaRoutes     from './routes/auth_mfa.js';
 import payrollRoutes     from './routes/payroll.js';
 import correctionsRoutes from './routes/corrections.js';
 import approvalsRoutes   from './routes/approvals.js';
@@ -58,6 +59,7 @@ app.get('/health', (_req, res) =>
   res.json({ status: 'ok', env: config.nodeEnv, ts: new Date().toISOString() })
 );
 
+app.use('/auth/mfa',    authLimiter, authMfaRoutes);
 app.use('/auth',        authLimiter, authRoutes);
 app.use('/payroll',     payrollRoutes);
 app.use('/corrections', correctionsRoutes);
