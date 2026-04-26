@@ -7,6 +7,15 @@ const required = (key) => {
 };
 const optional = (key, fallback = '') => process.env[key] || fallback;
 
+// Comma-separated env → array of trimmed non-empty strings.
+const list = (key) => (process.env[key] || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+// Same, but parsed as integers (for Carerix CRUserRole IDs).
+const intList = (key) => list(key).map(Number).filter(Number.isFinite);
+
 export const config = {
   raido: {
     baseUrl:    process.env.RAIDO_BASE_URL || 'https://aai-apim-prod-northeu-01.azure-api.net/raido/v1/nocrestapi/v1',
@@ -33,9 +42,15 @@ export const config = {
     tenantId:      optional('CARERIX_TENANT_ID', 'confair'),
 
     // Carerix legacy REST API (api.carerix.com) — used for user authentication
-  restUrl:       optional('CARERIX_REST_URL', 'https://api.carerix.com/'),
-  restUsername:  optional('CARERIX_REST_USERNAME', 'confair'),
-  restPassword:  optional('CARERIX_REST_PASSWORD', ''),
+    restUrl:       optional('CARERIX_REST_URL', 'https://api.carerix.com/'),
+    restUsername:  optional('CARERIX_REST_USERNAME', 'confair'),
+    restPassword:  optional('CARERIX_REST_PASSWORD', ''),
+
+    // CRUserRole IDs that map to platform agency roles. No defaults — an
+    // unmapped role is rejected at login (no silent privilege elevation).
+    // Configure both as comma-separated CRUserRole.id values in the env.
+    agencyAdminRoleIds:      intList('CARERIX_AGENCY_ADMIN_ROLE_IDS'),
+    agencyOperationsRoleIds: intList('CARERIX_AGENCY_OPERATIONS_ROLE_IDS'),
 
   // Derived OAuth2 endpoints
     get tokenUrl()   { return `${this.authUrl}/token`; },
@@ -46,9 +61,31 @@ export const config = {
   // OAuth2 callback URL — must match what's registered in Carerix client
   appUrl: optional('APP_URL', 'https://confair-api-production.up.railway.app'),
 
+  // Used to sign short-lived MFA challenge / enrollment tokens. No default —
+  // a missing or default value would let an attacker mint their own tokens.
   jwt: {
-    secret:    optional('JWT_SECRET', 'dev-secret-change-in-production'),
+    secret:    required('JWT_SECRET'),
     expiresIn: '8h',
+  },
+
+  // Multi-factor authentication.
+  mfa: {
+    issuer: optional('MFA_ISSUER', 'Confair'),
+    // Roles that MUST have MFA enrolled. Users in these roles who haven't
+    // enrolled yet are bounced into the enrollment flow at login. Other
+    // users may enrol voluntarily but are not forced.
+    enforceForRoles: list('MFA_ENFORCE_ROLES'),
+    // Validity window for the short-lived challenge token returned after
+    // step-1 (Carerix) succeeds and we're waiting on the TOTP code.
+    challengeTtlSeconds: Number(process.env.MFA_CHALLENGE_TTL_SECONDS || 300),
+  },
+
+  // Per-username lockout. Counts failed login attempts in a sliding window
+  // and refuses further attempts (regardless of credentials) once the
+  // threshold is hit. Complements the per-IP rate limiter.
+  loginLockout: {
+    windowMinutes:  Number(process.env.LOGIN_LOCKOUT_WINDOW_MINUTES || 15),
+    maxAttempts:    Number(process.env.LOGIN_LOCKOUT_MAX_ATTEMPTS   || 10),
   },
 
   cors: {

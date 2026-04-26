@@ -7,6 +7,8 @@ import { config } from './config.js';
 import { logger } from './utils/logger.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import authRoutes        from './routes/auth.js';
+import authMfaRoutes     from './routes/auth_mfa.js';
+import authProbeRoutes   from './routes/auth_probe.js';
 import payrollRoutes     from './routes/payroll.js';
 import correctionsRoutes from './routes/corrections.js';
 import approvalsRoutes   from './routes/approvals.js';
@@ -36,9 +38,9 @@ const corsOptions = {
 };
 
 app.use(helmet({ crossOriginResourcePolicy: false }));
-app.set('trust proxy', 1); // Trust Railway's proxy for correct IP detection
+app.set('trust proxy', 1);
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));  // handle all preflight requests
+app.options('*', cors(corsOptions));
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
@@ -58,7 +60,10 @@ app.get('/health', (_req, res) =>
   res.json({ status: 'ok', env: config.nodeEnv, ts: new Date().toISOString() })
 );
 
+// /auth/mfa is mounted before /auth so the more specific prefix wins.
+app.use('/auth/mfa',    authLimiter, authMfaRoutes);
 app.use('/auth',        authLimiter, authRoutes);
+app.use('/auth',        authLimiter, authProbeRoutes); // /auth/probe
 app.use('/payroll',     payrollRoutes);
 app.use('/corrections', correctionsRoutes);
 app.use('/approvals',   approvalsRoutes);
