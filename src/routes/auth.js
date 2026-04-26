@@ -47,11 +47,27 @@ function mapPlatformRole({ userRoleId, empId, compId }) {
   return null;
 }
 
-// Fire-and-forget audit + lockout writes. Both are append-only, best-effort
-// telemetry — letting them fall behind the user response saves Supabase
-// round-trips on the critical path.
 function fireAndForget(label, p) {
   return Promise.resolve(p).catch(err => logger.warn(`${label} failed`, { error: err?.message || String(err) }));
+}
+
+// Tiny stopwatch helper. `mark()` returns the elapsed-since-`start` ms and
+// stamps a per-step name into `out`. Used to instrument handleLogin so the
+// client can see where the time goes.
+function makeStopwatch() {
+  const t0  = Date.now();
+  let last  = t0;
+  const out = {};
+  return {
+    mark(name) {
+      const now = Date.now();
+      out[name] = now - last;
+      last = now;
+      return out[name];
+    },
+    total() { return Date.now() - t0; },
+    out,
+  };
 }
 
 export async function loginWithCarerix(username, password, { ipAddress } = {}) {
@@ -91,9 +107,6 @@ export async function loginWithCarerix(username, password, { ipAddress } = {}) {
 
   if (!platformRole) {
     logger.warn('Carerix login rejected: no role mapping', { crUserId, userRoleId, empId, compId, username });
-    // Persist the diagnostic context to Supabase so admins can find the
-    // userRoleId without trawling through Railway logs. Fire-and-forget so a
-    // failed audit insert doesn't slow the rejection.
     fireAndForget('login_role_unmapped audit', writeAuditLog({
       eventType: 'login_role_unmapped',
       payload: {
@@ -169,7 +182,7 @@ async function refreshUserAccessOnLogin(session, identity) {
   return result;
 }
 
-function loginResponse(res, session, identity, syncResult) {
+function loginResponse(res, session, identity, syncResult, timing) {
   res.json({
     accessToken:  session.accessToken,
     refreshToken: session.refreshToken,
@@ -186,6 +199,7 @@ function loginResponse(res, session, identity, syncResult) {
       accessSyncStatus:  syncResult?.status === 'synced' ? 'synced'
                        : syncResult?.status === 'skipped' ? 'skipped' : 'stale',
     },
+    _timing: timing || null,
   });
 }
 
@@ -193,24 +207,23 @@ function loginResponse(res, session, identity, syncResult) {
 async function handleLogin(req, res, next, { username, password }) {
   const ipAddress = req.ip;
   const userAgent = req.headers['user-agent'] || null;
+  const sw = makeStopwatch();
 
   try {
     if (!username || !password) throw new ApiError('Username and password are required', 400);
 
-    // 1. Per-username lockout (complements per-IP rate limiter).
     const lockout = await isUsernameLockedOut(username);
+    sw.mark('lockout');
     if (lockout.locked) {
       res.set('Retry-After', String(lockout.retryAfterSeconds));
       throw new ApiError('Too many failed attempts. Try again later.', 429);
     }
 
-    // 2. Carerix authentication. Failures are recorded + audit-logged.
     let identity;
     try {
       identity = await loginWithCarerix(username, password, { ipAddress });
+      sw.mark('carerix');
     } catch (err) {
-      // Failure-path telemetry is fire-and-forget too — we want to return the
-      // 401/403 to the user as quickly as possible.
       fireAndForget('login_attempts (failed)', recordLoginAttempt({ username, succeeded: false, ipAddress, userAgent }));
       fireAndForget('audit login_failed', writeAuditLog({
         eventType: 'login_failed',
@@ -220,18 +233,22 @@ async function handleLogin(req, res, next, { username, password }) {
       throw err;
     }
 
-    // 3. Provision user (also enforces is_active=false rejection).
     const { userId } = await provisionCarerixUser(identity);
+    sw.mark('provision');
 
-    // 4. MFA gate.
     const mfa = await getMfaState(userId);
+    sw.mark('mfa_check');
+
     if (mfa.enrolled) {
       const challenge = signLoginChallenge(userId);
       fireAndForget('login_attempts (mfa)', recordLoginAttempt({ username, succeeded: true, ipAddress, userAgent }));
+      const total = sw.total();
+      logger.info('Login challenge issued', { username, role: identity.platformRole, totalMs: total, breakdown: sw.out });
       return res.json({
         mfaRequired: true,
         challenge,
         ttlSeconds: config.mfa.challengeTtlSeconds,
+        _timing:    { ...sw.out, total },
       });
     }
     if (config.mfa.enforceForRoles.includes(identity.platformRole)) {
@@ -239,11 +256,11 @@ async function handleLogin(req, res, next, { username, password }) {
       throw new ApiError('MFA enrollment is required for your role. Please contact your administrator to enrol.', 403);
     }
 
-    // 5. No MFA required — finalise the session.
-    const session    = await issueSupabaseSession({ email: identity.email, userId, role: identity.platformRole });
+    const session = await issueSupabaseSession({ email: identity.email, userId, role: identity.platformRole });
+    sw.mark('session');
     const syncResult = await refreshUserAccessOnLogin(session, identity);
+    sw.mark('access_sync');
 
-    // Telemetry off the critical path.
     fireAndForget('login_attempts (success)', recordLoginAttempt({ username, succeeded: true, ipAddress, userAgent }));
     fireAndForget('audit login', writeAuditLog({
       eventType: 'login',
@@ -253,7 +270,9 @@ async function handleLogin(req, res, next, { username, password }) {
       ipAddress,
     }));
 
-    loginResponse(res, session, identity, syncResult);
+    const total = sw.total();
+    logger.info('Login complete', { username, role: identity.platformRole, totalMs: total, breakdown: sw.out });
+    loginResponse(res, session, identity, syncResult, { ...sw.out, total });
   } catch (err) { next(err); }
 }
 
@@ -264,11 +283,8 @@ router.post('/login/carerix', (req, res, next) =>
   handleLogin(req, res, next, { username: req.body?.username, password: req.body?.password })
 );
 
-/**
- * Step 2 for MFA users: client sends back the challenge JWT plus the 6-digit
- * code (or a recovery code). On success we issue the real Supabase session.
- */
 router.post('/mfa/verify-login', async (req, res, next) => {
+  const sw = makeStopwatch();
   try {
     const { challenge, code, recoveryCode } = req.body || {};
     if (!challenge || (!code && !recoveryCode)) throw new ApiError('challenge and code are required', 400);
@@ -282,6 +298,7 @@ router.post('/mfa/verify-login', async (req, res, next) => {
     } else if (recoveryCode) {
       ok = await consumeRecoveryCode(decoded.userId, recoveryCode);
     }
+    sw.mark('verify_code');
 
     if (!ok) {
       fireAndForget('audit mfa_failed', writeAuditLog({
@@ -298,6 +315,7 @@ router.post('/mfa/verify-login', async (req, res, next) => {
       .select('id, role, email, display_name, carerix_user_id, carerix_company_id, carerix_employee_id')
       .eq('id', decoded.userId)
       .single();
+    sw.mark('profile_read');
     if (!profile) throw new ApiError('User profile not found', 401);
 
     const identity = {
@@ -310,7 +328,9 @@ router.post('/mfa/verify-login', async (req, res, next) => {
     };
 
     const session    = await issueSupabaseSession({ email: profile.email, userId: profile.id, role: profile.role });
+    sw.mark('session');
     const syncResult = await refreshUserAccessOnLogin(session, identity);
+    sw.mark('access_sync');
 
     fireAndForget('audit mfa_login', writeAuditLog({
       eventType:   'login',
@@ -319,7 +339,9 @@ router.post('/mfa/verify-login', async (req, res, next) => {
       payload:     { mfa: true, mode: code ? 'totp' : 'recovery' },
       ipAddress:   req.ip,
     }));
-    loginResponse(res, session, identity, syncResult);
+    const total = sw.total();
+    logger.info('MFA login complete', { userId: decoded.userId, totalMs: total, breakdown: sw.out });
+    loginResponse(res, session, identity, syncResult, { ...sw.out, total });
   } catch (err) { next(err); }
 });
 
