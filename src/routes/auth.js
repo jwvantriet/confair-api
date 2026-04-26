@@ -2,35 +2,52 @@ import { Router } from 'express';
 import axios from 'axios';
 import crypto from 'crypto';
 import { XMLParser } from 'fast-xml-parser';
-import { adminSupabase, provisionCarerixSession } from '../services/supabase.js';
+import {
+  adminSupabase,
+  provisionCarerixUser,
+  issueSupabaseSession,
+} from '../services/supabase.js';
 import {
   syncUserCompanyAccessFromCarerix,
   syncPlacementIdentityFromCarerix,
 } from '../services/access.js';
-import {
-  queryGraphQL,
-  getCarerixCheckboxRegistry,
-  fetchPlacementIdentityByCrUserId,
-} from '../services/carerix.js';
-import { requireAuth, requireAgency } from '../middleware/auth.js';
+import { requireAuth } from '../middleware/auth.js';
 import { ApiError } from '../middleware/errorHandler.js';
 import { writeAuditLog } from '../utils/audit.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
+import {
+  recordLoginAttempt,
+  isUsernameLockedOut,
+} from '../services/login_attempts.js';
+import {
+  signLoginChallenge, verifyLoginChallenge,
+  getMfaState, getActiveSecret,
+  verifyTotpCode, consumeRecoveryCode,
+} from '../services/mfa.js';
 
 const router = Router();
 const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
 const parseXml = (xml) => { try { return xmlParser.parse(xml); } catch { return null; } };
 const getId = (obj) => obj?.['@_id'] || obj?.id || obj?._id || null;
 
-// Carerix CRUserRole IDs → platform roles
-// id=1  → Employee (CREmployee linked) → placement
-// id=11 → Contact  (CRCompany linked)  → company_admin
-// other → Office/recruiter              → agency_admin
+// Carerix CRUserRole IDs we map without env config:
+//   id=1  → CREmployee linked → placement
+//   id=11 → CRCompany linked  → company_admin
+// Agency role IDs are configured via env (CARERIX_AGENCY_ADMIN_ROLE_IDS,
+// CARERIX_AGENCY_OPERATIONS_ROLE_IDS). Anything else → reject (no defaults).
 const ROLE_CONTACT  = 11;
 const ROLE_EMPLOYEE = 1;
 
-async function loginWithCarerix(username, password) {
+function mapPlatformRole({ userRoleId, empId, compId }) {
+  if (empId  || userRoleId === ROLE_EMPLOYEE) return 'placement';
+  if (compId || userRoleId === ROLE_CONTACT)  return 'company_admin';
+  if (config.carerix.agencyAdminRoleIds.includes(userRoleId))      return 'agency_admin';
+  if (config.carerix.agencyOperationsRoleIds.includes(userRoleId)) return 'agency_operations';
+  return null;
+}
+
+export async function loginWithCarerix(username, password) {
   const restBase    = config.carerix.restUrl;
   const restAuth    = Buffer.from(`${config.carerix.restUsername}:${config.carerix.restPassword}`).toString('base64');
   const md5password = crypto.createHash('md5').update(password).digest('hex');
@@ -58,17 +75,20 @@ async function loginWithCarerix(username, password) {
   if (!crUserId) throw new ApiError('Invalid username or password', 401);
 
   const userRoleId = parseInt(getId(crUser.toUserRole?.CRUserRole || crUser.toUserRole) || '0', 10);
-
   const empNode  = crUser.toEmployee?.CREmployee || crUser.toEmployee;
   const compNode = crUser.toCompany?.CRCompany   || crUser.toCompany;
   const empId    = getId(empNode);
   const compId   = getId(compNode);
-
   const fullName = `${crUser.firstName || ''} ${crUser.lastName || ''}`.trim() || username;
+  const platformRole = mapPlatformRole({ userRoleId, empId, compId });
 
-  const platformRole = empId || userRoleId === ROLE_EMPLOYEE ? 'placement'
-                     : compId || userRoleId === ROLE_CONTACT  ? 'company_admin'
-                     : 'agency_admin';
+  if (!platformRole) {
+    logger.warn('Carerix login rejected: no role mapping', { crUserId, userRoleId, username });
+    throw new ApiError(
+      'Your account is not provisioned for this platform. Please contact your administrator.',
+      403,
+    );
+  }
 
   logger.info('Carerix login', { crUserId, userRoleId, empId, compId, platformRole, username });
 
@@ -106,9 +126,7 @@ async function refreshUserAccessOnLogin(session, identity) {
   if (result.status === 'synced') {
     if (identity.platformRole !== 'placement') {
       await adminSupabase.rpc('mark_access_sync_outcome', {
-        p_user_profile_id: session.userId,
-        p_status:          'synced',
-        p_error:           null,
+        p_user_profile_id: session.userId, p_status: 'synced', p_error: null,
       });
     }
     return result;
@@ -117,24 +135,15 @@ async function refreshUserAccessOnLogin(session, identity) {
   const newStatus  = hasSyncedBefore ? 'stale' : 'failed';
   const errorBlurb = `${result.status}:${result.reason}${result.error ? ` (${result.error})` : ''}`;
   await adminSupabase.rpc('mark_access_sync_outcome', {
-    p_user_profile_id: session.userId,
-    p_status:          newStatus,
-    p_error:           errorBlurb,
+    p_user_profile_id: session.userId, p_status: newStatus, p_error: errorBlurb,
   });
 
   if (!hasSyncedBefore) {
-    logger.warn('Login blocked: first-time Carerix sync failed', {
-      userId: session.userId, role: identity.platformRole, ...result,
-    });
-    throw new ApiError(
-      'Could not load your access from Carerix. Please try again in a moment.',
-      503,
-    );
+    logger.warn('Login blocked: first-time Carerix sync failed', { userId: session.userId, role: identity.platformRole, ...result });
+    throw new ApiError('Could not load your access from Carerix. Please try again in a moment.', 503);
   }
 
-  logger.warn('Carerix sync failed on login — degrading to last-known-good', {
-    userId: session.userId, role: identity.platformRole, ...result,
-  });
+  logger.warn('Carerix sync failed on login — degrading to last-known-good', { userId: session.userId, role: identity.platformRole, ...result });
   return result;
 }
 
@@ -144,41 +153,147 @@ function loginResponse(res, session, identity, syncResult) {
     refreshToken: session.refreshToken,
     expiresAt:    session.expiresAt,
     user: {
-      id:                              session.userId,
-      email:                           identity.email,
-      displayName:                     identity.fullName,
-      role:                            identity.platformRole,
-      authSource:                      'carerix',
-      carerixUserId:                   identity.carerixUserId,
-      carerixCompanyId:                identity.carerixCompanyId,
-      carerixEmployeeId:               identity.carerixEmployeeId,
-      accessSyncStatus:                syncResult?.status === 'synced'   ? 'synced'
-                                     : syncResult?.status === 'skipped' ? 'skipped'
-                                     : 'stale',
+      id:                session.userId,
+      email:             identity.email,
+      displayName:       identity.fullName,
+      role:              identity.platformRole,
+      authSource:        'carerix',
+      carerixUserId:     identity.carerixUserId,
+      carerixCompanyId:  identity.carerixCompanyId,
+      carerixEmployeeId: identity.carerixEmployeeId,
+      accessSyncStatus:  syncResult?.status === 'synced' ? 'synced'
+                       : syncResult?.status === 'skipped' ? 'skipped' : 'stale',
     },
   });
 }
 
-router.post('/login/agency', async (req, res, next) => {
+/** Shared login pipeline for /login/agency and /login/carerix. */
+async function handleLogin(req, res, next, { username, password }) {
+  const ipAddress = req.ip;
+  const userAgent = req.headers['user-agent'] || null;
+
   try {
-    const user = req.body.username || req.body.email;
-    if (!user || !req.body.password) throw new ApiError('Username and password are required', 400);
-    const identity   = await loginWithCarerix(user, req.body.password);
-    const session    = await provisionCarerixSession(identity);
+    if (!username || !password) throw new ApiError('Username and password are required', 400);
+
+    // 1. Per-username lockout (complements per-IP rate limiter).
+    const lockout = await isUsernameLockedOut(username);
+    if (lockout.locked) {
+      res.set('Retry-After', String(lockout.retryAfterSeconds));
+      throw new ApiError('Too many failed attempts. Try again later.', 429);
+    }
+
+    // 2. Carerix authentication. Failures are recorded + audit-logged.
+    let identity;
+    try {
+      identity = await loginWithCarerix(username, password);
+    } catch (err) {
+      await recordLoginAttempt({ username, succeeded: false, ipAddress, userAgent });
+      await writeAuditLog({
+        eventType: 'login_failed',
+        payload:   { username, reason: err.message, status: err.status || 500 },
+        ipAddress,
+      });
+      throw err;
+    }
+
+    // 3. Provision user (also enforces is_active=false rejection).
+    const { userId } = await provisionCarerixUser(identity);
+
+    // 4. MFA gate.
+    const mfa = await getMfaState(userId);
+    if (mfa.enrolled) {
+      const challenge = signLoginChallenge(userId);
+      // Successful Carerix auth still counts as a "good" attempt for lockout
+      // purposes — the second factor is gated separately at /mfa/verify.
+      await recordLoginAttempt({ username, succeeded: true, ipAddress, userAgent });
+      return res.json({
+        mfaRequired: true,
+        challenge,
+        // expose the challenge TTL so the UI can show a countdown
+        ttlSeconds: config.mfa.challengeTtlSeconds,
+      });
+    }
+    if (config.mfa.enforceForRoles.includes(identity.platformRole)) {
+      // User is in an enforced role but hasn't enrolled yet. We don't issue
+      // a session — they have to enrol first. The client flow takes them to
+      // /dashboard/settings/mfa via the `mfaEnrollmentRequired` flag.
+      await recordLoginAttempt({ username, succeeded: true, ipAddress, userAgent });
+      throw new ApiError('MFA enrollment is required for your role. Please contact your administrator to enrol.', 403);
+    }
+
+    // 5. No MFA required — finalise the session.
+    const session    = await issueSupabaseSession({ email: identity.email, userId, role: identity.platformRole });
     const syncResult = await refreshUserAccessOnLogin(session, identity);
-    await writeAuditLog({ eventType: 'login', actorUserId: session.userId, actorRole: identity.platformRole, payload: { user }, ipAddress: req.ip });
+    await recordLoginAttempt({ username, succeeded: true, ipAddress, userAgent });
+    await writeAuditLog({ eventType: 'login', actorUserId: session.userId, actorRole: identity.platformRole, payload: { username }, ipAddress });
     loginResponse(res, session, identity, syncResult);
   } catch (err) { next(err); }
-});
+}
 
-router.post('/login/carerix', async (req, res, next) => {
+router.post('/login/agency', (req, res, next) =>
+  handleLogin(req, res, next, { username: req.body?.username || req.body?.email, password: req.body?.password })
+);
+router.post('/login/carerix', (req, res, next) =>
+  handleLogin(req, res, next, { username: req.body?.username, password: req.body?.password })
+);
+
+/**
+ * Step 2 for MFA users: client sends back the challenge JWT plus the 6-digit
+ * code (or a recovery code). On success we issue the real Supabase session.
+ */
+router.post('/mfa/verify-login', async (req, res, next) => {
   try {
-    const { username, password } = req.body;
-    if (!username || !password) throw new ApiError('Username and password are required', 400);
-    const identity   = await loginWithCarerix(username, password);
-    const session    = await provisionCarerixSession(identity);
+    const { challenge, code, recoveryCode } = req.body || {};
+    if (!challenge || (!code && !recoveryCode)) throw new ApiError('challenge and code are required', 400);
+    const decoded = verifyLoginChallenge(challenge);
+    if (!decoded) throw new ApiError('Invalid or expired login challenge. Sign in again.', 401);
+
+    let ok = false;
+    if (code) {
+      const secret = await getActiveSecret(decoded.userId);
+      ok = !!secret && verifyTotpCode(secret, code);
+    } else if (recoveryCode) {
+      ok = await consumeRecoveryCode(decoded.userId, recoveryCode);
+    }
+
+    if (!ok) {
+      await writeAuditLog({
+        eventType:   'mfa_failed',
+        actorUserId: decoded.userId,
+        ipAddress:   req.ip,
+        payload:     { mode: code ? 'totp' : 'recovery' },
+      });
+      throw new ApiError('Invalid code. Try again.', 401);
+    }
+
+    // Recreate the identity skeleton for response shaping. We re-read the
+    // profile so display_name / email reflect the current value.
+    const { data: profile } = await adminSupabase
+      .from('user_profiles')
+      .select('id, role, email, display_name, carerix_user_id, carerix_company_id, carerix_employee_id')
+      .eq('id', decoded.userId)
+      .single();
+    if (!profile) throw new ApiError('User profile not found', 401);
+
+    const identity = {
+      email:             profile.email,
+      fullName:          profile.display_name,
+      platformRole:      profile.role,
+      carerixUserId:     profile.carerix_user_id,
+      carerixCompanyId:  profile.carerix_company_id,
+      carerixEmployeeId: profile.carerix_employee_id,
+    };
+
+    const session    = await issueSupabaseSession({ email: profile.email, userId: profile.id, role: profile.role });
     const syncResult = await refreshUserAccessOnLogin(session, identity);
-    await writeAuditLog({ eventType: 'login', actorUserId: session.userId, actorRole: identity.platformRole, payload: { username }, ipAddress: req.ip });
+
+    await writeAuditLog({
+      eventType:   'login',
+      actorUserId: session.userId,
+      actorRole:   identity.platformRole,
+      payload:     { mfa: true, mode: code ? 'totp' : 'recovery' },
+      ipAddress:   req.ip,
+    });
     loginResponse(res, session, identity, syncResult);
   } catch (err) { next(err); }
 });
@@ -229,218 +344,6 @@ router.get('/me', requireAuth, (req, res) => {
     carerixFunctionGroupLevel1Name:      carerix_function_group_level1_name,
     accessSyncStatus:                    access_sync_status,
   });
-});
-
-// ── Diagnostic login probe ───────────────────────────────────────────────────
-//
-// POST /auth/probe
-//
-// Agency-only. Runs the FULL Carerix login + identity lookup against a
-// supplied set of credentials, but creates no session and writes nothing to
-// user_profiles or user_company_access. Returns role, identity, function-
-// group linkage, linked companies, warnings, and per-phase timings.
-//
-// UI: served by /carerix/explorer → "🔐 Login Probe" sidebar section.
-
-async function probeCompanyAccess(crUserId) {
-  const out = {
-    registryAvailable:     false,
-    registryEntries:       0,
-    additionalInfoKeysSet: [],
-    decodedFunctionGroups: [],
-    linkedCompanies:       [],
-    unknownCompanies:      [],
-  };
-  const crUserIdNum = Number(crUserId);
-  if (!Number.isFinite(crUserIdNum)) return out;
-
-  let userResp, linksResp, registry;
-  try {
-    [userResp, linksResp, registry] = await Promise.all([
-      queryGraphQL(`
-        query CRUser($qualifier: String) {
-          crUserPage(qualifier: $qualifier, pageable: { page: 0, size: 1 }) {
-            items { _id userID additionalInfo }
-          }
-        }
-      `, { qualifier: `userID == ${crUserIdNum}` }),
-      queryGraphQL(`
-        query UserCompanies($qualifier: String, $pageable: Pageable) {
-          crUserCompanyPage(qualifier: $qualifier, pageable: $pageable) {
-            totalElements
-            items { _id toCompany { _id companyID name } }
-          }
-        }
-      `, {
-        qualifier: `toUser.userID == ${crUserIdNum}`,
-        pageable:  { page: 0, size: 100 },
-      }),
-      getCarerixCheckboxRegistry(),
-    ]);
-  } catch (err) {
-    out.error = `carerix_unreachable: ${err.message}`;
-    return out;
-  }
-
-  out.registryAvailable = registry !== null;
-  out.registryEntries   = registry ? Object.keys(registry).length : 0;
-
-  const additionalInfo = userResp?.data?.crUserPage?.items?.[0]?.additionalInfo || {};
-  if (registry) {
-    for (const [key, value] of Object.entries(additionalInfo)) {
-      if (String(value).trim() !== '1') continue;
-      const rawKey = key.startsWith('_') ? key.slice(1) : key;
-      out.additionalInfoKeysSet.push(rawKey);
-      const code = registry[rawKey];
-      if (code) out.decodedFunctionGroups.push(code);
-    }
-  }
-
-  const links = linksResp?.data?.crUserCompanyPage?.items || [];
-  const carerixCompanies = links
-    .map(l => l?.toCompany)
-    .filter(c => c?.companyID != null);
-  const carerixCompanyIds = Array.from(new Set(carerixCompanies.map(c => String(c.companyID))));
-
-  let resolvedRows = [];
-  if (carerixCompanyIds.length) {
-    const { data } = await adminSupabase
-      .from('companies')
-      .select('id, name, carerix_company_id')
-      .in('carerix_company_id', carerixCompanyIds);
-    resolvedRows = data || [];
-  }
-  const resolvedMap = new Map(resolvedRows.map(r => [r.carerix_company_id, r]));
-
-  out.linkedCompanies = carerixCompanyIds.map(cid => {
-    const carerixSrc = carerixCompanies.find(c => String(c.companyID) === cid);
-    const platform   = resolvedMap.get(cid);
-    return {
-      carerixCompanyId:    cid,
-      nameInCarerix:       carerixSrc?.name || null,
-      platformCompanyId:   platform?.id   || null,
-      platformCompanyName: platform?.name || null,
-      imported:            !!platform,
-    };
-  });
-  out.unknownCompanies = out.linkedCompanies.filter(c => !c.imported).map(c => c.carerixCompanyId);
-
-  return out;
-}
-
-async function runLoginProbe(username, password) {
-  const tStart  = Date.now();
-  const timings = {};
-  const warnings = [];
-
-  const t1 = Date.now();
-  let identity;
-  try {
-    identity = await loginWithCarerix(username, password);
-  } catch (err) {
-    timings.carerixRestLogin = Date.now() - t1;
-    timings.total            = Date.now() - tStart;
-    return {
-      approved: false,
-      error: {
-        status:  err.statusCode || err.status || 500,
-        message: err.message || 'Login failed',
-      },
-      timings,
-    };
-  }
-  timings.carerixRestLogin = Date.now() - t1;
-
-  const result = {
-    approved:          true,
-    platformRole:      identity.platformRole,
-    email:             identity.email,
-    fullName:          identity.fullName,
-    carerixUserId:     identity.carerixUserId,
-    carerixCompanyId:  identity.carerixCompanyId,
-    carerixEmployeeId: identity.carerixEmployeeId,
-    userRoleIdInCarerix: identity.userRoleId,
-    placement:         null,
-    company:           null,
-    agency:            null,
-    warnings,
-  };
-
-  if (identity.platformRole === 'placement') {
-    const t2 = Date.now();
-    const fg = await fetchPlacementIdentityByCrUserId(identity.carerixUserId);
-    timings.placementLookup = Date.now() - t2;
-    if (!fg) {
-      warnings.push('No CREmployee linked to this CRUser; placement-scoped queries will return nothing.');
-      result.placement = { found: false };
-    } else {
-      result.placement = {
-        found:                true,
-        carerixEmployeeId:    fg.employeeID,
-        functionGroupLevel1:  {
-          // dataNodeID is the canonical match key — placements.carerix_function_group_id
-          // stores this exact value, and company users' decoded function_groups[] also
-          // hold dataNodeIDs (via checkbox exportCodes that point at function group nodes).
-          id:   fg.fgLevel1Id,
-          // exportCode: kept in the response for completeness, but Function1 nodes in this
-          // tenant don't populate it — so it's expected to be null and is NOT a problem.
-          code: fg.fgLevel1Code,
-          name: fg.fgLevel1Name,
-        },
-      };
-      // Only warn if the dataNodeID itself is missing — that's the truly broken case
-      // (no toFunction1Level1Node link on the CREmployee). A null exportCode is fine.
-      if (!fg.fgLevel1Id) {
-        warnings.push('Placement has no toFunction1Level1Node linked in Carerix — function-group scoping cannot match this user to any placements.');
-      }
-    }
-  } else if (identity.platformRole === 'agency_admin' || identity.platformRole === 'agency_operations') {
-    result.agency = {
-      note: 'Agency role — will see all companies and placements (no per-company access scoping).',
-    };
-  } else {
-    const t2 = Date.now();
-    const probe = await probeCompanyAccess(identity.carerixUserId);
-    timings.companyAccessLookup = Date.now() - t2;
-    result.company = probe;
-
-    if (probe.error)                                              warnings.push(probe.error);
-    if (!probe.registryAvailable)                                 warnings.push('Carerix checkbox registry could not be loaded — function groups cannot be decoded right now.');
-    if (probe.registryAvailable && probe.registryEntries === 0)   warnings.push('Carerix checkbox registry is empty — there are no Attribute-contact CRDataNodes with tag=checkboxType. Function groups cannot be decoded.');
-    if (probe.linkedCompanies.length === 0)                       warnings.push('No CRUserCompany links — this user will see no companies after login.');
-    if (probe.unknownCompanies.length > 0)                        warnings.push(`${probe.unknownCompanies.length} Carerix company(s) linked to this user are NOT yet imported into the platform companies table; they will be invisible after login. Run syncCarerixCompany for: ${probe.unknownCompanies.join(', ')}`);
-    if (probe.registryAvailable && probe.decodedFunctionGroups.length === 0 && probe.linkedCompanies.length > 0) {
-      warnings.push('No function-group checkboxes ticked on this CRUser — the user will be granted zero function groups (explicit deny) on each linked company.');
-    }
-  }
-
-  timings.total = Date.now() - tStart;
-  return { ...result, timings };
-}
-
-router.post('/probe', requireAuth, requireAgency, async (req, res, next) => {
-  try {
-    const { username, password } = req.body || {};
-    if (!username || !password) throw new ApiError('username and password are required', 400);
-
-    const probeResult = await runLoginProbe(username, password);
-
-    await writeAuditLog({
-      eventType:    'login_probe',
-      actorUserId:  req.user.id,
-      actorRole:    req.user.role,
-      payload: {
-        probedUsername: username,
-        approved:       probeResult.approved,
-        role:           probeResult.platformRole || null,
-        warnings:       probeResult.warnings?.length || 0,
-        totalMs:        probeResult.timings?.total ?? null,
-      },
-      ipAddress: req.ip,
-    });
-
-    res.json(probeResult);
-  } catch (err) { next(err); }
 });
 
 export default router;
