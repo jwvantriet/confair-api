@@ -6,9 +6,10 @@ import rateLimit from 'express-rate-limit';
 import { config } from './config.js';
 import { logger } from './utils/logger.js';
 import { errorHandler } from './middleware/errorHandler.js';
-import authRoutes        from './routes/auth.js';
-import authMfaRoutes     from './routes/auth_mfa.js';
-import authProbeRoutes   from './routes/auth_probe.js';
+import authRoutes          from './routes/auth.js';
+import authMfaRoutes       from './routes/auth_mfa.js';
+import authProbeRoutes     from './routes/auth_probe.js';
+import authOidcProbeRoutes from './routes/auth_oidc_probe.js';
 import payrollRoutes     from './routes/payroll.js';
 import correctionsRoutes from './routes/corrections.js';
 import approvalsRoutes   from './routes/approvals.js';
@@ -63,7 +64,8 @@ app.get('/health', (_req, res) =>
 // /auth/mfa is mounted before /auth so the more specific prefix wins.
 app.use('/auth/mfa',    authLimiter, authMfaRoutes);
 app.use('/auth',        authLimiter, authRoutes);
-app.use('/auth',        authLimiter, authProbeRoutes); // /auth/probe
+app.use('/auth',        authLimiter, authProbeRoutes);     // /auth/probe
+app.use('/auth',        authLimiter, authOidcProbeRoutes); // /auth/oidc-probe
 app.use('/payroll',     payrollRoutes);
 app.use('/corrections', correctionsRoutes);
 app.use('/approvals',   approvalsRoutes);
