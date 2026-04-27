@@ -31,11 +31,6 @@ const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: 
 const parseXml = (xml) => { try { return xmlParser.parse(xml); } catch { return null; } };
 const getId = (obj) => obj?.['@_id'] || obj?.id || obj?._id || null;
 
-// Carerix CRUserRole IDs we map without env config:
-//   id=1  → CREmployee linked → placement
-//   id=11 → CRCompany linked  → company_admin
-// Agency role IDs are configured via env (CARERIX_AGENCY_ADMIN_ROLE_IDS,
-// CARERIX_AGENCY_OPERATIONS_ROLE_IDS). Anything else → reject (no defaults).
 const ROLE_CONTACT  = 11;
 const ROLE_EMPLOYEE = 1;
 
@@ -51,9 +46,6 @@ function fireAndForget(label, p) {
   return Promise.resolve(p).catch(err => logger.warn(`${label} failed`, { error: err?.message || String(err) }));
 }
 
-// Tiny stopwatch helper. `mark()` returns the elapsed-since-`start` ms and
-// stamps a per-step name into `out`. Used to instrument handleLogin so the
-// client can see where the time goes.
 function makeStopwatch() {
   const t0  = Date.now();
   let last  = t0;
@@ -182,6 +174,43 @@ async function refreshUserAccessOnLogin(session, identity) {
   return result;
 }
 
+/**
+ * Returning users: kick the access sync into the background so the response
+ * goes out immediately. The dashboard will see the previous (last-known-good)
+ * access state until the background sync completes — and re-poll /auth/me
+ * once it lands. First-time logins still block, because they have no access
+ * data to fall back on.
+ *
+ * Saves ~500–2000 ms of perceived login latency for the typical returning
+ * agency/company/placement user.
+ */
+async function maybeRefreshAccessInBackground(session, identity) {
+  if (!identity?.carerixUserId) return { status: 'skipped', reason: 'no_carerix_user_id' };
+  if (identity.platformRole === 'agency_admin' || identity.platformRole === 'agency_operations') {
+    return { status: 'skipped', reason: 'agency_role' };
+  }
+
+  const { data: profile } = await adminSupabase
+    .from('user_profiles')
+    .select('access_sync_last_ok_at')
+    .eq('id', session.userId)
+    .maybeSingle();
+  const hasSyncedBefore = !!profile?.access_sync_last_ok_at;
+
+  if (!hasSyncedBefore) {
+    return refreshUserAccessOnLogin(session, identity);
+  }
+
+  refreshUserAccessOnLogin(session, identity).catch(err => {
+    logger.warn('Background access sync failed', {
+      userId: session.userId,
+      role:   identity.platformRole,
+      error:  err.message,
+    });
+  });
+  return { status: 'pending', reason: 'background_sync' };
+}
+
 function loginResponse(res, session, identity, syncResult, timing) {
   res.json({
     accessToken:  session.accessToken,
@@ -196,14 +225,15 @@ function loginResponse(res, session, identity, syncResult, timing) {
       carerixUserId:     identity.carerixUserId,
       carerixCompanyId:  identity.carerixCompanyId,
       carerixEmployeeId: identity.carerixEmployeeId,
-      accessSyncStatus:  syncResult?.status === 'synced' ? 'synced'
-                       : syncResult?.status === 'skipped' ? 'skipped' : 'stale',
+      accessSyncStatus:  syncResult?.status === 'synced'  ? 'synced'
+                       : syncResult?.status === 'skipped' ? 'skipped'
+                       : syncResult?.status === 'pending' ? 'pending'
+                       : 'stale',
     },
     _timing: timing || null,
   });
 }
 
-/** Shared login pipeline for /login/agency and /login/carerix. */
 async function handleLogin(req, res, next, { username, password }) {
   const ipAddress = req.ip;
   const userAgent = req.headers['user-agent'] || null;
@@ -258,8 +288,12 @@ async function handleLogin(req, res, next, { username, password }) {
 
     const session = await issueSupabaseSession({ email: identity.email, userId, role: identity.platformRole });
     sw.mark('session');
-    const syncResult = await refreshUserAccessOnLogin(session, identity);
-    sw.mark('access_sync');
+
+    // Returning users: defer the access sync. Tracked separately as
+    // `access_sync_check` (just the existence query) vs `access_sync_inline`
+    // (only set when we synced synchronously).
+    const syncResult = await maybeRefreshAccessInBackground(session, identity);
+    sw.mark(syncResult.reason === 'background_sync' ? 'access_sync_check' : 'access_sync_inline');
 
     fireAndForget('login_attempts (success)', recordLoginAttempt({ username, succeeded: true, ipAddress, userAgent }));
     fireAndForget('audit login', writeAuditLog({
@@ -271,7 +305,7 @@ async function handleLogin(req, res, next, { username, password }) {
     }));
 
     const total = sw.total();
-    logger.info('Login complete', { username, role: identity.platformRole, totalMs: total, breakdown: sw.out });
+    logger.info('Login complete', { username, role: identity.platformRole, totalMs: total, breakdown: sw.out, syncStatus: syncResult.status });
     loginResponse(res, session, identity, syncResult, { ...sw.out, total });
   } catch (err) { next(err); }
 }
@@ -329,8 +363,8 @@ router.post('/mfa/verify-login', async (req, res, next) => {
 
     const session    = await issueSupabaseSession({ email: profile.email, userId: profile.id, role: profile.role });
     sw.mark('session');
-    const syncResult = await refreshUserAccessOnLogin(session, identity);
-    sw.mark('access_sync');
+    const syncResult = await maybeRefreshAccessInBackground(session, identity);
+    sw.mark(syncResult.reason === 'background_sync' ? 'access_sync_check' : 'access_sync_inline');
 
     fireAndForget('audit mfa_login', writeAuditLog({
       eventType:   'login',
@@ -340,7 +374,7 @@ router.post('/mfa/verify-login', async (req, res, next) => {
       ipAddress:   req.ip,
     }));
     const total = sw.total();
-    logger.info('MFA login complete', { userId: decoded.userId, totalMs: total, breakdown: sw.out });
+    logger.info('MFA login complete', { userId: decoded.userId, totalMs: total, breakdown: sw.out, syncStatus: syncResult.status });
     loginResponse(res, session, identity, syncResult, { ...sw.out, total });
   } catch (err) { next(err); }
 });
