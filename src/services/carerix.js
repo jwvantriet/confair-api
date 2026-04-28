@@ -24,18 +24,10 @@ import { adminSupabase } from './supabase.js';
 let _serviceToken     = null;
 let _serviceTokenExp  = 0;
 
-/**
- * Gets a service-level access token using client_credentials flow.
- * Used for GraphQL queries (fee retrieval, candidate lookups).
- * Caches the token until 60s before expiry.
- */
 async function getServiceToken() {
   const now = Date.now();
   if (_serviceToken && now < _serviceTokenExp) return _serviceToken;
 
-  // Match the working Python app exactly:
-  // 1. Try HTTP Basic Auth first (raw base64, NO URL encoding)
-  // 2. Fall back to credentials in body if 400/401
   const basicAuth = Buffer.from(
     `${config.carerix.clientId}:${config.carerix.clientSecret}`
   ).toString('base64');
@@ -56,7 +48,6 @@ async function getServiceToken() {
     const status = basicErr.response?.status;
     logger.warn('Basic Auth failed, trying body params', { status, error: basicErr.response?.data });
     if (status === 400 || status === 401 || status === 403) {
-      // Fallback: credentials in body
       const bodyForm = new URLSearchParams({
         grant_type:    'client_credentials',
         client_id:     config.carerix.clientId,
@@ -85,25 +76,10 @@ async function getServiceToken() {
 }
 
 
-// ── GraphQL client ─────────────────────────────────────────────────────────────
 export async function queryGraphQL(query, variables = {}, options = {}) {
   return carerixGQL(query, variables, options);
 }
 
-// ── Checkbox registry (Attribute contact → function_group_id) ────────────────
-// CRUser.additionalInfo carries boolean-like entries keyed by the dataNodeID of
-// a CRDataNode of type "Attribute contact" and tag "checkboxType". Carerix
-// administrators map each checkbox to a function_group via the node's
-// exportCode. Decoding a user's function groups therefore needs this registry:
-//
-//   { [dataNodeID]: exportCode }  e.g. { "12452": "9590", "12453": "9592" }
-//
-// The set changes rarely, so we cache it in-memory for 15 minutes.
-//
-// IMPORTANT: returns NULL on fetch failure (not {}). Callers MUST distinguish:
-//   - registry === null → Carerix unreachable, do NOT decode (fail-closed)
-//   - registry === {}   → Carerix reachable but no checkbox nodes exist
-//   - registry === {…}  → normal case
 let _checkboxRegistry     = null;
 let _checkboxRegistryExp  = 0;
 
@@ -143,23 +119,6 @@ export async function getCarerixCheckboxRegistry({ ttlMs = 15 * 60 * 1000 } = {}
   }
 }
 
-/**
- * Fetches a placement's identity (linked employee + function group level 1)
- * starting from their CRUser numeric userID.
- *
- * The legacy XML login response sometimes omits the toEmployee link, so this
- * GraphQL-based lookup is the reliable way to find the employee record.
- *
- * Returns null on lookup failure or when no employee is linked.
- *
- * Shape on success:
- *   { employeeID, fgLevel1Id, fgLevel1Code, fgLevel1Name }
- *
- *   - employeeID   = the human-readable employeeID (or _id fallback)
- *   - fgLevel1Id   = CRDataNode.dataNodeID of the function group
- *   - fgLevel1Code = CRDataNode.exportCode  → matches placements.carerix_function_group_id
- *   - fgLevel1Name = CRDataNode.value       → human label for UI
- */
 export async function fetchPlacementIdentityByCrUserId(crUserId) {
   if (!crUserId) return null;
   const crUserIdNum = Number(crUserId);
@@ -217,10 +176,6 @@ async function carerixGQL(query, variables = {}, { timeoutMs = 30_000 } = {}) {
 
 // ── OAuth2 Authorization Code Flow ────────────────────────────────────────────
 
-/**
- * Builds the Carerix login redirect URL.
- * The frontend sends the user here to log in.
- */
 export function getCarerixAuthUrl(state, redirectUri) {
   const params = new URLSearchParams({
     client_id:     config.carerix.clientId,
@@ -232,10 +187,6 @@ export function getCarerixAuthUrl(state, redirectUri) {
   return `${config.carerix.authCodeUrl}?${params.toString()}`;
 }
 
-/**
- * Exchanges an authorization code for tokens.
- * Called from the OAuth callback route.
- */
 export async function exchangeCodeForTokens(code, redirectUri) {
   try {
     const res = await axios.post(config.carerix.tokenUrl,
@@ -268,10 +219,6 @@ export async function exchangeCodeForTokens(code, redirectUri) {
   }
 }
 
-/**
- * Fetches user identity from Carerix userinfo endpoint.
- * Returns normalised identity object.
- */
 export async function getCarerixUserInfo(accessToken) {
   try {
     const res = await axios.get(config.carerix.userInfoUrl, {
@@ -285,7 +232,6 @@ export async function getCarerixUserInfo(accessToken) {
     const u = res.data;
     logger.debug('Carerix userinfo', { sub: u.sub, email: u.email });
 
-    // Map Carerix role/claims → platform role
     const platformRole = mapCarerixRole(u);
 
     return {
@@ -305,7 +251,6 @@ export async function getCarerixUserInfo(accessToken) {
 }
 
 function mapCarerixRole(userInfo) {
-  // Carerix may return role info in different fields depending on version
   const role = userInfo.role || userInfo.user_type || userInfo.preferred_username || '';
   const roleMap = {
     Candidate:   'placement',
@@ -316,7 +261,6 @@ function mapCarerixRole(userInfo) {
     ClientAdmin: 'company_admin',
     contact:     'company_admin',
   };
-  // Check roles array if present
   if (Array.isArray(userInfo.roles)) {
     if (userInfo.roles.includes('candidate')) return 'placement';
     if (userInfo.roles.includes('contact'))   return 'company_admin';
@@ -324,7 +268,6 @@ function mapCarerixRole(userInfo) {
   return roleMap[role] || 'placement';
 }
 
-// ── Identity cache sync ───────────────────────────────────────────────────────
 export async function syncIdentityCache(identity) {
   const { error } = await adminSupabase
     .from('carerix_identity_cache')
@@ -343,13 +286,8 @@ export async function syncIdentityCache(identity) {
 
 // ── Fee retrieval via GraphQL ─────────────────────────────────────────────────
 
-/**
- * Fetches the applicable fee for a placement from Carerix GraphQL.
- * Looks up the match/placement record and returns the agreed rate.
- */
 export async function fetchFeeFromCarerix(placementRef, companyRef, declarationTypeCode, periodDate) {
   try {
-    // Query the match record for this placement to get the agreed rate
     const data = await carerixGQL(`
       query GetPlacementRate($qualifier: String) {
         crMatchPage(qualifier: $qualifier, pageable: { page: 0, size: 1 }) {
@@ -373,7 +311,6 @@ export async function fetchFeeFromCarerix(placementRef, companyRef, declarationT
       return { found: false, reason: `No match found in Carerix for placement ${placementRef}` };
     }
 
-    // Extract rate from match — exact field depends on your Carerix configuration
     const rate = match.toPublication?.salary || null;
 
     return {
@@ -435,7 +372,6 @@ export async function bulkFetchFees(entries, referenceDate, concurrency = 5) {
   return results;
 }
 
-// ── Diagnostic test ───────────────────────────────────────────────────────────
 export async function testCarerixConnection() {
   const results = { steps: [], config: {
     authUrl:      config.carerix.authUrl,
@@ -446,7 +382,6 @@ export async function testCarerixConnection() {
     hasSecret:    !!config.carerix.clientSecret,
   }};
 
-  // Step 1: Discovery
   try {
     const r = await axios.get(`${config.carerix.authUrl}/../../../.well-known/openid-configuration`.replace(/\/protocol.*/, '/.well-known/openid-configuration'), { timeout: 8000 });
     results.steps.push({ step: 'discovery', status: 'success', issuer: r.data.issuer });
@@ -454,12 +389,10 @@ export async function testCarerixConnection() {
     results.steps.push({ step: 'discovery', status: 'failed', error: err.message });
   }
 
-  // Step 2: Client credentials token
   try {
     const token = await getServiceToken();
     results.steps.push({ step: 'client_credentials', status: 'success', hasToken: !!token });
 
-    // Step 3: GraphQL query
     try {
       const data = await carerixGQL(`query { crEmployeePage(pageable:{page:0,size:1}) { totalElements } }`);
       results.steps.push({ step: 'graphql_query', status: 'success', data: data?.data });
@@ -474,7 +407,7 @@ export async function testCarerixConnection() {
   results.overallStatus = results.steps.every(s => s.status === 'success') ? 'connected' : 'partial_or_failed';
   return results;
 }
-/** Normalize Carerix currency label to ISO code */
+
 export function normalizeCurrency(raw) {
   if (!raw) return 'USD';
   const u = raw.toUpperCase().trim();
@@ -485,10 +418,6 @@ export function normalizeCurrency(raw) {
   return 'USD';
 }
 
-/**
- * Fetch rates for a placement from Carerix crJobFinancePage.
- * Returns a map of { carerix_type_id -> { amount, currency } }
- */
 export async function fetchCarerixRatesForJob(carerixJobId) {
   try {
     const result = await queryGraphQL(`
@@ -540,18 +469,13 @@ export async function fetchCarerixRatesForJob(carerixJobId) {
 
 // ── Crew code → Carerix job matching ─────────────────────────────────────────
 
+// Crew codes in Carerix are 3 OR 4 uppercase letters (e.g. BNY = Benony,
+// BENO = Benoit). Anything else is treated as "no code".
+const CREW_CODE_REGEX = /^[A-Z]{3,4}$/;
+
 /**
- * Query Carerix jobs and build a map of { "DAGF" -> "jobId", ... }
+ * Query Carerix jobs and build a map of { "BNY" -> "jobId", ... }
  * Crew code is stored in additionalInfo field 10189 on the crJob record.
- *
- * Jobs are sorted by modificationDate DESC so recently-changed records
- * (where new crew codes typically appear) are scanned first. When
- * `targetCodes` is provided, the scan stops as soon as every requested
- * code has been found — avoiding a full-tenant scan when only a handful
- * of placements need matching.
- *
- * Per-page failures (timeouts, transient GraphQL errors) are logged but
- * do not abort the whole scan — we return whatever we managed to collect.
  */
 export async function buildCrewCodeToJobMap({ targetCodes = null, maxPages = 100 } = {}) {
   const CREW_CODE_FIELD = '10189';
@@ -582,11 +506,10 @@ export async function buildCrewCodeToJobMap({ targetCodes = null, maxPages = 100
     for (const job of items) {
       const ai = job?.additionalInfo;
       if (!ai || typeof ai !== 'object') continue;
-      // field 10189 may appear as numeric key or prefixed with underscore
       const raw = ai[CREW_CODE_FIELD] ?? ai[`_${CREW_CODE_FIELD}`] ?? null;
       if (!raw) continue;
       const code = String(raw).trim().toUpperCase();
-      if (/^[A-Z]{4}$/.test(code) && !codeToJob[code]) {
+      if (CREW_CODE_REGEX.test(code) && !codeToJob[code]) {
         codeToJob[code] = String(job.jobID || job._id);
       }
     }
@@ -594,7 +517,6 @@ export async function buildCrewCodeToJobMap({ targetCodes = null, maxPages = 100
     totalFetched += items.length;
     pagesScanned++;
 
-    // Early exit when every requested code has been resolved
     if (needed && needed.size > 0) {
       const stillMissing = [...needed].some(c => !codeToJob[c]);
       if (!stillMissing) break;
@@ -613,10 +535,6 @@ export async function buildCrewCodeToJobMap({ targetCodes = null, maxPages = 100
   return codeToJob;
 }
 
-/**
- * For all placements without a carerix_job_id, try to match via crew code
- * against Carerix jobs. Updates placements table in place.
- */
 export async function autoMatchPlacementsCarerixIds() {
   const { data: unmatched } = await adminSupabase
     .from('placements')
