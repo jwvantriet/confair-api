@@ -16,7 +16,7 @@ import { adminSupabase } from './supabase.js';
 import { queryGraphQL }   from './carerix.js';
 import { logger }         from '../utils/logger.js';
 
-const CREW_CODE_FIELD = '10189'; // additionalInfo key carrying the 4-letter crew code
+const CREW_CODE_FIELD = '10189'; // additionalInfo key carrying the crew code (3 or 4 letters)
 
 // ── GraphQL fragments ─────────────────────────────────────────────────────────
 
@@ -69,13 +69,17 @@ const CR_USER_COMPANY_Q = `
 
 function str(v) { return v == null ? '' : String(v); }
 
+// Crew codes in Carerix are 3 OR 4 uppercase letters (e.g. BNY = Benony,
+// BENO = Benoit). Anything else is treated as "no code".
+const CREW_CODE_REGEX = /^[A-Z]{3,4}$/;
+
 function crewCodeFromJob(job) {
   const ai = job?.additionalInfo;
   if (!ai || typeof ai !== 'object') return null;
   const raw = ai[CREW_CODE_FIELD] ?? ai[`_${CREW_CODE_FIELD}`] ?? null;
   if (!raw) return null;
   const code = String(raw).trim().toUpperCase();
-  return /^[A-Z]{4}$/.test(code) ? code : null;
+  return CREW_CODE_REGEX.test(code) ? code : null;
 }
 
 function isoDateOrNull(v) {
@@ -90,8 +94,6 @@ async function paginate(query, qualifier, field) {
   let page = 0;
   const size = 100;
   while (true) {
-    // Bulk imports can return big payloads — give each page a generous
-    // timeout so a full tenant doesn't blow up under Carerix latency.
     const res = await queryGraphQL(query, { qualifier, pageable: { page, size } }, { timeoutMs: 60_000 });
     const items = res?.data?.[field]?.items || [];
     const total = res?.data?.[field]?.totalElements ?? items.length;
@@ -113,7 +115,6 @@ async function upsertCompany(crCompany) {
     carerix_agency_id: crCompany.agency?._id ? String(crCompany.agency._id) : null,
     is_active: true,
   };
-  // Find existing by carerix_company_id
   const { data: existing } = await adminSupabase
     .from('companies').select('id')
     .eq('carerix_company_id', row.carerix_company_id)
@@ -136,19 +137,10 @@ async function upsertPlacement(companyId, crJob) {
   const emp = crJob.toEmployee || {};
   const fullName = [emp.firstName, emp.lastName].filter(Boolean).join(' ') || crJob.name || crewId || 'Unknown';
 
-  // Function GROUP from CREmployee.toFunction1Level1Node (Carerix data node).
-  // Level 1 is the group (e.g. "Pilot", "Mechanic", "Loadmaster") — the level
-  // we use to scope charges. Level 2 (specific position like "Captain" /
-  // "First Officer" / "Mechanic B1") may be added later in a separate column
-  // if we need position-aware rates.
   const fn = emp?.toFunction1Level1Node || null;
   const carerixFunctionGroup = fn?.value || fn?.label || null;
   const carerixFunctionGroupId = fn?.dataNodeID != null ? Number(fn.dataNodeID) : null;
 
-  // Placement status from CRJob.toStatusNode. The 'tag' field carries the
-  // business marker ("JobActiveTag" for statuses that mean the placement is
-  // operational). The active / notActive ints indicate whether the status is
-  // still in active use in Carerix (vs deprecated).
   const st = crJob?.toStatusNode || null;
   const carerixStatusValue     = st?.value ?? null;
   const carerixStatusId        = st?.dataNodeID != null ? Number(st.dataNodeID) : null;
@@ -177,7 +169,6 @@ async function upsertPlacement(companyId, crJob) {
     carerix_status_notactive:   carerixStatusNotActive,
   };
 
-  // 1. Match by carerix_job_id (strongest)
   const { data: byJob } = await adminSupabase
     .from('placements').select('id')
     .eq('carerix_job_id', carerixJobId).maybeSingle();
@@ -186,7 +177,6 @@ async function upsertPlacement(companyId, crJob) {
     return { id: byJob.id, matched: 'carerix_job_id', created: false };
   }
 
-  // 2. Match by crew_id + company_id (legacy rows with crew code but no job id)
   if (crewId) {
     const { data: byCrew } = await adminSupabase
       .from('placements').select('id')
@@ -197,7 +187,6 @@ async function upsertPlacement(companyId, crJob) {
     }
   }
 
-  // 3. Insert new
   const { data: ins, error } = await adminSupabase
     .from('placements').insert(fields).select('id').single();
   if (error) throw new Error(`placement insert: ${error.message}`);
@@ -233,7 +222,6 @@ async function upsertUserProfile(companyId, cru) {
     userProfileId = ins.id;
   }
 
-  // Junction: ensure the (user, company) link exists
   await adminSupabase.from('user_company_access')
     .upsert({ user_profile_id: userProfileId, company_id: companyId },
             { onConflict: 'user_profile_id,company_id', ignoreDuplicates: true });
@@ -242,15 +230,6 @@ async function upsertUserProfile(companyId, cru) {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/**
- * Sync a Carerix company's active jobs + user-company links into our tables.
- *
- * Pass an `emit(step, data?)` callback to receive progress events; a sensible
- * no-op is used when omitted. Events emitted:
- *   started, company, jobs_fetching, jobs_fetched, placement_upserted,
- *   placements_done, users_fetching, users_fetched, user_upserted,
- *   users_done, done, error
- */
 export async function syncCarerixCompany(carerixCompanyID, emit = () => {}) {
   const result = {
     carerixCompanyID: Number(carerixCompanyID),
@@ -261,7 +240,6 @@ export async function syncCarerixCompany(carerixCompanyID, emit = () => {}) {
 
   emit('started', { carerixCompanyID: Number(carerixCompanyID) });
 
-  // ── 1. Company ────────────────────────────────────────────────────────────
   const companyResp = await queryGraphQL(CR_COMPANY_Q, {
     qualifier: `companyID == ${Number(carerixCompanyID)}`,
   });
@@ -275,11 +253,6 @@ export async function syncCarerixCompany(carerixCompanyID, emit = () => {}) {
   };
   emit('company', result.company);
 
-  // ── 2. Active jobs for this company ──────────────────────────────────────
-  // NOTE: Previously tried narrowing with `AND toStatusNode.active == 1` but
-  // that appeared to return zero jobs in practice, which combined with the
-  // orphan-cleanup below wiped all placements. Revert to the plain qualifier
-  // until the status-node filter is verified via /carerix/probe/jobs-statuses.
   const jobsQualifier =
     `toCompany.companyID == ${Number(carerixCompanyID)} AND deleted == 0`;
 
@@ -289,9 +262,9 @@ export async function syncCarerixCompany(carerixCompanyID, emit = () => {}) {
   const jobs = allJobs.filter(j => {
     const s = isoDateOrNull(j?.startDate);
     const e = isoDateOrNull(j?.endDate);
-    if (!s) return false;                 // no start date → skip per user rule
-    if (s > todayStr) return false;       // starts in future → skip
-    if (e && e < todayStr) return false;  // ended in past → skip
+    if (!s) return false;
+    if (s > todayStr) return false;
+    if (e && e < todayStr) return false;
     return true;
   });
   result.placements.fetched = allJobs.length;
@@ -321,18 +294,6 @@ export async function syncCarerixCompany(carerixCompanyID, emit = () => {}) {
   }
   emit('placements_done', result.placements);
 
-  // ── 2b. Orphan cleanup — DISABLED ────────────────────────────────────────
-  // Previous implementation hard-deleted placements whose carerix_job_id was
-  // not in the fetched set. Combined with a qualifier that returned zero
-  // jobs (e.g. a bad filter), this wiped the entire company.
-  //
-  // Re-enable only when:
-  //   1. The fetched set is compared against the RAW allJobs (unfiltered by
-  //      date) so history rows aren't considered orphans; AND
-  //   2. A guard refuses to delete when the fetched set is empty or
-  //      represents a suspicious drop (e.g. > 20% of prior population).
-
-  // ── 3. Users (contacts) linked to this company ───────────────────────────
   const userQualifier =
     `toCompany.companyID == ${Number(carerixCompanyID)} ` +
     `AND toUser.isActive == 1 AND toUser.deleted == 0`;
