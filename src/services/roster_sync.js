@@ -20,13 +20,8 @@ import { recomputePlacementRotations } from './rotations.js';
 import { isPlacementActiveInPeriod } from './access.js';
 import { logger } from '../utils/logger.js';
 
-// Flush the event buffer to Supabase every FLUSH_EVERY_EVENTS events or
-// at least every FLUSH_EVERY_MS milliseconds — whichever happens first.
 const FLUSH_EVERY_EVENTS = 10;
 const FLUSH_EVERY_MS     = 3_000;
-
-// Cap the persisted buffer so a single sync_run row never balloons.
-// The frontend only needs recent events for display.
 const MAX_BUFFERED_EVENTS = 5_000;
 
 function normalizeCurrency(raw) {
@@ -39,7 +34,23 @@ function normalizeCurrency(raw) {
   return 'USD';
 }
 
+/**
+ * Returns rates grouped by Carerix kind dataNodeID. Keys are strings — the
+ * caller stringifies its lookup key so types match.
+ *
+ * Also returns a `_debug` shape (totalItems, kept, dropped) so callers can
+ * surface why a particular job ended up with empty rates.
+ */
 async function fetchCarerixRatesForJob(carerixJobId, periodFrom = null) {
+  const debug = {
+    totalItems:        0,
+    droppedNoFinance:  0,
+    droppedExpired:    0,
+    droppedNoKindId:   0,
+    droppedNoAmount:   0,
+    kept:              0,
+    error:             null,
+  };
   try {
     const { queryGraphQL } = await import('./carerix.js');
     const result = await queryGraphQL(`
@@ -62,28 +73,35 @@ async function fetchCarerixRatesForJob(carerixJobId, periodFrom = null) {
     });
 
     const items = result?.data?.crJobFinancePage?.items || [];
+    debug.totalItems = items.length;
+
     const rateMap = {};
     for (const item of items) {
       const finance = item?.toFinance;
-      if (!finance) continue;
+      if (!finance) { debug.droppedNoFinance++; continue; }
       const start = finance.startDate ? String(finance.startDate).split('T')[0] : null;
       const end   = finance.endDate   ? String(finance.endDate).split('T')[0]   : null;
-      if (periodFrom && end && end < periodFrom) continue;
+      if (periodFrom && end && end < periodFrom) { debug.droppedExpired++; continue; }
       const kindId = finance.toKindNode?.dataNodeID;
-      if (!kindId) continue;
+      if (kindId == null) { debug.droppedNoKindId++; continue; }
       const amount = finance.amount != null ? Number(finance.amount) : null;
-      if (amount == null) continue;
+      if (amount == null) { debug.droppedNoAmount++; continue; }
       const currency = normalizeCurrency((finance.toCurrencyNode?.value || '').trim());
-      if (!rateMap[kindId]) rateMap[kindId] = [];
-      rateMap[kindId].push({ amount, currency, start, end });
+      // Stringify the key so caller's lookup (which also stringifies via
+      // implicit coercion) is guaranteed to match.
+      const key = String(kindId);
+      if (!rateMap[key]) rateMap[key] = [];
+      rateMap[key].push({ amount, currency, start, end });
+      debug.kept++;
     }
     for (const k of Object.keys(rateMap)) {
       rateMap[k].sort((a, b) => (a.start || '').localeCompare(b.start || ''));
     }
-    return rateMap;
+    return { rateMap, debug };
   } catch (err) {
     logger.warn('fetchCarerixRatesForJob failed', { carerixJobId, error: err.message });
-    return {};
+    debug.error = err.message;
+    return { rateMap: {}, debug };
   }
 }
 
@@ -97,13 +115,6 @@ function pickRateForDay(rates, dayDate) {
   return rates[rates.length - 1];
 }
 
-/**
- * Run a roster sync for `periodId`, persisting events to the
- * `sync_runs` row identified by `syncRunId`. Returns once finished
- * (caller should NOT await this from a request handler — it would
- * defeat the purpose). The function never throws; failures are
- * recorded on the row.
- */
 export async function runRosterSync({ periodId, syncRunId }) {
   const eventBuffer = [];
   let lastStep     = null;
@@ -118,7 +129,6 @@ export async function runRosterSync({ periodId, syncRunId }) {
   const flush = async (extra = {}) => {
     lastFlush = Date.now();
     try {
-      // Trim buffer if it gets too large, keeping the most recent.
       const persisted = eventBuffer.length > MAX_BUFFERED_EVENTS
         ? eventBuffer.slice(-MAX_BUFFERED_EVENTS)
         : eventBuffer;
@@ -214,6 +224,18 @@ export async function runRosterSync({ periodId, syncRunId }) {
     const { data: chargeTypes } = await adminSupabase.from('charge_types').select('id, code, carerix_type_id');
     const ctByCode = Object.fromEntries((chargeTypes || []).map(ct => [ct.code, ct]));
 
+    // One-time at the top of the sync: emit what charge_types looks like
+    // server-side. If carerix_type_id values are missing or wrong here,
+    // every per-placement rates lookup will produce 0.
+    emit('charge_types_loaded', {
+      count: chargeTypes?.length ?? 0,
+      codes: (chargeTypes || []).map(ct => ({
+        code:            ct.code,
+        carerix_type_id: ct.carerix_type_id,
+        type:            typeof ct.carerix_type_id,
+      })),
+    });
+
     let doeMap = {};
     try {
       doeMap = await fetchDateOfEmploymentForPeriod(periodFrom, periodTo);
@@ -267,9 +289,14 @@ export async function runRosterSync({ periodId, syncRunId }) {
         let ratesByCode = {};
         if (placement.carerix_job_id) {
           try {
-            const carerixRateMap = await fetchCarerixRatesForJob(placement.carerix_job_id, periodFrom);
+            const { rateMap: carerixRateMap, debug: rateDebug } =
+              await fetchCarerixRatesForJob(placement.carerix_job_id, periodFrom);
+
+            const rateMapKeys = Object.keys(carerixRateMap);
+
             for (const ct of chargeTypes || []) {
-              const rates = ct.carerix_type_id ? carerixRateMap[ct.carerix_type_id] : null;
+              const lookupKey = ct.carerix_type_id != null ? String(ct.carerix_type_id) : null;
+              const rates     = lookupKey ? carerixRateMap[lookupKey] : null;
               if (!rates?.length) continue;
               ratesByCode[ct.code] = rates;
               const today = new Date().toISOString().split('T')[0];
@@ -280,11 +307,33 @@ export async function runRosterSync({ periodId, syncRunId }) {
                 fetched_at: new Date().toISOString(),
               }, { onConflict: 'placement_id,charge_type_id' });
             }
-            emit('rates', { crew_id: placement.crew_id, source: 'carerix', rateCount: Object.keys(ratesByCode).length, codes: Object.keys(ratesByCode) });
+
+            // Diagnostic — surfaces *why* the mapping produced 0 codes.
+            // Safe to leave on; payload is small.
+            emit('rates_debug', {
+              crew_id:            placement.crew_id,
+              carerix_job_id:     placement.carerix_job_id,
+              fetch:              rateDebug,
+              rateMapKeys,
+              chargeTypeIds:      (chargeTypes || []).map(ct => ({
+                code:            ct.code,
+                carerix_type_id: ct.carerix_type_id,
+              })),
+              matched:            Object.keys(ratesByCode),
+            });
+
+            emit('rates', {
+              crew_id:    placement.crew_id,
+              source:     'carerix',
+              rateCount:  Object.keys(ratesByCode).length,
+              codes:      Object.keys(ratesByCode),
+            });
           } catch (e) {
             logger.warn('Carerix rate fetch failed, using DB fallback', { error: e.message });
             emit('rates_warn', { crew_id: placement.crew_id, error: e.message });
           }
+        } else {
+          emit('rates_skip', { crew_id: placement.crew_id, reason: 'no carerix_job_id' });
         }
         if (!Object.keys(ratesByCode).length) {
           const { data: storedRates } = await adminSupabase
@@ -387,7 +436,6 @@ export async function runRosterSync({ periodId, syncRunId }) {
           emit('rotations_warn', { crew_id: placement.crew_id, error: rotErr.message });
         }
 
-        // Periodic flush after each placement so polling sees forward motion.
         await flush();
       } catch (e) {
         logger.error('Sync error', { placement: placement.full_name, error: e.message });
