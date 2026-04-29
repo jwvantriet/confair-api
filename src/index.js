@@ -10,6 +10,7 @@ import authRoutes          from './routes/auth.js';
 import authMfaRoutes       from './routes/auth_mfa.js';
 import authProbeRoutes     from './routes/auth_probe.js';
 import authOidcProbeRoutes from './routes/auth_oidc_probe.js';
+import carerixFinanceProbeRoutes from './routes/carerix_finance_probe.js';
 import payrollRoutes     from './routes/payroll.js';
 import correctionsRoutes from './routes/corrections.js';
 import approvalsRoutes   from './routes/approvals.js';
@@ -73,6 +74,7 @@ app.use('/runs',        runsRoutes);
 app.use('/invoices',    invoicesRoutes);
 app.use('/import',      importRoutes);
 app.use('/carerix',     carerixRoutes);
+app.use('/carerix',     carerixFinanceProbeRoutes); // /carerix/probe/job-finance
 app.use('/cx-pub',       carerixPublicRoutes);
 app.use('/confair-expense', confairExpenseRoutes);
 app.use('/expenses',         expenseRoutes);
