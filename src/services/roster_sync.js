@@ -143,6 +143,21 @@ export async function runRosterSync({ periodId, syncRunId }) {
     items_created:     0,
   };
 
+  // Timing helper: await `fn()` and add the elapsed ms to bucket[key].
+  // Used to measure where each placement spends its time without
+  // cluttering the call sites.
+  const time = async (bucket, key, fn) => {
+    const t0 = Date.now();
+    try { return await fn(); }
+    finally { bucket[key] = (bucket[key] || 0) + (Date.now() - t0); }
+  };
+  const syncStart = Date.now();
+  const phaseTimings = {};
+  const markPhase = (name, t0) => {
+    phaseTimings[name] = Date.now() - t0;
+    emit('phase_done', { phase: name, ms: phaseTimings[name] });
+  };
+
   const flush = async (extra = {}) => {
     lastFlush = Date.now();
     try {
@@ -179,15 +194,19 @@ export async function runRosterSync({ periodId, syncRunId }) {
   try {
     emit('sync_run', { id: syncRunId });
 
+    let t0 = Date.now();
     const { data: period } = await adminSupabase
       .from('payroll_periods').select('*').eq('id', periodId).single();
     if (!period) throw new Error('Period not found');
     emit('period', { ref: period.period_ref, from: period.start_date, to: period.end_date });
+    markPhase('load_period', t0);
 
+    t0 = Date.now();
     const { data: allPlacementsForSync } = await adminSupabase
       .from('placements')
       .select('id, placement_ref, full_name, crew_id, crew_nia, carerix_placement_id, carerix_job_id, user_profile_id, start_date, end_date')
       .not('crew_id', 'is', null);
+    markPhase('load_placements', t0);
 
     const placements = (allPlacementsForSync || []).filter(p => isPlacementActiveInPeriod(p, period));
     if (!placements?.length) {
@@ -221,14 +240,17 @@ export async function runRosterSync({ periodId, syncRunId }) {
     const periodTo   = period.end_date;
 
     let rolesMap = {};
+    t0 = Date.now();
     try {
       rolesMap = await fetchActiveRolesForPeriod(periodFrom, periodTo);
       emit('roles', { count: Object.keys(rolesMap).length, codes: Object.keys(rolesMap) });
     } catch (e) {
       logger.warn('Failed to fetch special roles', { error: e.message });
     }
+    markPhase('fetch_roles', t0);
 
     let sharedRosterItems = [];
+    t0 = Date.now();
     try {
       const allRosters = await fetchRosters(periodFrom, periodTo);
       sharedRosterItems = rosterItemsList(allRosters);
@@ -237,9 +259,12 @@ export async function runRosterSync({ periodId, syncRunId }) {
       logger.warn('RAIDO global fetch failed (will try per-placement as fallback)', { error: e.message });
       emit('raido_global_error', { error: e.message });
     }
+    markPhase('raido_global', t0);
 
+    t0 = Date.now();
     const { data: chargeTypes } = await adminSupabase.from('charge_types').select('id, code, carerix_type_id');
     const ctByCode = Object.fromEntries((chargeTypes || []).map(ct => [ct.code, ct]));
+    markPhase('load_charge_types', t0);
 
     emit('charge_types_loaded', {
       count: chargeTypes?.length ?? 0,
@@ -251,28 +276,38 @@ export async function runRosterSync({ periodId, syncRunId }) {
     });
 
     let doeMap = {};
+    t0 = Date.now();
     try {
       doeMap = await fetchDateOfEmploymentForPeriod(periodFrom, periodTo);
       emit('tenure', { count: Object.keys(doeMap).length, codes: Object.keys(doeMap) });
     } catch (e) {
       logger.warn('Failed to fetch DateOfEmployment', { error: e.message });
     }
+    markPhase('fetch_tenure', t0);
     const msPerYear = 365.25 * 24 * 3600 * 1000;
 
+    t0 = Date.now();
     const ratesCache = await prefetchCarerixRates(placements, periodFrom, emit);
+    markPhase('prefetch_carerix_rates', t0);
 
     let synced = 0, errors = 0;
     const results = [];
 
     for (const placement of placements) {
+      const placementStart = Date.now();
+      const t = { lock_check: 0, raido_per_placement: 0, qual_update: 0,
+                  placement_rates_upsert: 0, stored_rates_fallback: 0,
+                  delete_charge_items: 0, roster_days_upsert: 0,
+                  charge_items_upsert: 0, rotations: 0,
+                  charge_items_count: 0, roster_days_count: 0 };
       emit('placement_start', { name: placement.full_name, crew_id: placement.crew_id, has_carerix_job: !!placement.carerix_job_id });
       try {
-        const { data: lockStatus } = await adminSupabase
+        const { data: lockStatus } = await time(t, 'lock_check', () => adminSupabase
           .from('roster_period_status')
           .select('sync_locked')
           .eq('placement_id', placement.id)
           .eq('period_id', periodId)
-          .maybeSingle();
+          .maybeSingle());
 
         if (lockStatus?.sync_locked) {
           results.push({ placement: placement.full_name, days: 0, items: 0, skipped: true, reason: 'sync locked by company approval' });
@@ -284,7 +319,8 @@ export async function runRosterSync({ periodId, syncRunId }) {
 
         let items = sharedRosterItems;
         if (!items.length) {
-          const rosters = await fetchRostersForCrew(periodFrom, periodTo, placement.crew_id);
+          const rosters = await time(t, 'raido_per_placement',
+            () => fetchRostersForCrew(periodFrom, periodTo, placement.crew_id));
           items = rosterItemsList(rosters);
         }
         const rows         = mapRosterToRows(items, placement.crew_id, placement.crew_nia);
@@ -303,10 +339,10 @@ export async function runRosterSync({ periodId, syncRunId }) {
         const rolesFromApi = rolesMap[placement.crew_id?.toUpperCase()] || null;
         const roles        = rolesFromApi || crewSummary.activeRoles || null;
         if (qual || roles) {
-          await adminSupabase.from('placements').update({
+          await time(t, 'qual_update', () => adminSupabase.from('placements').update({
             ...(qual  ? { qualification: qual }  : {}),
             ...(roles ? { active_roles: roles }  : {}),
-          }).eq('id', placement.id);
+          }).eq('id', placement.id));
         }
 
         let itemsCreated = 0;
@@ -322,11 +358,11 @@ export async function runRosterSync({ periodId, syncRunId }) {
               ratesByCode[ct.code] = rates;
               const today = new Date().toISOString().split('T')[0];
               const nowRate = pickRateForDay(rates, today) || rates[0];
-              await adminSupabase.from('placement_rates').upsert({
+              await time(t, 'placement_rates_upsert', () => adminSupabase.from('placement_rates').upsert({
                 placement_id: placement.id, charge_type_id: ct.id,
                 amount: nowRate.amount, currency: nowRate.currency,
                 fetched_at: new Date().toISOString(),
-              }, { onConflict: 'placement_id,charge_type_id' });
+              }, { onConflict: 'placement_id,charge_type_id' }));
             }
             emit('rates', {
               crew_id:    placement.crew_id,
@@ -341,9 +377,10 @@ export async function runRosterSync({ periodId, syncRunId }) {
           emit('rates_skip', { crew_id: placement.crew_id, reason: 'no carerix_job_id' });
         }
         if (!Object.keys(ratesByCode).length) {
-          const { data: storedRates } = await adminSupabase
-            .from('placement_rates').select('charge_type_id, amount, currency')
-            .eq('placement_id', placement.id);
+          const { data: storedRates } = await time(t, 'stored_rates_fallback',
+            () => adminSupabase
+              .from('placement_rates').select('charge_type_id, amount, currency')
+              .eq('placement_id', placement.id));
           for (const r of storedRates || []) {
             const ct = (chargeTypes || []).find(c => c.id === r.charge_type_id);
             if (ct) ratesByCode[ct.code] = [{ amount: Number(r.amount), currency: r.currency, start: null, end: null }];
@@ -358,10 +395,10 @@ export async function runRosterSync({ periodId, syncRunId }) {
           return diffYears >= 5;
         };
 
-        await adminSupabase.from('charge_items')
+        await time(t, 'delete_charge_items', () => adminSupabase.from('charge_items')
           .delete()
           .eq('placement_id', placement.id)
-          .eq('period_id', periodId);
+          .eq('period_id', periodId));
 
         let dayIdx = 0;
         for (const day of crewSummary.days) {
@@ -370,13 +407,15 @@ export async function runRosterSync({ periodId, syncRunId }) {
             day.charges = { ...day.charges, YearsWithClient: 1 };
           }
           try {
-            const rd = await adminSupabase.from('roster_days').upsert({
-              placement_id: placement.id, period_id: periodId, roster_date: day.date,
-              crew_id: placement.crew_id, crew_nia: placement.crew_nia,
-              activities: day.activities, is_payable: day.isPayable,
-              has_ground: day.hasGround, has_sim: day.hasSim, has_pxp: day.hasPxp,
-              sold_off: day.soldOff, bod: day.bod, fetched_at: new Date().toISOString(),
-            }, { onConflict: 'placement_id,period_id,roster_date' }).select('id').limit(1);
+            const rd = await time(t, 'roster_days_upsert',
+              () => adminSupabase.from('roster_days').upsert({
+                placement_id: placement.id, period_id: periodId, roster_date: day.date,
+                crew_id: placement.crew_id, crew_nia: placement.crew_nia,
+                activities: day.activities, is_payable: day.isPayable,
+                has_ground: day.hasGround, has_sim: day.hasSim, has_pxp: day.hasPxp,
+                sold_off: day.soldOff, bod: day.bod, fetched_at: new Date().toISOString(),
+              }, { onConflict: 'placement_id,period_id,roster_date' }).select('id').limit(1));
+            t.roster_days_count++;
             if (rd?.error) throw new Error(`roster_days ${day.date}: ${rd.error.message}`);
 
             for (const [chargeCode, qty] of Object.entries(day.charges || {})) {
@@ -389,19 +428,21 @@ export async function runRosterSync({ periodId, syncRunId }) {
               const total    = rate != null ? Math.round(qty * rate * 100) / 100 : null;
               // Write to BOTH column pairs — the schema has duplicate columns
               // and different read paths use different ones.
-              const ci = await adminSupabase.from('charge_items').upsert({
-                placement_id:   placement.id,
-                period_id:      periodId,
-                charge_type_id: ct.id,
-                charge_date:    day.date,
-                quantity:       qty,
-                rate_per_unit:  rate,
-                rate_amount:    rate,
-                total_amount:   total,
-                total_value:    total,
-                currency,
-                status:         'confirmed',
-              }, { onConflict: 'placement_id,charge_date,charge_type_id' }).select('id').limit(1);
+              const ci = await time(t, 'charge_items_upsert',
+                () => adminSupabase.from('charge_items').upsert({
+                  placement_id:   placement.id,
+                  period_id:      periodId,
+                  charge_type_id: ct.id,
+                  charge_date:    day.date,
+                  quantity:       qty,
+                  rate_per_unit:  rate,
+                  rate_amount:    rate,
+                  total_amount:   total,
+                  total_value:    total,
+                  currency,
+                  status:         'confirmed',
+                }, { onConflict: 'placement_id,charge_date,charge_type_id' }).select('id').limit(1));
+              t.charge_items_count++;
               if (ci?.error) throw new Error(`charge_items ${day.date}/${chargeCode}: ${ci.error.message}`);
               itemsCreated++;
             }
@@ -419,36 +460,60 @@ export async function runRosterSync({ periodId, syncRunId }) {
 
         const otCt = ctByCode['Overtime'];
         try {
-          const { wrote } = await recomputePlacementRotations(placement.id, { lookbackMonths: 4 });
+          const { wrote } = await time(t, 'rotations',
+            () => recomputePlacementRotations(placement.id, { lookbackMonths: 4 }));
           emit('rotations', { crew_id: placement.crew_id, count: wrote });
 
           if (otCt) {
-            const { data: closedOt } = await adminSupabase
-              .from('rotations')
-              .select('end_date, ot_hours, ot_period_id')
-              .eq('placement_id', placement.id)
-              .eq('ot_period_id', periodId)
-              .gt('ot_hours', 0);
+            const { data: closedOt } = await time(t, 'rotations',
+              () => adminSupabase
+                .from('rotations')
+                .select('end_date, ot_hours, ot_period_id')
+                .eq('placement_id', placement.id)
+                .eq('ot_period_id', periodId)
+                .gt('ot_hours', 0));
             for (const r of closedOt || []) {
-              await adminSupabase.from('charge_items').upsert({
-                placement_id:   placement.id,
-                period_id:      periodId,
-                charge_type_id: otCt.id,
-                charge_date:    r.end_date,
-                quantity:       r.ot_hours,
-                rate_per_unit:  null,
-                rate_amount:    null,
-                total_amount:   null,
-                total_value:    null,
-                currency:       'USD',
-                status:         'confirmed',
-              }, { onConflict: 'placement_id,charge_date,charge_type_id', returning: 'minimal' });
+              await time(t, 'charge_items_upsert',
+                () => adminSupabase.from('charge_items').upsert({
+                  placement_id:   placement.id,
+                  period_id:      periodId,
+                  charge_type_id: otCt.id,
+                  charge_date:    r.end_date,
+                  quantity:       r.ot_hours,
+                  rate_per_unit:  null,
+                  rate_amount:    null,
+                  total_amount:   null,
+                  total_value:    null,
+                  currency:       'USD',
+                  status:         'confirmed',
+                }, { onConflict: 'placement_id,charge_date,charge_type_id', returning: 'minimal' }));
+              t.charge_items_count++;
             }
           }
         } catch (rotErr) {
           logger.warn('rotation recompute failed', { error: rotErr.message });
           emit('rotations_warn', { crew_id: placement.crew_id, error: rotErr.message });
         }
+
+        const totalMs = Date.now() - placementStart;
+        emit('placement_timings', {
+          crew_id:           placement.crew_id,
+          name:              placement.full_name,
+          total_ms:          totalMs,
+          roster_days_count: t.roster_days_count,
+          charge_items_count: t.charge_items_count,
+          ms: {
+            lock_check:             t.lock_check,
+            raido_per_placement:    t.raido_per_placement,
+            qual_update:            t.qual_update,
+            placement_rates_upsert: t.placement_rates_upsert,
+            stored_rates_fallback:  t.stored_rates_fallback,
+            delete_charge_items:    t.delete_charge_items,
+            roster_days_upsert:     t.roster_days_upsert,
+            charge_items_upsert:    t.charge_items_upsert,
+            rotations:              t.rotations,
+          },
+        });
 
         await flush();
       } catch (e) {
@@ -459,6 +524,11 @@ export async function runRosterSync({ periodId, syncRunId }) {
       }
     }
 
+    emit('sync_summary', {
+      total_ms:      Date.now() - syncStart,
+      phase_ms:      phaseTimings,
+      placement_loop_ms: Date.now() - syncStart - Object.values(phaseTimings).reduce((a, b) => a + b, 0),
+    });
     emit('done', { message: 'Sync complete', synced, errors, results });
     await flush({ status: 'completed', ended_at: new Date().toISOString() });
   } catch (err) {
