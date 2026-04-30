@@ -121,8 +121,12 @@ export async function provisionCarerixUser(identity) {
  * the user's JWT as the auth context for every subsequent admin operation
  * across the entire process, silently breaking RLS bypass.
  *
- * Instead we use a one-shot client purely to mint and immediately discard
- * the session — only the returned tokens travel onward.
+ * We use a one-shot client purely for verifyOtp. The client falls out of
+ * scope and is GC'd after the function returns; the session it created
+ * remains valid because we DO NOT call signOut on it. (Counter-intuitively,
+ * `auth.signOut({ scope: 'local' })` in supabase-js calls /auth/v1/logout
+ * on the server and invalidates the session we just minted — exactly the
+ * tokens the user is about to use. Don't do that.)
  */
 export async function issueSupabaseSession({ email, userId, role }) {
   const { data: linkData, error: linkErr } = await adminSupabase.auth.admin.generateLink({
@@ -134,9 +138,6 @@ export async function issueSupabaseSession({ email, userId, role }) {
   const tokenHash = linkData.properties?.hashed_token;
   if (!tokenHash) throw new Error('No hashed_token in generateLink response');
 
-  // One-shot client — never assigned to a module-scope variable, so the
-  // session it creates dies with the function call. Critical: do NOT use
-  // adminSupabase here. See module-level comment.
   const oneShot = createClient(
     config.supabase.url,
     config.supabase.serviceRoleKey,
@@ -149,9 +150,8 @@ export async function issueSupabaseSession({ email, userId, role }) {
   });
   if (otpErr) throw new Error(`Session creation failed: ${otpErr.message}`);
 
-  // Belt-and-braces: clear the one-shot's session so any held reference
-  // to this client (none expected, but cheap) can't leak the user JWT.
-  try { await oneShot.auth.signOut({ scope: 'local' }); } catch (_e) { /* ignore */ }
+  // Intentionally NOT calling oneShot.auth.signOut(): that endpoint
+  // invalidates the access_token we're about to return to the user.
 
   return {
     accessToken:  otpData.session.access_token,
