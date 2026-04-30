@@ -11,6 +11,7 @@ import authMfaRoutes       from './routes/auth_mfa.js';
 import authProbeRoutes     from './routes/auth_probe.js';
 import authOidcProbeRoutes from './routes/auth_oidc_probe.js';
 import carerixFinanceProbeRoutes from './routes/carerix_finance_probe.js';
+import diagnosticsRoleRoutes from './routes/diagnostics_role.js';
 import payrollRoutes     from './routes/payroll.js';
 import correctionsRoutes from './routes/corrections.js';
 import approvalsRoutes   from './routes/approvals.js';
@@ -82,6 +83,7 @@ app.use('/payroll-approval', payrollApprovalRoutes);
 app.use('/invoice',      invoiceRoutes);
 app.use('/roster',      rosterRoutes);
 app.use('/payroll-roster', payrollRosterRoutes);
+app.use('/diagnostics',    diagnosticsRoleRoutes); // /diagnostics/role
 app.use('/diagnostics',    diagnosticsRoutes);
 app.use('/errors',         errorLogRoutes);
 app.use('/rotations',      rotationsAdminRoutes);
