@@ -2,6 +2,11 @@
  * Supabase clients
  *
  * adminSupabase  — service role key, bypasses RLS. Server-side only.
+ *                  NEVER call any auth method on this client (signIn,
+ *                  verifyOtp, signOut, etc.) — those mutate the client's
+ *                  in-memory session and from then on every .from()/.rpc()
+ *                  call will use the user's JWT instead of the service
+ *                  role key (silently breaking RLS bypass).
  * userSupabase() — per-request client scoped to a user JWT. Respects RLS.
  */
 
@@ -29,13 +34,6 @@ export function userSupabase(accessToken) {
 /**
  * Step 1 of login: ensure a user_profiles row exists for the Carerix
  * identity and refuse outright if the account is deactivated.
- *
- * Splitting profile-upsert from session-issuance lets the auth route park
- * a freshly-authenticated user at the MFA challenge before any Supabase
- * tokens are minted. No tokens leave the server until MFA passes (or is
- * not required).
- *
- * @returns {Promise<{ userId: string }>}
  */
 export async function provisionCarerixUser(identity) {
   let existing = null;
@@ -57,8 +55,6 @@ export async function provisionCarerixUser(identity) {
     existing = data;
   }
 
-  // Refuse early if a profile exists but has been deactivated. New users
-  // (no profile yet) are provisioned with is_active=true below.
   if (existing && existing.is_active === false) {
     throw new ApiError('Account is inactive', 403);
   }
@@ -117,7 +113,16 @@ export async function provisionCarerixUser(identity) {
 /**
  * Step 2 of login (post-MFA, or no-MFA): mint a Supabase session.
  *
- * Uses generateLink → verifyOtp because Supabase v2 removed createSession.
+ * generateLink runs as service-role on adminSupabase (admin call, no
+ * session side-effect).
+ *
+ * verifyOtp, however, **establishes a user session on the client it's
+ * called on**. We must NEVER call it on `adminSupabase` — that would set
+ * the user's JWT as the auth context for every subsequent admin operation
+ * across the entire process, silently breaking RLS bypass.
+ *
+ * Instead we use a one-shot client purely to mint and immediately discard
+ * the session — only the returned tokens travel onward.
  */
 export async function issueSupabaseSession({ email, userId, role }) {
   const { data: linkData, error: linkErr } = await adminSupabase.auth.admin.generateLink({
@@ -129,11 +134,24 @@ export async function issueSupabaseSession({ email, userId, role }) {
   const tokenHash = linkData.properties?.hashed_token;
   if (!tokenHash) throw new Error('No hashed_token in generateLink response');
 
-  const { data: otpData, error: otpErr } = await adminSupabase.auth.verifyOtp({
+  // One-shot client — never assigned to a module-scope variable, so the
+  // session it creates dies with the function call. Critical: do NOT use
+  // adminSupabase here. See module-level comment.
+  const oneShot = createClient(
+    config.supabase.url,
+    config.supabase.serviceRoleKey,
+    { auth: { autoRefreshToken: false, persistSession: false } }
+  );
+
+  const { data: otpData, error: otpErr } = await oneShot.auth.verifyOtp({
     token_hash: tokenHash,
     type: 'email',
   });
   if (otpErr) throw new Error(`Session creation failed: ${otpErr.message}`);
+
+  // Belt-and-braces: clear the one-shot's session so any held reference
+  // to this client (none expected, but cheap) can't leak the user JWT.
+  try { await oneShot.auth.signOut({ scope: 'local' }); } catch (_e) { /* ignore */ }
 
   return {
     accessToken:  otpData.session.access_token,
@@ -145,9 +163,7 @@ export async function issueSupabaseSession({ email, userId, role }) {
 }
 
 /**
- * Convenience: run both steps. Used by code paths that don't gate on MFA
- * (e.g. legacy callers or admin-impersonation flows). New code should call
- * the two halves explicitly so MFA can be inserted between them.
+ * Convenience: run both steps. Used by code paths that don't gate on MFA.
  */
 export async function provisionCarerixSession(identity) {
   const { userId } = await provisionCarerixUser(identity);
