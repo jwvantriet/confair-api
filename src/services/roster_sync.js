@@ -11,8 +11,13 @@
  * Performance: Carerix job-rate fetches are pre-fetched in parallel
  * (concurrency CARERIX_PREFETCH_CONCURRENCY) before the per-placement
  * loop and cached, so each placement reads from the in-memory cache
- * instead of making its own ~500ms Carerix call. For a tenant with 200
- * placements this drops the sync from minutes down to ~15-20 seconds.
+ * instead of making its own ~500ms Carerix call.
+ *
+ * Schema note: charge_items has two duplicate column pairs from earlier
+ * schema iterations — `rate_per_unit/total_amount` and
+ * `rate_amount/total_value`. We write to both so any read path (summary,
+ * placement view, exports) sees consistent data regardless of which
+ * column pair it queries.
  */
 
 import { adminSupabase } from './supabase.js';
@@ -27,9 +32,6 @@ import { logger } from '../utils/logger.js';
 const FLUSH_EVERY_EVENTS = 10;
 const FLUSH_EVERY_MS     = 3_000;
 const MAX_BUFFERED_EVENTS = 5_000;
-
-// Number of concurrent Carerix rate fetches during the prefetch phase.
-// Carerix tolerates ~10 parallel queries; pick 8 to leave headroom.
 const CARERIX_PREFETCH_CONCURRENCY = 8;
 
 function normalizeCurrency(raw) {
@@ -99,10 +101,6 @@ async function fetchCarerixRatesForJob(carerixJobId, periodFrom = null) {
   }
 }
 
-/**
- * Pre-fetch Carerix rates for all distinct carerix_job_ids in the placement
- * set, in parallel. Returns a Map<jobId, { rateMap, debug }>.
- */
 async function prefetchCarerixRates(placements, periodFrom, emit) {
   const uniqueJobIds = [...new Set(
     placements.map(p => p.carerix_job_id).filter(Boolean)
@@ -261,8 +259,6 @@ export async function runRosterSync({ periodId, syncRunId }) {
     }
     const msPerYear = 365.25 * 24 * 3600 * 1000;
 
-    // ── Pre-fetch Carerix rates for all unique jobs in parallel ─────────────
-    // Saves roughly N × ~500ms (sequential) → ~15-20s total (parallel).
     const ratesCache = await prefetchCarerixRates(placements, periodFrom, emit);
 
     let synced = 0, errors = 0;
@@ -316,7 +312,6 @@ export async function runRosterSync({ periodId, syncRunId }) {
         let itemsCreated = 0;
         let ratesByCode = {};
         if (placement.carerix_job_id) {
-          // Look up from prefetched cache instead of calling Carerix again.
           const cached = ratesCache.get(String(placement.carerix_job_id));
           if (cached) {
             const { rateMap: carerixRateMap } = cached;
@@ -392,10 +387,20 @@ export async function runRosterSync({ periodId, syncRunId }) {
               const rate     = rateRow?.amount ?? null;
               const currency = rateRow?.currency ?? 'USD';
               const total    = rate != null ? Math.round(qty * rate * 100) / 100 : null;
+              // Write to BOTH column pairs — the schema has duplicate columns
+              // and different read paths use different ones.
               const ci = await adminSupabase.from('charge_items').upsert({
-                placement_id: placement.id, period_id: periodId,
-                charge_type_id: ct.id, charge_date: day.date,
-                quantity: qty, rate_per_unit: rate, currency, total_amount: total, status: 'confirmed',
+                placement_id:   placement.id,
+                period_id:      periodId,
+                charge_type_id: ct.id,
+                charge_date:    day.date,
+                quantity:       qty,
+                rate_per_unit:  rate,
+                rate_amount:    rate,
+                total_amount:   total,
+                total_value:    total,
+                currency,
+                status:         'confirmed',
               }, { onConflict: 'placement_id,charge_date,charge_type_id' }).select('id').limit(1);
               if (ci?.error) throw new Error(`charge_items ${day.date}/${chargeCode}: ${ci.error.message}`);
               itemsCreated++;
@@ -426,10 +431,17 @@ export async function runRosterSync({ periodId, syncRunId }) {
               .gt('ot_hours', 0);
             for (const r of closedOt || []) {
               await adminSupabase.from('charge_items').upsert({
-                placement_id: placement.id, period_id: periodId,
-                charge_type_id: otCt.id, charge_date: r.end_date,
-                quantity: r.ot_hours, rate_amount: null, currency: 'USD',
-                total_value: null, status: 'confirmed',
+                placement_id:   placement.id,
+                period_id:      periodId,
+                charge_type_id: otCt.id,
+                charge_date:    r.end_date,
+                quantity:       r.ot_hours,
+                rate_per_unit:  null,
+                rate_amount:    null,
+                total_amount:   null,
+                total_value:    null,
+                currency:       'USD',
+                status:         'confirmed',
               }, { onConflict: 'placement_id,charge_date,charge_type_id', returning: 'minimal' });
             }
           }

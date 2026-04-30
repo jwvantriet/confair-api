@@ -5,10 +5,12 @@
  *   POST /roster/sync/:periodId            — creates a sync_runs row, returns
  *                                            { syncRunId } immediately, kicks
  *                                            off runRosterSync in background.
- *   GET  /roster/sync-runs/:syncRunId      — returns current state of the run
- *                                            (status, counters, recent events).
- *   GET  /roster/sync-runs?periodId=…      — list recent runs for a period
- *                                            (newest first).
+ *   GET  /roster/sync-runs/:syncRunId      — returns current state of the run.
+ *   GET  /roster/sync-runs?periodId=…      — list recent runs for a period.
+ *
+ * Schema note: charge_items has two duplicate column pairs from earlier
+ * iterations — `rate_per_unit/total_amount` and `rate_amount/total_value`.
+ * All reads here use coalesce-style fallback so older rows keep working.
  */
 import { Router } from 'express';
 import { adminSupabase } from '../services/supabase.js';
@@ -22,6 +24,15 @@ import { runRosterSync } from '../services/roster_sync.js';
 const router = Router();
 router.use(requireAuth);
 
+// Read either of the two stored "total" columns. Old data may have only one
+// populated; new data has both.
+const totalOf = (item) =>
+  Number(item?.total_value ?? item?.total_amount ?? 0);
+
+// Same trick for the rate columns.
+const rateOf = (item) =>
+  item?.rate_amount ?? item?.rate_per_unit ?? null;
+
 // ── GET /roster/charge-types ──────────────────────────────────────────────────
 router.get('/charge-types', async (req, res, next) => {
   try {
@@ -30,7 +41,7 @@ router.get('/charge-types', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ── POST /roster/sync/:periodId — start a background sync ────────────────────
+// ── POST /roster/sync/:periodId ──────────────────────────────────────────────
 router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
   try {
     const { periodId } = req.params;
@@ -47,7 +58,6 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
     }).select('id').single();
     if (insErr || !runRow) throw new ApiError(`Failed to create sync run: ${insErr?.message || 'unknown'}`, 500);
 
-    // Fire-and-forget. Errors are recorded inside runRosterSync.
     runRosterSync({ periodId, syncRunId: runRow.id })
       .catch(err => logger.error('runRosterSync crashed at top level', { syncRunId: runRow.id, error: err.message }));
 
@@ -55,7 +65,6 @@ router.post('/sync/:periodId', requireAgency, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ── GET /roster/sync-runs/:syncRunId — poll status ───────────────────────────
 router.get('/sync-runs/:syncRunId', requireAgency, async (req, res, next) => {
   try {
     const { syncRunId } = req.params;
@@ -67,8 +76,6 @@ router.get('/sync-runs/:syncRunId', requireAgency, async (req, res, next) => {
     if (error) throw new ApiError(error.message, 500);
     if (!run)  throw new ApiError('Sync run not found', 404);
 
-    // Trim raw_events to recent N to keep response small.
-    // The frontend re-renders each poll and only needs forward motion.
     const sinceCursor = req.query.since ? Number(req.query.since) : 0;
     const allEvents   = Array.isArray(run.raw_events) ? run.raw_events : [];
     const events      = sinceCursor > 0
@@ -83,7 +90,6 @@ router.get('/sync-runs/:syncRunId', requireAgency, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ── GET /roster/sync-runs?periodId=… — recent runs for a period ──────────────
 router.get('/sync-runs', requireAgency, async (req, res, next) => {
   try {
     const periodId = req.query.periodId;
@@ -129,7 +135,8 @@ router.get('/summary/:periodId', async (req, res, next) => {
 
     let q = adminSupabase
       .from('charge_items')
-      .select('placement_id, charge_type_id, charge_date, quantity, rate_amount, currency, total_value, status, charge_types(code, label, sort_order)')
+      // Select BOTH column pairs so totalOf can fall back.
+      .select('placement_id, charge_type_id, charge_date, quantity, rate_amount, rate_per_unit, currency, total_value, total_amount, status, charge_types(code, label, sort_order)')
       .eq('period_id', periodId)
       .order('charge_date');
 
@@ -152,28 +159,56 @@ router.get('/summary/:periodId', async (req, res, next) => {
     const placementMap = Object.fromEntries(allPlacements.map(p => [p.id, p]));
 
     const byPlacement = new Map();
+    // Seed every in-scope placement with a 0-row so the UI can render zeros
+    // for placements that had no charges this period (cleaner than missing rows).
     for (const pl of allPlacements) {
-      byPlacement.set(pl.id, { placementId: pl.id, displayName: pl.full_name || '', crewId: pl.crew_id || null, chargeTypes: new Map(), totalValue: 0, currency: 'USD' });
+      byPlacement.set(pl.id, {
+        placementId: pl.id,
+        displayName: pl.full_name || '',
+        crewId:      pl.crew_id || null,
+        chargeTypes: new Map(),
+        totalValue:  0,
+        currency:    'USD',
+      });
     }
 
     for (const item of items || []) {
       const pid = item.placement_id;
       if (!byPlacement.has(pid)) {
         const pl = placementMap[pid];
-        byPlacement.set(pid, { placementId: pid, displayName: pl?.full_name || 'Unknown', crewId: pl?.crew_id || null, chargeTypes: new Map(), totalValue: 0, currency: item.currency });
+        byPlacement.set(pid, {
+          placementId: pid,
+          displayName: pl?.full_name || 'Unknown',
+          crewId:      pl?.crew_id || null,
+          chargeTypes: new Map(),
+          totalValue:  0,
+          currency:    item.currency || 'USD',
+        });
       }
       const p = byPlacement.get(pid);
       const code = item.charge_types?.code;
       if (!p.chargeTypes.has(code)) {
-        p.chargeTypes.set(code, { code, label: item.charge_types?.label, quantity: 0, totalValue: 0, currency: item.currency });
+        p.chargeTypes.set(code, {
+          code,
+          label:      item.charge_types?.label,
+          quantity:   0,
+          totalValue: 0,
+          currency:   item.currency || 'USD',
+        });
       }
-      const ct = p.chargeTypes.get(code);
-      ct.quantity   += Number(item.quantity   || 0);
-      ct.totalValue += Number(item.total_value || 0);
-      p.totalValue  += Number(item.total_value || 0);
+      const ct  = p.chargeTypes.get(code);
+      const val = totalOf(item);
+      ct.quantity   += Number(item.quantity || 0);
+      ct.totalValue += val;
+      p.totalValue  += val;
     }
 
-    res.json({ placements: Array.from(byPlacement.values()).map(p => ({ ...p, chargeTypes: Array.from(p.chargeTypes.values()) })) });
+    res.json({
+      placements: Array.from(byPlacement.values()).map(p => ({
+        ...p,
+        chargeTypes: Array.from(p.chargeTypes.values()),
+      })),
+    });
   } catch (err) { next(err); }
 });
 
@@ -205,7 +240,7 @@ router.get('/daily/:periodId/:placementId', async (req, res, next) => {
       if (!byDate.has(item.charge_date)) byDate.set(item.charge_date, { date: item.charge_date, charges: [], totalValue: 0 });
       const d = byDate.get(item.charge_date);
       d.charges.push(item);
-      d.totalValue += Number(item.total_value || 0);
+      d.totalValue += totalOf(item);
     }
 
     res.json({ days: Array.from(byDate.values()), corrections: corrections || [] });
@@ -256,7 +291,6 @@ router.get('/corrections/:periodId?', requireCompanyOrAbove, async (req, res, ne
   } catch (err) { next(err); }
 });
 
-// ── PATCH /roster/correction/:id ──────────────────────────────────────────────
 router.patch('/correction/:id', requireCompanyOrAbove, async (req, res, next) => {
   try {
     const { status, reviewNote } = req.body;
@@ -351,15 +385,42 @@ router.get('/placement/:periodId', async (req, res, next) => {
             fetched_at: new Date().toISOString(),
           }, { onConflict: 'placement_id,roster_date', returning: 'minimal' });
 
+          // Note: this live view writes quantity-only rows (no rates). It runs
+          // when an open period is being viewed. To avoid clobbering rates
+          // that the sync wrote, we DON'T overwrite rate/total columns here —
+          // we use a partial upsert that only sets quantity.
+          //
+          // (PG/PostgREST doesn't support "update only these columns on
+          // conflict" via supabase-js, so we instead skip this write when a
+          // sync row already exists. If no sync has run yet, write a stub.)
           for (const [code, qty] of Object.entries(day.charges || {})) {
             if (!qty) continue;
             const ct = ctByCode[code];
             if (!ct) continue;
+            const { data: existing } = await adminSupabase
+              .from('charge_items')
+              .select('id, rate_amount, rate_per_unit')
+              .eq('placement_id', placement.id)
+              .eq('period_id', periodId)
+              .eq('charge_date', day.date)
+              .eq('charge_type_id', ct.id)
+              .maybeSingle();
+            if (existing && (existing.rate_amount != null || existing.rate_per_unit != null)) {
+              // Sync row already has a rate — leave it alone.
+              continue;
+            }
             await adminSupabase.from('charge_items').upsert({
-              placement_id: placement.id, period_id: periodId,
-              charge_type_id: ct.id, charge_date: day.date,
-              quantity: qty, rate_amount: null, currency: 'USD',
-              total_value: null, status: 'confirmed',
+              placement_id:   placement.id,
+              period_id:      periodId,
+              charge_type_id: ct.id,
+              charge_date:    day.date,
+              quantity:       qty,
+              rate_per_unit:  null,
+              rate_amount:    null,
+              total_amount:   null,
+              total_value:    null,
+              currency:       'USD',
+              status:         'confirmed',
             }, { onConflict: 'placement_id,charge_date,charge_type_id', returning: 'minimal' });
           }
         }
