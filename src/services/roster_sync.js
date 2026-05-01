@@ -33,6 +33,7 @@ const FLUSH_EVERY_EVENTS = 10;
 const FLUSH_EVERY_MS     = 3_000;
 const MAX_BUFFERED_EVENTS = 5_000;
 const CARERIX_PREFETCH_CONCURRENCY = 8;
+const PLACEMENT_CONCURRENCY        = 5;
 
 function normalizeCurrency(raw) {
   if (!raw) return 'USD';
@@ -293,7 +294,13 @@ export async function runRosterSync({ periodId, syncRunId }) {
     let synced = 0, errors = 0;
     const results = [];
 
-    for (const placement of placements) {
+    // Each placement's work is independent — different crew, different rows,
+    // no shared mutable state besides the in-memory rate cache (read-only)
+    // and the run counters (mutated atomically by single-thread JS). So we
+    // can fan out across PLACEMENT_CONCURRENCY workers and let Supabase do
+    // the parallel work. JS is single-threaded so synced/errors increments
+    // can't tear; ordering of `results` is not guaranteed but never was.
+    const processPlacement = async (placement) => {
       const placementStart = Date.now();
       const t = { lock_check: 0, raido_per_placement: 0, qual_update: 0,
                   placement_rates_upsert: 0, stored_rates_fallback: 0,
@@ -314,7 +321,7 @@ export async function runRosterSync({ periodId, syncRunId }) {
           synced++;
           runState.placements_synced = synced;
           await flush();
-          continue;
+          return;
         }
 
         let items = sharedRosterItems;
@@ -332,7 +339,7 @@ export async function runRosterSync({ periodId, syncRunId }) {
           synced++;
           runState.placements_synced = synced;
           await flush();
-          continue;
+          return;
         }
 
         const qual         = crewSummary.qualification;
@@ -351,6 +358,7 @@ export async function runRosterSync({ periodId, syncRunId }) {
           const cached = ratesCache.get(String(placement.carerix_job_id));
           if (cached) {
             const { rateMap: carerixRateMap } = cached;
+            const placementRateRows = [];
             for (const ct of chargeTypes || []) {
               const lookupKey = ct.carerix_type_id != null ? String(ct.carerix_type_id) : null;
               const rates     = lookupKey ? carerixRateMap[lookupKey] : null;
@@ -358,11 +366,16 @@ export async function runRosterSync({ periodId, syncRunId }) {
               ratesByCode[ct.code] = rates;
               const today = new Date().toISOString().split('T')[0];
               const nowRate = pickRateForDay(rates, today) || rates[0];
-              await time(t, 'placement_rates_upsert', () => adminSupabase.from('placement_rates').upsert({
+              placementRateRows.push({
                 placement_id: placement.id, charge_type_id: ct.id,
                 amount: nowRate.amount, currency: nowRate.currency,
                 fetched_at: new Date().toISOString(),
-              }, { onConflict: 'placement_id,charge_type_id' }));
+              });
+            }
+            if (placementRateRows.length) {
+              await time(t, 'placement_rates_upsert', () => adminSupabase
+                .from('placement_rates')
+                .upsert(placementRateRows, { onConflict: 'placement_id,charge_type_id', returning: 'minimal' }));
             }
             emit('rates', {
               crew_id:    placement.crew_id,
@@ -400,56 +413,61 @@ export async function runRosterSync({ periodId, syncRunId }) {
           .eq('placement_id', placement.id)
           .eq('period_id', periodId));
 
-        let dayIdx = 0;
+        // Build the entire roster_days + charge_items payload in memory,
+        // then send each as a single batched upsert. Collapses ~120
+        // sequential round-trips per placement into 2.
+        const rosterDayRows  = [];
+        const chargeItemRows = [];
         for (const day of crewSummary.days) {
-          dayIdx++;
           if (day.isPayable && ywcEligibleForDay(day.date)) {
             day.charges = { ...day.charges, YearsWithClient: 1 };
           }
-          try {
-            const rd = await time(t, 'roster_days_upsert',
-              () => adminSupabase.from('roster_days').upsert({
-                placement_id: placement.id, period_id: periodId, roster_date: day.date,
-                crew_id: placement.crew_id, crew_nia: placement.crew_nia,
-                activities: day.activities, is_payable: day.isPayable,
-                has_ground: day.hasGround, has_sim: day.hasSim, has_pxp: day.hasPxp,
-                sold_off: day.soldOff, bod: day.bod, fetched_at: new Date().toISOString(),
-              }, { onConflict: 'placement_id,period_id,roster_date' }).select('id').limit(1));
-            t.roster_days_count++;
-            if (rd?.error) throw new Error(`roster_days ${day.date}: ${rd.error.message}`);
+          rosterDayRows.push({
+            placement_id: placement.id, period_id: periodId, roster_date: day.date,
+            crew_id: placement.crew_id, crew_nia: placement.crew_nia,
+            activities: day.activities, is_payable: day.isPayable,
+            has_ground: day.hasGround, has_sim: day.hasSim, has_pxp: day.hasPxp,
+            sold_off: day.soldOff, bod: day.bod, fetched_at: new Date().toISOString(),
+          });
 
-            for (const [chargeCode, qty] of Object.entries(day.charges || {})) {
-              if (!qty) continue;
-              const ct = ctByCode[chargeCode];
-              if (!ct) continue;
-              const rateRow  = pickRateForDay(ratesByCode[chargeCode], day.date);
-              const rate     = rateRow?.amount ?? null;
-              const currency = rateRow?.currency ?? 'USD';
-              const total    = rate != null ? Math.round(qty * rate * 100) / 100 : null;
-              // Write to BOTH column pairs — the schema has duplicate columns
-              // and different read paths use different ones.
-              const ci = await time(t, 'charge_items_upsert',
-                () => adminSupabase.from('charge_items').upsert({
-                  placement_id:   placement.id,
-                  period_id:      periodId,
-                  charge_type_id: ct.id,
-                  charge_date:    day.date,
-                  quantity:       qty,
-                  rate_per_unit:  rate,
-                  rate_amount:    rate,
-                  total_amount:   total,
-                  total_value:    total,
-                  currency,
-                  status:         'confirmed',
-                }, { onConflict: 'placement_id,charge_date,charge_type_id' }).select('id').limit(1));
-              t.charge_items_count++;
-              if (ci?.error) throw new Error(`charge_items ${day.date}/${chargeCode}: ${ci.error.message}`);
-              itemsCreated++;
-            }
-          } catch (dayErr) {
-            emit('day_error', { crew_id: placement.crew_id, date: day.date, error: dayErr.message });
-            throw dayErr;
+          for (const [chargeCode, qty] of Object.entries(day.charges || {})) {
+            if (!qty) continue;
+            const ct = ctByCode[chargeCode];
+            if (!ct) continue;
+            const rateRow  = pickRateForDay(ratesByCode[chargeCode], day.date);
+            const rate     = rateRow?.amount ?? null;
+            const currency = rateRow?.currency ?? 'USD';
+            const total    = rate != null ? Math.round(qty * rate * 100) / 100 : null;
+            chargeItemRows.push({
+              placement_id:   placement.id,
+              period_id:      periodId,
+              charge_type_id: ct.id,
+              charge_date:    day.date,
+              quantity:       qty,
+              rate_per_unit:  rate,
+              rate_amount:    rate,
+              total_amount:   total,
+              total_value:    total,
+              currency,
+              status:         'confirmed',
+            });
+            itemsCreated++;
           }
+        }
+
+        if (rosterDayRows.length) {
+          const rd = await time(t, 'roster_days_upsert', () => adminSupabase
+            .from('roster_days')
+            .upsert(rosterDayRows, { onConflict: 'placement_id,period_id,roster_date', returning: 'minimal' }));
+          t.roster_days_count = rosterDayRows.length;
+          if (rd?.error) throw new Error(`roster_days batch: ${rd.error.message}`);
+        }
+        if (chargeItemRows.length) {
+          const ci = await time(t, 'charge_items_upsert', () => adminSupabase
+            .from('charge_items')
+            .upsert(chargeItemRows, { onConflict: 'placement_id,charge_date,charge_type_id', returning: 'minimal' }));
+          t.charge_items_count = chargeItemRows.length;
+          if (ci?.error) throw new Error(`charge_items batch: ${ci.error.message}`);
         }
 
         results.push({ placement: placement.full_name, days: crewSummary.days.length, items: itemsCreated });
@@ -472,22 +490,23 @@ export async function runRosterSync({ periodId, syncRunId }) {
                 .eq('placement_id', placement.id)
                 .eq('ot_period_id', periodId)
                 .gt('ot_hours', 0));
-            for (const r of closedOt || []) {
-              await time(t, 'charge_items_upsert',
-                () => adminSupabase.from('charge_items').upsert({
-                  placement_id:   placement.id,
-                  period_id:      periodId,
-                  charge_type_id: otCt.id,
-                  charge_date:    r.end_date,
-                  quantity:       r.ot_hours,
-                  rate_per_unit:  null,
-                  rate_amount:    null,
-                  total_amount:   null,
-                  total_value:    null,
-                  currency:       'USD',
-                  status:         'confirmed',
-                }, { onConflict: 'placement_id,charge_date,charge_type_id', returning: 'minimal' }));
-              t.charge_items_count++;
+            const otRows = (closedOt || []).map(r => ({
+              placement_id:   placement.id,
+              period_id:      periodId,
+              charge_type_id: otCt.id,
+              charge_date:    r.end_date,
+              quantity:       r.ot_hours,
+              rate_per_unit:  null,
+              rate_amount:    null,
+              total_amount:   null,
+              total_value:    null,
+              currency:       'USD',
+              status:         'confirmed',
+            }));
+            if (otRows.length) {
+              await time(t, 'charge_items_upsert', () => adminSupabase.from('charge_items')
+                .upsert(otRows, { onConflict: 'placement_id,charge_date,charge_type_id', returning: 'minimal' }));
+              t.charge_items_count += otRows.length;
             }
           }
         } catch (rotErr) {
@@ -522,7 +541,13 @@ export async function runRosterSync({ periodId, syncRunId }) {
         errors++;
         runState.placements_errors = errors;
       }
+    };
+
+    for (let i = 0; i < placements.length; i += PLACEMENT_CONCURRENCY) {
+      const batch = placements.slice(i, i + PLACEMENT_CONCURRENCY);
+      await Promise.all(batch.map(processPlacement));
     }
+
 
     emit('sync_summary', {
       total_ms:      Date.now() - syncStart,
